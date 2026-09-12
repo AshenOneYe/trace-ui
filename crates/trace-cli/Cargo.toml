@@ -11,4 +11,5 @@ path = "src/main.rs"
 trace-core = { path = "../trace-core" }
 trace-mcp = { path = "../trace-mcp" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-util = "0.7"
 anyhow = "1"
