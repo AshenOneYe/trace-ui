@@ -13,10 +13,10 @@ use crate::types::*;
 // ── 截断常量 ──
 // NOTE: 修改这些值时，需同步更新对应 #[tool] 描述中的硬编码数字。
 
-// Referenced in: get_trace_lines description ("up to 100 lines per call")
-const MAX_LINES: u32 = 100;
-// Referenced in: search_instructions description ("up to 200 results")
-const MAX_SEARCH: u32 = 200;
+// Referenced in: get_trace_lines description ("up to 2000 lines per call")
+const MAX_LINES: u32 = 2000;
+// Referenced in: search_instructions description ("up to 500 results per page")
+const MAX_SEARCH: u32 = 500;
 const DEFAULT_SEARCH: u32 = 30;
 
 fn json(val: &impl serde::Serialize) -> String {
@@ -75,21 +75,44 @@ fn format_lines(lines: &[TraceLine], full: bool) -> Vec<serde_json::Value> {
     }
 }
 
-/// 检查 changes 字段是否仅包含栈/帧指针寄存器变化
-fn is_stack_only_change(changes: &str) -> bool {
+/// 检查 changes 字段是否仅包含噪音寄存器变化。
+/// 基础噪音集 = 栈/帧指针（sp/x29/fp/wsp/w29，当 stack=true 时），
+/// 可扩展 extra_regs（如 VM 调度器的 x21/x22/x26）。
+fn is_noise_only_change(changes: &str, stack: bool, extra_regs: &std::collections::HashSet<String>) -> bool {
     if changes.is_empty() { return false; }
     let mut has_any = false;
     for token in changes.split_whitespace() {
         if let Some(eq_pos) = token.find('=') {
             let reg = &token[..eq_pos];
             has_any = true;
-            match reg {
-                "sp" | "x29" | "fp" | "wsp" | "w29" => {}
-                _ => return false,
+            let reg_lower = reg.to_ascii_lowercase();
+            match reg_lower.as_str() {
+                "sp" | "x29" | "fp" | "wsp" | "w29" => {
+                    if !stack && !extra_regs.contains(&reg_lower) {
+                        return false;
+                    }
+                }
+                _ => {
+                    if !extra_regs.contains(&reg_lower) {
+                        return false;
+                    }
+                }
             }
         }
     }
     has_any
+}
+
+/// 解析逗号分隔的寄存器噪音列表（小写化），如 "x21,x22,x26"
+fn parse_noise_regs(list: &Option<String>) -> std::collections::HashSet<String> {
+    match list {
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        None => std::collections::HashSet::new(),
+    }
 }
 
 /// Parse address range string like "0x246F00-0x249800"
@@ -238,7 +261,7 @@ impl TraceToolHandler {
         description = "Retrieve instruction lines from the trace. Each line contains: \
             address, disassembly, register changes, and memory access info. \
             Lines are identified by 0-based sequence numbers. \
-            Returns up to 100 lines per call."
+            Returns up to 2000 lines per call."
     )]
     fn get_trace_lines(&self, Parameters(req): Parameters<GetTraceLinesRequest>) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
@@ -277,6 +300,142 @@ impl TraceToolHandler {
             .map_err(|e| e.to_string())
     }
 
+    #[tool(
+        name = "get_mem_history",
+        description = "Full read/write history of one memory address: every access in seq order \
+            with data value, size, instruction and disasm. Answers 'who wrote/read this buffer and when' \
+            directly — no manual mem[WRITE] searching. Filter with rw='W'/'R', locate with seq \
+            (returns center_index), paginate with offset+count. Records with data_known=false are \
+            writes whose value was not printed in the trace (e.g. NEON q-register stores)."
+    )]
+    fn get_mem_history(&self, Parameters(req): Parameters<GetMemHistoryRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let addr = parse_hex_addr(&req.address)?;
+        let count = req.count.min(500) as usize;
+        let page = self.engine.get_mem_history_page(&sid, addr, req.rw.as_deref(), req.seq, req.offset as usize, count)
+            .map_err(|e| e.to_string())?;
+        let response = serde_json::json!({
+            "address": req.address,
+            "total": page.total,
+            "center_index": page.center_index,
+            "offset": req.offset,
+            "count": page.records.len(),
+            "has_more": (req.offset as usize + page.records.len()) < page.total,
+            "records": page.records,
+        });
+        Ok(json(&response))
+    }
+
+    #[tool(
+        name = "search_memory",
+        description = "Find memory accesses by VALUE — where did these bytes get written/read? \
+            Give hex bytes in memory order (e.g. '5d13d2b15aafa27f' for a key/magic constant), \
+            with '??' wildcards (e.g. '5d13??b1'). Searches all mem records (default: writes only, \
+            rw='R' for reads, 'all' for both), byte-aligned at any offset inside each record. \
+            Ideal for locating where key material, config blobs or constants land in memory."
+    )]
+    fn search_memory(&self, Parameters(req): Parameters<SearchMemoryRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let count = req.count.min(500) as usize;
+        let result = self.engine.search_memory_values(&sid, &req.value, req.rw.as_deref(), req.offset as usize, count)
+            .map_err(|e| e.to_string())?;
+        let response = serde_json::json!({
+            "value": req.value,
+            "total": result.total,
+            "offset": req.offset,
+            "count": result.matches.len(),
+            "has_more": (req.offset as usize + result.matches.len()) < result.total,
+            "matches": result.matches,
+        });
+        Ok(json(&response))
+    }
+
+    #[tool(
+        name = "get_registers",
+        description = "Complete register snapshot (X0-X30, SP, NZCV, PC) at a given line — \
+            reconstructed from checkpoints, not just the line's incremental changes. \
+            Also reports 'changed' (regs modified by this line) and 'read' (regs consumed)."
+    )]
+    fn get_registers(&self, Parameters(req): Parameters<GetRegistersRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let mut regs = self.engine.get_registers_at(&sid, req.seq)
+            .map_err(|e| e.to_string())?;
+        let pc = regs.remove("PC");
+        let changed = regs.remove("__changed");
+        let read = regs.remove("__read");
+        let response = serde_json::json!({
+            "seq": req.seq,
+            "pc": pc,
+            "changed": changed,
+            "read": read,
+            "registers": regs,
+        });
+        Ok(json(&response))
+    }
+
+    #[tool(
+        name = "get_string_xrefs",
+        description = "Cross-references of a string: every instruction that reads or writes the \
+            string's memory range (seq, rw, insn_addr, disasm). Get the address and byte_len from \
+            get_strings, then use this to find the code consuming the string."
+    )]
+    fn get_string_xrefs(&self, Parameters(req): Parameters<GetStringXrefsRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let addr = parse_hex_addr(&req.address)?;
+        let length = req.length.unwrap_or(64).min(4096);
+        let xrefs = self.engine.get_string_xrefs(&sid, addr, length)
+            .map_err(|e| e.to_string())?;
+        let response = serde_json::json!({
+            "address": req.address,
+            "length": length,
+            "count": xrefs.len(),
+            "xrefs": xrefs,
+        });
+        Ok(json(&response))
+    }
+
+    #[tool(
+        name = "get_def_use",
+        description = "Register def-use analysis at one line. Without reg: lists the registers this \
+            line DEFINES. With reg (e.g. 'x19'): if the line USES reg, finds the nearest upstream line \
+            that defined it (def_seq); if the line DEFINES reg, collects downstream USE lines until \
+            redefinition (use_seqs, redefined_seq). Much cheaper than a full taint run for tracking a \
+            single register."
+    )]
+    fn get_def_use(&self, Parameters(req): Parameters<GetDefUseRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let line_defs = self.engine.get_line_def_registers(&sid, req.seq)
+            .map_err(|e| e.to_string())?;
+        let mut response = serde_json::json!({
+            "seq": req.seq,
+            "line_defs": line_defs,
+        });
+        if let Some(reg) = &req.reg {
+            let chain = self.engine.get_def_use_chain(&sid, req.seq, &reg.to_lowercase())
+                .map_err(|e| e.to_string())?;
+            // 补充相关行的 disasm
+            let mut wanted: Vec<u32> = vec![req.seq];
+            if let Some(d) = chain.def_seq { wanted.push(d); }
+            if let Some(r) = chain.redefined_seq { wanted.push(r); }
+            wanted.extend(chain.use_seqs.iter().take(20).copied());
+            let lines = self.engine.get_lines(&sid, &wanted)
+                .map_err(|e| e.to_string())?;
+            let disasm_of = |s: u32| lines.iter()
+                .find(|l| l.seq == s)
+                .map(|l| l.disasm.clone())
+                .unwrap_or_default();
+            response["chain"] = serde_json::json!({
+                "reg": reg.to_lowercase(),
+                "anchor_disasm": disasm_of(req.seq),
+                "def_seq": chain.def_seq,
+                "def_disasm": chain.def_seq.map(|s| disasm_of(s)),
+                "use_seqs": chain.use_seqs,
+                "redefined_seq": chain.redefined_seq,
+            });
+        }
+        Ok(json(&response))
+    }
+
     // ━━━━━━━━━━━━━━━━━━━━━━ 搜索与分析 ━━━━━━━━━━━━━━━━━━━━━━
 
     #[tool(
@@ -285,72 +444,64 @@ impl TraceToolHandler {
             Returns matching line numbers and a preview of each match. \
             Use regex for complex patterns like 'bl.*0x[0-9a-f]+' to find specific branch targets. \
             Wrap pattern in /slashes/ for auto-regex detection. \
-            Supports optional seq_range ('3000-6000') and addr_range ('0x246F00-0x249800') filters \
-            to narrow results to a specific execution window or code region."
+            Supports seq_range ('3000-6000') to scan ONLY that window — matches inside the window are \
+            never lost to global truncation. Supports addr_range ('0x246F00-0x249800') filtering by \
+            instruction address (matches SO offset OR absolute address), applied during the scan so \
+            total_matches is exact. Paginate large result sets with offset + max_results (up to 500 per page)."
     )]
     async fn search_instructions(&self, Parameters(req): Parameters<SearchInstructionsRequest>) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let engine = self.engine.clone();
         blocking(move || {
             let max = req.max_results.unwrap_or(DEFAULT_SEARCH).min(MAX_SEARCH);
+            let offset = req.offset.unwrap_or(0);
+
+            // 确定扫描窗口：有 seq_range 时只扫窗口；否则全 trace
+            let (start_seq, end_seq) = if let Some(ref range) = req.seq_range {
+                parse_seq_range(range)?
+            } else {
+                let info = engine.get_session_info(&sid).map_err(|e| e.to_string())?;
+                (0, info.total_lines)
+            };
+
+            let addr_filter = match req.addr_range {
+                Some(ref range) => Some(parse_addr_range(range)?),
+                None => None,
+            };
+
             let options = SearchOptions {
                 case_sensitive: req.case_sensitive,
                 use_regex: req.use_regex,
                 fuzzy: false,
-                max_results: Some(max),
+                max_results: None,
             };
-            let result = engine.search(&sid, &req.query, options)
+
+            let outcome = engine
+                .search_in_range(&sid, &req.query, options, start_seq, end_seq, addr_filter, offset, max)
                 .map_err(|e| e.to_string())?;
 
-            // seq range filter
-            let filtered_seqs: Vec<u32> = if let Some(ref range) = req.seq_range {
-                let (start, end) = parse_seq_range(range)?;
-                result.match_seqs.iter()
-                    .copied()
-                    .filter(|&seq| seq >= start && seq <= end)
-                    .collect()
-            } else {
-                result.match_seqs.clone()
-            };
-
-            let total_after_seq_filter = filtered_seqs.len();
-
-            // Load lines (take more than needed to handle addr_range filtering)
-            let load_count = if req.addr_range.is_some() { (max as usize) * 3 } else { max as usize };
-            let preview_seqs: Vec<u32> = filtered_seqs.iter().copied().take(load_count).collect();
-            let lines = engine.get_lines(&sid, &preview_seqs)
+            let lines = engine.get_lines(&sid, &outcome.match_seqs)
                 .map_err(|e| e.to_string())?;
-
-            // addr_range filter
-            let final_lines: Vec<&TraceLine> = if let Some(ref range) = req.addr_range {
-                let (start, end) = parse_addr_range(range)?;
-                lines.iter()
-                    .filter(|l| line_in_addr_range(l, start, end))
-                    .take(max as usize)
-                    .collect()
-            } else {
-                lines.iter().take(max as usize).collect()
-            };
 
             let matches: Vec<serde_json::Value> = if req.full {
-                final_lines.iter().map(|l| serde_json::to_value(l)
+                lines.iter().map(|l| serde_json::to_value(l)
                     .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
                 ).collect()
             } else {
-                final_lines.iter().map(|l| compact_line(l)).collect()
+                lines.iter().map(|l| compact_line(l)).collect()
             };
 
-            let effective_total = if req.seq_range.is_some() || req.addr_range.is_some() {
-                total_after_seq_filter
-            } else {
-                result.total_matches as usize
-            };
+            let count = matches.len();
+            let has_more = (offset as usize + count) < outcome.total_in_range as usize;
 
             Ok(json(&serde_json::json!({
                 "matches": matches,
-                "total_matches": effective_total,
-                "total_scanned": result.total_scanned,
-                "truncated": result.truncated || final_lines.len() < total_after_seq_filter,
+                "total_matches": outcome.total_in_range,
+                "total_scanned": outcome.total_scanned,
+                "offset": offset,
+                "count": count,
+                "has_more": has_more,
+                "truncated": has_more,
             })))
         }).await
     }
@@ -373,12 +524,14 @@ impl TraceToolHandler {
 
         let total_tainted = all_seqs.len() as u32;
 
-        // 栈操作过滤
-        let (after_stack_filter, stack_ops_filtered) = if req.ignore_stack_ops && !all_seqs.is_empty() {
+        // 噪音过滤：栈/帧指针 + 额外噪音寄存器（如 VM 调度器）
+        let noise_regs = parse_noise_regs(&req.ignore_regs);
+        let filter_active = req.ignore_stack_ops || !noise_regs.is_empty();
+        let (after_stack_filter, stack_ops_filtered) = if filter_active && !all_seqs.is_empty() {
             let all_lines = self.engine.get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
             let kept: Vec<TraceLine> = all_lines.into_iter()
-                .filter(|line| !is_stack_only_change(&line.changes))
+                .filter(|line| !is_noise_only_change(&line.changes, req.ignore_stack_ops, &noise_regs))
                 .collect();
             let filtered_count = total_tainted - kept.len() as u32;
             (kept, filtered_count)
@@ -581,7 +734,8 @@ impl TraceToolHandler {
         description = "Run backward taint analysis and return results in one call. \
             Traces where a value came from by following data/control dependencies. \
             Returns analysis stats plus the first page of tainted instructions. \
-            Use get_tainted_lines to paginate if has_more is true."
+            Use get_tainted_lines to paginate if has_more is true. \
+            Tip: on VM-obfuscated traces, pass ignore_regs like 'x21,x22,x26' to drop dispatcher noise."
     )]
     async fn taint_analysis(&self, Parameters(req): Parameters<TaintAnalysisRequest>) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
@@ -599,15 +753,37 @@ impl TraceToolHandler {
             // 2. 仅返回统计信息
             let include = req.include_lines.min(200);
             if include == 0 {
+                // stats-only 也应用噪音/地址过滤，保证 total_after_filter 与 get_tainted_lines 一致
+                let all_seqs = engine.get_tainted_seqs(&sid)
+                    .map_err(|e| e.to_string())?;
+                let noise_regs = parse_noise_regs(&req.ignore_regs);
+                let filter_active = req.ignore_stack_ops || !noise_regs.is_empty();
+                let (total_after_filter, stack_ops_filtered) =
+                    if !all_seqs.is_empty() && (filter_active || req.addr_range.is_some()) {
+                        let all_lines = engine.get_lines(&sid, &all_seqs)
+                            .map_err(|e| e.to_string())?;
+                        let before = all_lines.len();
+                        let mut kept: Vec<TraceLine> = all_lines.into_iter()
+                            .filter(|l| !is_noise_only_change(&l.changes, req.ignore_stack_ops, &noise_regs))
+                            .collect();
+                        let stack_filtered = (before - kept.len()) as u32;
+                        if let Some(ref range) = req.addr_range {
+                            let (start, end) = parse_addr_range(range)?;
+                            kept.retain(|l| line_in_addr_range(l, start, end));
+                        }
+                        (kept.len() as u32, stack_filtered)
+                    } else {
+                        (all_seqs.len() as u32, 0)
+                    };
                 return Ok(json(&serde_json::json!({
                     "marked_count": result.marked_count,
                     "total_lines": result.total_lines,
                     "percentage": format!("{:.2}%", result.percentage),
                     "lines": [],
-                    "total_after_filter": result.marked_count,
-                    "stack_ops_filtered": 0,
+                    "total_after_filter": total_after_filter,
+                    "stack_ops_filtered": stack_ops_filtered,
                     "count": 0,
-                    "has_more": result.marked_count > 0,
+                    "has_more": total_after_filter > 0,
                     "hint": "Use get_tainted_lines to retrieve tainted instructions.",
                 })));
             }
@@ -632,11 +808,13 @@ impl TraceToolHandler {
             let all_lines = engine.get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
 
-            // 4. 栈操作过滤
-            let (kept, stack_filtered) = if req.ignore_stack_ops {
+            // 4. 噪音过滤：栈/帧指针 + 额外噪音寄存器（如 VM 调度器）
+            let noise_regs = parse_noise_regs(&req.ignore_regs);
+            let filter_active = req.ignore_stack_ops || !noise_regs.is_empty();
+            let (kept, stack_filtered) = if filter_active {
                 let before = all_lines.len();
                 let filtered: Vec<TraceLine> = all_lines.into_iter()
-                    .filter(|l| !is_stack_only_change(&l.changes))
+                    .filter(|l| !is_noise_only_change(&l.changes, req.ignore_stack_ops, &noise_regs))
                     .collect();
                 let diff = before - filtered.len();
                 (filtered, diff as u32)

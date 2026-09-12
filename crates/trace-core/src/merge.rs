@@ -1285,10 +1285,10 @@ mod tests {
     fn test_merge_mem_access_indices() {
         use crate::query::mem_access::{MemAccessIndex, MemAccessRecord, MemRw};
         let mut idx1 = MemAccessIndex::new();
-        idx1.add(0x1000, MemAccessRecord { seq: 1, insn_addr: 0x100, rw: MemRw::Read, data: 0, size: 4 });
+        idx1.add(0x1000, MemAccessRecord { seq: 1, insn_addr: 0x100, rw: MemRw::Read, data: 0, size: 4, data_known: true });
         let mut idx2 = MemAccessIndex::new();
-        idx2.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x200, rw: MemRw::Write, data: 42, size: 4 });
-        idx2.add(0x2000, MemAccessRecord { seq: 6, insn_addr: 0x204, rw: MemRw::Read, data: 0, size: 1 });
+        idx2.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x200, rw: MemRw::Write, data: 42, size: 4, data_known: true });
+        idx2.add(0x2000, MemAccessRecord { seq: 6, insn_addr: 0x204, rw: MemRw::Read, data: 0, size: 1, data_known: true });
 
         let merged = merge_mem_access_indices(vec![idx1, idx2]);
         assert_eq!(merged.total_addresses(), 2);

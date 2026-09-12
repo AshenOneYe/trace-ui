@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use trace_parser::gumtrace::CallAnnotation;
 use trace_parser::types::TraceFormat;
 
-use crate::api_types::{CallInfoDto, SearchMatch, SearchOptions, SearchResultLite};
+use crate::api_types::{CallInfoDto, SearchMatch, SearchOptions, SearchResultLite, RangeSearchOutcome};
 use crate::browse::{parse_trace_line, parse_trace_line_gumtrace};
 use crate::error::{Result, TraceError};
 use crate::utils::ascii_contains;
@@ -186,6 +186,59 @@ fn search_chunk_seqs(
     (match_seqs, total_matches)
 }
 
+/// 范围搜索的分块扫描：在 [start_seq, end_seq) 窗口内收集匹配，
+/// 可选按指令地址（so_offset 或绝对地址）过滤，保留前 keep_cap 个匹配供分页。
+fn search_range_chunk(
+    data: &[u8],
+    start_seq: u32,
+    end_seq: u32,
+    start_offset: usize,
+    mode: &SearchMode,
+    consumed_seqs: &HashSet<u32>,
+    call_search_texts: &HashMap<u32, String>,
+    addr_filter: Option<(u64, u64)>,
+    keep_cap: usize,
+) -> (Vec<u32>, u32) {
+    let mut kept = Vec::new();
+    let mut total = 0u32;
+    let mut pos = start_offset;
+    let mut seq = start_seq;
+
+    while pos < data.len() && seq < end_seq {
+        let end = memchr::memchr(b'\n', &data[pos..])
+            .map(|i| pos + i)
+            .unwrap_or(data.len());
+        let line = &data[pos..end];
+
+        if !consumed_seqs.contains(&seq) {
+            let call_text = call_search_texts.get(&seq).map(|s| s.as_bytes());
+            if matches_line(mode, line, call_text) {
+                let pass_addr = match addr_filter {
+                    Some((lo, hi)) => {
+                        let line_str = std::str::from_utf8(line).unwrap_or("");
+                        let so_off = crate::phase2::extract_insn_offset(line_str);
+                        let abs = crate::phase2::extract_insn_addr(line_str);
+                        (so_off != 0 && so_off >= lo && so_off <= hi)
+                            || (abs != 0 && abs >= lo && abs <= hi)
+                    }
+                    None => true,
+                };
+                if pass_addr {
+                    total += 1;
+                    if kept.len() < keep_cap {
+                        kept.push(seq);
+                    }
+                }
+            }
+        }
+
+        pos = end + 1;
+        seq += 1;
+    }
+
+    (kept, total)
+}
+
 // ── TraceEngine methods ──
 
 impl TraceEngine {
@@ -349,6 +402,162 @@ impl TraceEngine {
         let start = (offset as usize).min(all_seqs.len());
         let end = (start + count as usize).min(all_seqs.len());
         Ok((gen, all_seqs[start..end].to_vec()))
+    }
+
+    /// 范围感知搜索：仅在 [start_seq, end_seq) 窗口内扫描，支持
+    /// 指令地址过滤（so_offset 或绝对地址命中其一即算）与 offset 分页。
+    ///
+    /// 与 `search` 的关键区别：`search` 先全局截断到前 N 个匹配再由调用方过滤，
+    /// 当窗口内匹配不在全局前 N 时会得到"空结果但 total>0"的错误行为；
+    /// 本方法直接在窗口内扫描，total_in_range 是窗口内的精确总数。
+    pub fn search_in_range(
+        &self,
+        session_id: &str,
+        query: &str,
+        options: SearchOptions,
+        start_seq: u32,
+        end_seq: u32,
+        addr_filter: Option<(u64, u64)>,
+        offset: u32,
+        limit: u32,
+    ) -> Result<RangeSearchOutcome> {
+        if query.is_empty() || limit == 0 {
+            return Ok(RangeSearchOutcome {
+                match_seqs: Vec::new(),
+                total_in_range: 0,
+                total_scanned: 0,
+            });
+        }
+        let handle = self.get_handle(session_id)?;
+        let mode = parse_search_mode(query, options.case_sensitive, options.use_regex, options.fuzzy)?;
+
+        let (mmap_arc, call_search_texts, consumed_seqs, chunks, start, end) = {
+            let state = handle
+                .state
+                .read()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+
+            let total_lines = state
+                .lidx_store
+                .as_ref()
+                .map(|s| s.total_lines())
+                .unwrap_or(0);
+
+            let start = start_seq.min(total_lines);
+            let end = end_seq.min(total_lines);
+            if start >= end {
+                return Ok(RangeSearchOutcome {
+                    match_seqs: Vec::new(),
+                    total_in_range: 0,
+                    total_scanned: 0,
+                });
+            }
+
+            let num_cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+
+            // 窗口较大时并行分块（与 search 相同的分块策略）
+            let chunks: Option<Vec<(u32, u32, usize)>> =
+                if num_cpus > 1 && end - start > 200_000 {
+                    state.line_index_view().map(|li| {
+                        let data: &[u8] = &state.mmap;
+                        let num_chunks = num_cpus.min(16);
+                        let lines_per_chunk =
+                            ((end - start) as usize + num_chunks - 1) / num_chunks;
+                        let mut result = Vec::with_capacity(num_chunks);
+                        let mut chunk_start = start;
+                        while chunk_start < end {
+                            let chunk_end = (chunk_start + lines_per_chunk as u32).min(end);
+                            let start_offset =
+                                li.line_byte_offset(data, chunk_start).unwrap_or(0) as usize;
+                            result.push((chunk_start, chunk_end, start_offset));
+                            chunk_start = chunk_end;
+                        }
+                        result
+                    })
+                } else {
+                    None
+                };
+
+            let consumed: HashSet<u32> = state.consumed_seqs.iter().copied().collect();
+
+            (
+                state.mmap.clone(),
+                state.call_search_texts.clone(),
+                consumed,
+                chunks,
+                start,
+                end,
+            )
+        };
+
+        let data: Arc<memmap2::Mmap> = mmap_arc;
+        let keep_cap = offset.saturating_add(limit) as usize;
+
+        let (kept, total_in_range) = if let Some(chunks) = chunks {
+            let chunk_results: Vec<(Vec<u32>, u32)> = chunks
+                .par_iter()
+                .map(|&(cs, ce, coff)| {
+                    search_range_chunk(
+                        &data,
+                        cs,
+                        ce,
+                        coff,
+                        &mode,
+                        &consumed_seqs,
+                        &call_search_texts,
+                        addr_filter,
+                        keep_cap,
+                    )
+                })
+                .collect();
+            let mut merged = Vec::new();
+            let mut total = 0u32;
+            for (chunk_kept, chunk_total) in chunk_results {
+                total += chunk_total;
+                // 各块保留的是自身匹配的前缀，按块序拼接后截断即得全局前 keep_cap 个
+                if merged.len() < keep_cap {
+                    let remaining = keep_cap - merged.len();
+                    merged.extend(chunk_kept.into_iter().take(remaining));
+                }
+            }
+            (merged, total)
+        } else {
+            let start_offset = {
+                // 单线程路径：需要行索引定位窗口起点
+                let state = handle
+                    .state
+                    .read()
+                    .map_err(|e| TraceError::Internal(e.to_string()))?;
+                let li = state
+                    .line_index_view()
+                    .ok_or_else(|| TraceError::IndexNotReady)?;
+                li.line_byte_offset(&state.mmap, start).unwrap_or(0) as usize
+            };
+            search_range_chunk(
+                &data,
+                start,
+                end,
+                start_offset,
+                &mode,
+                &consumed_seqs,
+                &call_search_texts,
+                addr_filter,
+                keep_cap,
+            )
+        };
+
+        // 分页：[offset, offset+limit)
+        let page_start = (offset as usize).min(kept.len());
+        let page_end = (page_start + limit as usize).min(kept.len());
+        let match_seqs = kept[page_start..page_end].to_vec();
+
+        Ok(RangeSearchOutcome {
+            match_seqs,
+            total_in_range,
+            total_scanned: end - start,
+        })
     }
 
     pub fn get_search_matches(

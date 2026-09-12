@@ -1,6 +1,11 @@
 pub const MEM_RW_READ: u8 = 0;
 pub const MEM_RW_WRITE: u8 = 1;
 
+/// flags 位定义（FlatMemAccessRecord.flags）
+/// bit0: 数据值未知（trace 未打印寄存器值，如 NEON/SIMD）。
+/// 旧缓存文件中该字节为 0（原 _pad），自动视为 data_known=true，向后兼容。
+pub const FLAG_DATA_UNKNOWN: u8 = 0x01;
+
 /// A single memory access record.
 ///
 /// Layout is explicit `repr(C)` with manual padding to 24 bytes.
@@ -13,7 +18,8 @@ pub struct FlatMemAccessRecord {
     pub seq: u32,
     pub size: u8,
     pub rw: u8,        // 0=Read, 1=Write
-    pub _pad: [u8; 2], // explicit pad to reach 24 bytes total
+    pub flags: u8,     // bit0 = data unknown (was _pad[0]; zero in old caches = known)
+    pub _pad: [u8; 1], // explicit pad to reach 24 bytes total
 }
 
 
@@ -26,6 +32,11 @@ impl FlatMemAccessRecord {
     #[inline]
     pub fn is_write(&self) -> bool {
         self.rw == MEM_RW_WRITE
+    }
+
+    #[inline]
+    pub fn is_data_known(&self) -> bool {
+        self.flags & FLAG_DATA_UNKNOWN == 0
     }
 }
 
@@ -116,7 +127,8 @@ mod tests {
                     seq: 0,
                     size: 4,
                     rw: 1,
-                    _pad: [0; 2],
+                    flags: 0,
+                    _pad: [0; 1],
                 },
                 FlatMemAccessRecord {
                     insn_addr: 0x104,
@@ -124,7 +136,8 @@ mod tests {
                     seq: 5,
                     size: 4,
                     rw: 0,
-                    _pad: [0; 2],
+                    flags: 0,
+                    _pad: [0; 1],
                 },
                 FlatMemAccessRecord {
                     insn_addr: 0x200,
@@ -132,7 +145,8 @@ mod tests {
                     seq: 10,
                     size: 1,
                     rw: 1,
-                    _pad: [0; 2],
+                    flags: 0,
+                    _pad: [0; 1],
                 },
             ],
         }
@@ -172,7 +186,8 @@ mod tests {
             seq: 0,
             size: 1,
             rw: 0,
-            _pad: [0; 2],
+            flags: 0,
+            _pad: [0; 1],
         };
         assert!(r.is_read());
         let w = FlatMemAccessRecord {
@@ -181,7 +196,8 @@ mod tests {
             seq: 0,
             size: 1,
             rw: 1,
-            _pad: [0; 2],
+            flags: 0,
+            _pad: [0; 1],
         };
         assert!(w.is_write());
     }

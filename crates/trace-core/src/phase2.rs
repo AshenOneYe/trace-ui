@@ -104,16 +104,21 @@ pub fn build_phase2(data: &[u8], progress_fn: Option<Box<dyn Fn(usize, usize) + 
 
                     if mem_op.elem_width <= 8 {
                         // Scalar 路径
-                        mem_idx.add(
-                            mem_op.abs,
-                            MemAccessRecord {
-                                seq,
-                                insn_addr,
-                                rw,
-                                data: mem_op.value.unwrap_or(0),
-                                size: mem_op.elem_width,
-                            },
-                        );
+                        // 值未知的 READ 跳过；值未知的 WRITE 记录（data_known=false，用于写入归因）
+                        let data_known = mem_op.value.is_some();
+                        if data_known || mem_op.is_write {
+                            mem_idx.add(
+                                mem_op.abs,
+                                MemAccessRecord {
+                                    seq,
+                                    insn_addr,
+                                    rw,
+                                    data: mem_op.value.unwrap_or(0),
+                                    size: mem_op.elem_width,
+                                    data_known,
+                                },
+                            );
+                        }
 
                         // Pair 指令：在 abs + elem_width 处创建第二条记录
                         if let Some(val2) = mem_op.value2 {
@@ -125,30 +130,40 @@ pub fn build_phase2(data: &[u8], progress_fn: Option<Box<dyn Fn(usize, usize) + 
                                     rw,
                                     data: val2,
                                     size: mem_op.elem_width,
+                                    data_known: true,
                                 },
                             );
                         }
                     } else if mem_op.elem_width == 16 {
                         // 128-bit: 拆为两条 size=8 的记录
-                        if let Some(lo) = mem_op.value_lo {
+                        // NEON/SIMD 行常不打印 q 寄存器值 → data_known=false，但写入仍需归因
+                        let lo_known = mem_op.value_lo.is_some();
+                        if lo_known || mem_op.is_write {
                             mem_idx.add(mem_op.abs, MemAccessRecord {
-                                seq, insn_addr, rw, data: lo, size: 8,
+                                seq, insn_addr, rw, data: mem_op.value_lo.unwrap_or(0), size: 8,
+                                data_known: lo_known,
                             });
                         }
-                        if let Some(hi) = mem_op.value_hi {
+                        let hi_known = mem_op.value_hi.is_some();
+                        if hi_known || mem_op.is_write {
                             mem_idx.add(mem_op.abs + 8, MemAccessRecord {
-                                seq, insn_addr, rw, data: hi, size: 8,
+                                seq, insn_addr, rw, data: mem_op.value_hi.unwrap_or(0), size: 8,
+                                data_known: hi_known,
                             });
                         }
                         // Pair 128-bit: 第二个寄存器
-                        if let Some(lo2) = mem_op.value2_lo {
+                        let lo2_known = mem_op.value2_lo.is_some();
+                        if lo2_known || mem_op.is_write {
                             mem_idx.add(mem_op.abs + 16, MemAccessRecord {
-                                seq, insn_addr, rw, data: lo2, size: 8,
+                                seq, insn_addr, rw, data: mem_op.value2_lo.unwrap_or(0), size: 8,
+                                data_known: lo2_known,
                             });
                         }
-                        if let Some(hi2) = mem_op.value2_hi {
+                        let hi2_known = mem_op.value2_hi.is_some();
+                        if hi2_known || mem_op.is_write {
                             mem_idx.add(mem_op.abs + 24, MemAccessRecord {
-                                seq, insn_addr, rw, data: hi2, size: 8,
+                                seq, insn_addr, rw, data: mem_op.value2_hi.unwrap_or(0), size: 8,
+                                data_known: hi2_known,
                             });
                         }
                     }

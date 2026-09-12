@@ -51,7 +51,8 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
                     MemRw::Read => MEM_RW_READ,
                     MemRw::Write => MEM_RW_WRITE,
                 },
-                _pad: [0; 2],
+                flags: if rec.data_known { 0 } else { crate::flat::mem_access::FLAG_DATA_UNKNOWN },
+                _pad: [0; 1],
             });
         }
         offsets.push(records.len() as u32);
@@ -247,9 +248,9 @@ mod tests {
     #[test]
     fn test_mem_access_round_trip() {
         let mut idx = MemAccessIndex::new();
-        idx.add(0x1000, MemAccessRecord { seq: 0, insn_addr: 0x100, rw: MemRw::Write, data: 0x42, size: 4 });
-        idx.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x104, rw: MemRw::Read,  data: 0x43, size: 4 });
-        idx.add(0x2000, MemAccessRecord { seq: 10, insn_addr: 0x200, rw: MemRw::Write, data: 0xFF, size: 1 });
+        idx.add(0x1000, MemAccessRecord { seq: 0, insn_addr: 0x100, rw: MemRw::Write, data: 0x42, size: 4, data_known: true });
+        idx.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x104, rw: MemRw::Read,  data: 0x43, size: 4, data_known: true });
+        idx.add(0x2000, MemAccessRecord { seq: 10, insn_addr: 0x200, rw: MemRw::Write, data: 0xFF, size: 1, data_known: true });
 
         let flat = mem_access_to_flat(&idx);
         let view = flat.view();
@@ -279,9 +280,9 @@ mod tests {
     fn test_mem_access_sorted_addrs() {
         let mut idx = MemAccessIndex::new();
         // Insert in non-sorted order
-        idx.add(0x3000, MemAccessRecord { seq: 1, insn_addr: 0x300, rw: MemRw::Read, data: 1, size: 1 });
-        idx.add(0x1000, MemAccessRecord { seq: 2, insn_addr: 0x100, rw: MemRw::Read, data: 2, size: 1 });
-        idx.add(0x2000, MemAccessRecord { seq: 3, insn_addr: 0x200, rw: MemRw::Read, data: 3, size: 1 });
+        idx.add(0x3000, MemAccessRecord { seq: 1, insn_addr: 0x300, rw: MemRw::Read, data: 1, size: 1, data_known: true });
+        idx.add(0x1000, MemAccessRecord { seq: 2, insn_addr: 0x100, rw: MemRw::Read, data: 2, size: 1, data_known: true });
+        idx.add(0x2000, MemAccessRecord { seq: 3, insn_addr: 0x200, rw: MemRw::Read, data: 3, size: 1, data_known: true });
 
         let flat = mem_access_to_flat(&idx);
         // addrs must be sorted for binary search

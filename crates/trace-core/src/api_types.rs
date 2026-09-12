@@ -78,6 +78,7 @@ pub struct TraceLine {
 
 // ── Search ──
 
+#[derive(Clone)]
 pub struct SearchOptions {
     pub case_sensitive: bool,
     pub use_regex: bool,
@@ -91,6 +92,17 @@ pub struct SearchResultLite {
     pub total_scanned: u32,
     pub total_matches: u32,
     pub truncated: bool,
+}
+
+/// 范围搜索结果（search_in_range）：分页 + 精确总数
+#[derive(Serialize)]
+pub struct RangeSearchOutcome {
+    /// 当前页的匹配 seq 列表 [offset, offset+limit)
+    pub match_seqs: Vec<u32>,
+    /// 窗口内（含地址过滤后）的匹配总数
+    pub total_in_range: u32,
+    /// 实际扫描的行数
+    pub total_scanned: u32,
 }
 
 #[derive(Serialize)]
@@ -139,6 +151,20 @@ pub struct MemorySnapshot {
     pub bytes: Vec<u8>,
     pub known: Vec<bool>,
     pub length: u32,
+    /// 数据值未知的写入事件（如 NEON/SIMD 写入，trace 未打印寄存器值）。
+    /// 这些字节在 `known` 中为 false，但写入者与时刻可归因。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unknown_data_writes: Vec<UnknownDataWrite>,
+}
+
+#[derive(Serialize)]
+pub struct UnknownDataWrite {
+    /// 写入的基地址（绝对）
+    pub addr: String,
+    pub seq: u32,
+    /// 写入指令地址（绝对）
+    pub insn_addr: String,
+    pub size: u8,
 }
 
 #[derive(Serialize)]
@@ -149,6 +175,8 @@ pub struct MemHistoryRecord {
     pub size: u8,
     pub insn_addr: String,
     pub disasm: String,
+    /// false = trace 行未打印数据值（data 字段无意义）
+    pub data_known: bool,
 }
 
 #[derive(Serialize)]
@@ -156,6 +184,34 @@ pub struct MemHistoryMeta {
     pub total: usize,
     pub center_index: usize,
     pub samples: Vec<MemHistoryRecord>,
+}
+
+/// 地址读写历史（带 rw 过滤 + 分页）
+#[derive(Serialize)]
+pub struct MemHistoryPage {
+    pub total: usize,
+    /// 相对过滤后列表的定位索引（请求带 seq 时给出）
+    pub center_index: Option<usize>,
+    pub records: Vec<MemHistoryRecord>,
+}
+
+// ── Memory Value Search ──
+
+#[derive(Debug, Serialize)]
+pub struct MemoryWriteMatch {
+    pub seq: u32,
+    pub addr: String,
+    pub rw: String,
+    pub size: u8,
+    pub data: String,
+    pub insn_addr: String,
+    pub disasm: String,
+}
+
+#[derive(Serialize)]
+pub struct MemoryValueSearchResult {
+    pub total: usize,
+    pub matches: Vec<MemoryWriteMatch>,
 }
 
 // ── Call Tree ──

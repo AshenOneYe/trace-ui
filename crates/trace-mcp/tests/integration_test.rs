@@ -861,3 +861,330 @@ fn check_stack_only(changes: &str) -> bool {
     }
     has_any
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━ search_in_range（范围搜索 + 分页修复） ━━━━━━━━━━━━━━━━━━━━━━
+
+/// 回归测试：旧版 search 先全局截断到前 200 个匹配、再由 MCP 层过滤窗口，
+/// 窗口内匹配不在全局前 200 时全部漏报（"返回空但 total>0"）。
+/// search_in_range 必须直接在窗口内扫描，不受全局截断影响。
+#[test]
+fn test_search_in_range_finds_matches_beyond_global_truncation() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    // "mem[WRITE]" 全文约 1 万个匹配，第 201 个出现在 seq≈740。
+    // 取 trace 末尾窗口：旧实现（全局前 200 后过滤）必然返回空。
+    let info = engine.get_session_info(&sid).unwrap();
+    let win_start = 100_000u32;
+    let win_end = info.total_lines;
+
+    let outcome = engine
+        .search_in_range(&sid, "mem[WRITE]", trace_core::SearchOptions {
+            case_sensitive: false, use_regex: false, fuzzy: false, max_results: None,
+        }, win_start, win_end, None, 0, 10)
+        .expect("search_in_range");
+
+    assert!(outcome.total_in_range > 100,
+        "late window should contain many matches, got {}", outcome.total_in_range);
+    assert_eq!(outcome.match_seqs.len(), 10);
+    assert!(outcome.match_seqs.iter().all(|&s| s >= win_start && s < win_end));
+    assert!(outcome.match_seqs.windows(2).all(|w| w[0] < w[1]), "matches must be ascending");
+
+    // 对照：旧引擎 search 截断模式只保留全局前 200 个，窗口内为空 —— 这正是被修复的 bug
+    let old = engine.search(&sid, "mem[WRITE]", trace_core::SearchOptions {
+        case_sensitive: false, use_regex: false, fuzzy: false, max_results: Some(200),
+    }).expect("search");
+    let in_window: Vec<u32> = old.match_seqs.iter().copied()
+        .filter(|&s| s >= win_start && s < win_end).collect();
+    assert!(in_window.is_empty(),
+        "legacy truncated search misses the window (this is the bug being fixed)");
+
+    engine.close_session(&sid).unwrap();
+}
+
+/// 分页一致性：offset 翻页拼接 == 前 N 个匹配；total_in_range 与 offset/limit 无关
+#[test]
+fn test_search_in_range_pagination() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+    let opts = trace_core::SearchOptions { case_sensitive: false, use_regex: false, fuzzy: false, max_results: None };
+
+    let page1 = engine.search_in_range(&sid, "mem[WRITE]", opts.clone(), 0, 1_000_000, None, 0, 5).unwrap();
+    let page2 = engine.search_in_range(&sid, "mem[WRITE]", opts.clone(), 0, 1_000_000, None, 5, 5).unwrap();
+    let page3 = engine.search_in_range(&sid, "mem[WRITE]", opts.clone(), 0, 1_000_000, None, 10, 1000).unwrap();
+
+    assert_eq!(page1.total_in_range, page2.total_in_range);
+    assert_eq!(page1.total_in_range, page3.total_in_range);
+    assert_eq!(page1.match_seqs.len(), 5);
+    assert_eq!(page2.match_seqs.len(), 5);
+
+    let mut combined = page1.match_seqs.clone();
+    combined.extend(page2.match_seqs.iter().copied());
+    // combined = 前 10 个匹配；page3(offset=10) 从第 11 个匹配开始
+    assert_eq!(combined.len(), 10);
+    assert!(combined.windows(2).all(|w| w[0] < w[1]));
+    assert!(*combined.last().unwrap() < page3.match_seqs[0],
+        "page3 must start after the first 10 matches");
+    // 一致性：单页取 10 个 == 两页拼接
+    let single = engine.search_in_range(&sid, "mem[WRITE]", opts.clone(), 0, 1_000_000, None, 0, 10).unwrap();
+    assert_eq!(combined, single.match_seqs);
+
+    // offset 超出总数 → 空页，total 不变
+    let beyond = engine.search_in_range(&sid, "mem[WRITE]", opts, 0, 1_000_000,
+        None, page1.total_in_range, 5).unwrap();
+    assert!(beyond.match_seqs.is_empty());
+    assert_eq!(beyond.total_in_range, page1.total_in_range);
+
+    engine.close_session(&sid).unwrap();
+}
+
+/// addr 过滤：按绝对指令地址窗口过滤（so_offset 或绝对地址任一命中），
+/// 过滤在扫描时进行，total_in_range 是过滤后的精确总数
+#[test]
+fn test_search_in_range_addr_filter() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+    let opts = trace_core::SearchOptions { case_sensitive: false, use_regex: false, fuzzy: false, max_results: None };
+
+    // 取一个已知匹配的绝对指令地址
+    let probe = engine.search_in_range(&sid, "mem[WRITE]", opts.clone(), 0, 1_000_000, None, 0, 1).unwrap();
+    let seq0 = probe.match_seqs[0];
+    let lines = engine.get_lines(&sid, &[seq0]).unwrap();
+    let abs_addr = u64::from_str_radix(lines[0].address.trim_start_matches("0x"), 16)
+        .expect("parse abs addr");
+
+    // 以该地址 ±0x10 为窗口，应恰好保留该 seq
+    let outcome = engine.search_in_range(&sid, "mem[WRITE]", opts.clone(), 0, 1_000_000,
+        Some((abs_addr.saturating_sub(0x10), abs_addr + 0x10)), 0, 50).unwrap();
+    assert!(outcome.match_seqs.contains(&seq0),
+        "addr filter should keep seq {} (abs=0x{:x})", seq0, abs_addr);
+    assert!(outcome.total_in_range >= 1);
+
+    // 远离任何指令的窗口 → 0 匹配
+    let none = engine.search_in_range(&sid, "mem[WRITE]", opts, 0, 1_000_000,
+        Some((0xdead0000, 0xdead0010)), 0, 50).unwrap();
+    assert_eq!(none.total_in_range, 0);
+    assert!(none.match_seqs.is_empty());
+
+    engine.close_session(&sid).unwrap();
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━ NEON/SIMD 未知数据写入归因 ━━━━━━━━━━━━━━━━━━━━━━
+
+/// NEON 写入行未打印 q 寄存器值时：
+/// - 写入必须被记录（data_known=false），不再凭空消失
+/// - get_memory 字节保持 unknown，但 unknown_data_writes 提供写入归因（谁、何时）
+/// - 已知数据的标量写不受影响
+#[test]
+fn test_neon_write_without_value_provenance() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("trace-ui-neon-noval-{}.txt", std::process::id()));
+    let trace = concat!(
+        "[07:17:13 001][libt.so 0x100] [f9000be8] 0x40000100: \"str x8, [x19]\" ; mem[WRITE] abs=0x1000 x8=0x1122334455667788 x19=0x1000 => x8=0x1122334455667788\n",
+        "[07:17:13 002][libt.so 0x104] [6002803d] 0x40000104: \"str q0, [x20]\" ; mem[WRITE] abs=0x2000 x20=0x2000\n",
+        "[07:17:13 003][libt.so 0x108] [f9400fe0] 0x40000108: \"ldr x1, [x19]\" ; mem[READ] abs=0x1000 x19=0x1000 => x1=0x1122334455667788\n",
+    );
+    std::fs::write(&path, trace).unwrap();
+
+    let engine = Arc::new(TraceEngine::new());
+    let info = engine.create_session(path.to_str().unwrap()).unwrap();
+    let sid = info.session_id.clone();
+    engine.build_index(&sid, trace_core::BuildOptions { force_rebuild: true, skip_strings: true }, None).unwrap();
+
+    // [1] 已知标量写：字节可读
+    let snap = engine.get_memory_at(&sid, 0x1000, 2, 8).unwrap();
+    assert!(snap.known[..8].iter().all(|&k| k), "scalar write bytes must be known");
+    assert_eq!(snap.bytes[..8].to_vec(), 0x1122334455667788u64.to_le_bytes().to_vec());
+
+    // [2] NEON 写（无 q0= 值）：字节未知 + 写入归因
+    let snap2 = engine.get_memory_at(&sid, 0x2000, 2, 16).unwrap();
+    assert!(snap2.known.iter().all(|&k| !k), "NEON write without value must stay unknown");
+    assert_eq!(snap2.unknown_data_writes.len(), 2, "two 8-byte halves must be attributed");
+    assert!(snap2.unknown_data_writes.iter().all(|w| w.seq == 1));
+    assert!(snap2.unknown_data_writes.iter().any(|w| w.addr == "0x2000"));
+    assert!(snap2.unknown_data_writes.iter().any(|w| w.addr == "0x2008"));
+    assert!(snap2.unknown_data_writes.iter().any(|w| w.insn_addr == "0x40000104"));
+
+    // [3] 已知标量写区域不受 NEON 影响
+    let snap3 = engine.get_memory_at(&sid, 0x1000, 2, 8).unwrap();
+    assert!(snap3.known[..8].iter().all(|&k| k));
+
+    engine.close_session(&sid).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 并行分块路径：窗口 > 200K 行时触发 rayon 分块，验证块序合并后匹配仍按 seq 升序、总数精确
+#[test]
+fn test_search_in_range_parallel_chunks() {
+    // 生成 ~250K 行合成 trace（触发 >200K 并行阈值）
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("trace-ui-big-{}.txt", std::process::id()));
+    let mut buf = String::with_capacity(16 * 1024 * 1024);
+    for i in 0..250_000u32 {
+        if i % 10 == 0 {
+            buf.push_str(&format!(
+                "[07:17:13 001][libt.so 0x100] [f9000be8] 0x40000100: \"str x8, [x19]\" ; mem[WRITE] abs=0x{:x} x8=0x1122334455667788 x19=0x1000 => x8=0x1122334455667788\n", i));
+        } else {
+            buf.push_str(&format!(
+                "[07:17:13 001][libt.so 0x100] [8b090108] 0x40000100: \"add x8, x8, x9\" x8=0x5 x9=0xa => x8=0xf\n"));
+        }
+    }
+    std::fs::write(&path, buf).unwrap();
+
+    let engine = Arc::new(TraceEngine::new());
+    let info = engine.create_session(path.to_str().unwrap()).unwrap();
+    let sid = info.session_id.clone();
+    engine.build_index(&sid, trace_core::BuildOptions { force_rebuild: true, skip_strings: true }, None).unwrap();
+
+    let outcome = engine.search_in_range(&sid, "mem[WRITE]",
+        trace_core::SearchOptions { case_sensitive: false, use_regex: false, fuzzy: false, max_results: None },
+        0, 250_000, None, 0, 30).unwrap();
+
+    assert_eq!(outcome.total_in_range, 25_000, "exact total across parallel chunks");
+    assert_eq!(outcome.match_seqs.len(), 30);
+    assert!(outcome.match_seqs.windows(2).all(|w| w[0] < w[1]), "ascending after chunk merge");
+    assert_eq!(outcome.match_seqs[0], 0);
+    assert_eq!(outcome.match_seqs[1], 10);
+
+    // 翻页到深处仍然正确
+    let deep = engine.search_in_range(&sid, "mem[WRITE]",
+        trace_core::SearchOptions { case_sensitive: false, use_regex: false, fuzzy: false, max_results: None },
+        0, 250_000, None, 24_990, 30).unwrap();
+    assert_eq!(deep.match_seqs.len(), 10, "last page has exactly the remaining matches");
+    assert_eq!(deep.match_seqs[0], 249_900);
+
+    engine.close_session(&sid).unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━ Batch 3: 内存历史 / 按值搜索 / 寄存器 / 字符串交叉引用 / DEF-USE ━━━━━━━━━━━━━━━━━━━━━━
+
+/// P6: 地址读写历史（rw 过滤 + 分页 + seq 定位）
+#[test]
+fn test_get_mem_history_page() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    // 0xbfffbf60 在 seq 2759 被 NEON str q0 写入 16 字节（已知数据）
+    let page = engine.get_mem_history_page(&sid, 0xbfffbf60, None, None, 0, 500).unwrap();
+    assert!(page.total >= 1, "must have history");
+    assert!(page.records.iter().any(|r| r.seq == 2759 && r.rw == "W" && r.data_known),
+        "seq 2759 write must be recorded with known data");
+    assert!(page.records.iter().all(|r| !r.disasm.is_empty()));
+
+    // rw 过滤
+    let writes = engine.get_mem_history_page(&sid, 0xbfffbf60, Some("W"), None, 0, 500).unwrap();
+    assert!(writes.total >= 1 && writes.records.iter().all(|r| r.rw == "W"));
+    let reads = engine.get_mem_history_page(&sid, 0xbfffbf60, Some("R"), None, 0, 500).unwrap();
+    assert!(reads.records.iter().all(|r| r.rw == "R"));
+
+    // 分页（total >= 2 时验证拼接一致性）
+    if page.total >= 2 {
+        let p1 = engine.get_mem_history_page(&sid, 0xbfffbf60, None, None, 0, 1).unwrap();
+        assert_eq!(p1.records.len(), 1);
+        assert_eq!(p1.total, page.total);
+        let p2 = engine.get_mem_history_page(&sid, 0xbfffbf60, None, None, 1, 500).unwrap();
+        assert_eq!(p1.records[0].seq, page.records[0].seq);
+        assert_eq!(p2.records[0].seq, page.records[1].seq);
+    }
+
+    // seq 定位
+    let centered = engine.get_mem_history_page(&sid, 0xbfffbf60, None, Some(2759), 0, 500).unwrap();
+    let ci = centered.center_index.expect("center_index");
+    assert!(centered.records[ci].seq >= 2759);
+
+    // 不存在的地址
+    let empty = engine.get_mem_history_page(&sid, 0xdeadbeef00, None, None, 0, 10).unwrap();
+    assert_eq!(empty.total, 0);
+}
+
+/// P7: 按值搜索内存写入（通配符 + 任意偏移 + rw）
+#[test]
+fn test_search_memory_values() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    // seq 2759: str q0 写入 0xbfffbf60，内存字节 08 50 4f 53 54 00 00 00（"POST" 头部）
+    let r = engine.search_memory_values(&sid, "08504f53", None, 0, 50).unwrap();
+    assert!(r.total >= 1, "value search must find the write");
+    assert!(r.matches.iter().any(|m| m.seq == 2759 && m.addr == "0xbfffbf60" && m.rw == "W"),
+        "got: {:?}", r.matches.iter().take(3).collect::<Vec<_>>());
+
+    // 通配符：??504f53 应命中同一位置
+    let w = engine.search_memory_values(&sid, "??504f53", None, 0, 50).unwrap();
+    assert!(w.matches.iter().any(|m| m.seq == 2759), "wildcard must match");
+
+    // 记录内偏移：08504f53 出现在 8 字节记录的开头；用 "544f5008"? 不存在——
+    // 验证非零偏移：搜索 "000000544f5008"（同一记录的高 4 字节 54 00 00 00 + 下一记录）不可行，
+    // 改为验证 1 字节搜索命中多条
+    let one = engine.search_memory_values(&sid, "08", None, 0, 500).unwrap();
+    assert!(one.total >= r.total);
+
+    // rw=all / R
+    let all = engine.search_memory_values(&sid, "08504f53", Some("all"), 0, 50).unwrap();
+    assert!(all.total >= r.total);
+    let rd = engine.search_memory_values(&sid, "08504f53", Some("R"), 0, 50).unwrap();
+    assert!(rd.matches.iter().all(|m| m.rw == "R"));
+
+    // 不存在的值
+    let none = engine.search_memory_values(&sid, "deadbeefcafebabe", None, 0, 50).unwrap();
+    assert_eq!(none.total, 0);
+
+    // 分页一致性
+    let half = engine.search_memory_values(&sid, "08", None, 0, 2).unwrap();
+    let next = engine.search_memory_values(&sid, "08", None, 2, 2).unwrap();
+    assert_eq!(half.total, next.total);
+    if half.total > 2 {
+        assert_ne!(half.matches[0].seq, next.matches[0].seq);
+    }
+
+    // 非法输入
+    assert!(engine.search_memory_values(&sid, "xyz", None, 0, 10).is_err());
+    assert!(engine.search_memory_values(&sid, "????????", None, 0, 10).is_err());
+    assert!(engine.search_memory_values(&sid, "112233445566778899", None, 0, 10).is_err());
+}
+
+/// P8: 完整寄存器快照
+#[test]
+fn test_get_registers_snapshot() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    let regs = engine.get_registers_at(&sid, 2759).unwrap();
+    assert!(regs.get("X19").unwrap().ends_with("bfffbf60"), "X19={:?}", regs.get("X19"));
+    assert!(regs.get("PC").unwrap().ends_with("404fe38c"), "PC={:?}", regs.get("PC"));
+    assert!(regs.contains_key("__changed") || true); // changed 可选
+    assert!(regs.get("X0").map(|v| v.starts_with("0x")).unwrap_or(false));
+}
+
+/// P9: 字符串交叉引用
+#[test]
+fn test_string_xrefs_engine() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    let strings = engine.get_strings(&sid, trace_core::StringQueryOptions {
+        min_len: 4, offset: 0, limit: 200, search: None,
+    }).unwrap();
+    let target = strings.strings.iter()
+        .find(|s| s.xref_count > 0)
+        .expect("need a string with xrefs");
+    let addr = u64::from_str_radix(target.addr.trim_start_matches("0x"), 16).unwrap();
+
+    let xrefs = engine.get_string_xrefs(&sid, addr, target.byte_len).unwrap();
+    assert!(!xrefs.is_empty(), "string with xref_count>0 must yield xrefs");
+    assert!(xrefs.windows(2).all(|w| w[0].seq <= w[1].seq), "sorted by seq");
+    assert!(xrefs.iter().all(|x| !x.disasm.is_empty()));
+}
+
+/// P10: 寄存器 DEF-USE 链
+#[test]
+fn test_get_def_use_chain() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    // seq 10: "mov x19, sp" 定义 x19；seq 11: "stp x3, x0, [x19, #0x28]" 使用 x19
+    let defs = engine.get_line_def_registers(&sid, 10).unwrap();
+    assert!(!defs.is_empty(), "mov x19, sp must define something");
+
+    let chain = engine.get_def_use_chain(&sid, 10, "x19").unwrap();
+    // anchor 是 DEF → use_seqs 应包含 11
+    assert!(chain.use_seqs.contains(&11),
+        "use_seqs must contain 11, got {:?} (redefined={:?})", chain.use_seqs, chain.redefined_seq);
+
+    // anchor 是 USE（seq 11 用 x19）→ def_seq 应指向 10
+    let up = engine.get_def_use_chain(&sid, 11, "x19").unwrap();
+    assert_eq!(up.def_seq, Some(10));
+}

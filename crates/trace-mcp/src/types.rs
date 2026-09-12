@@ -23,7 +23,7 @@ pub struct GetTraceLinesRequest {
     pub session_id: Option<String>,
     #[schemars(description = "Starting line number (0-based sequence number)")]
     pub start_seq: u32,
-    #[schemars(description = "Number of lines to retrieve (default: 20, max: 100)")]
+    #[schemars(description = "Number of lines to retrieve (default: 20, max: 2000)")]
     #[serde(default = "default_line_count")]
     pub count: u32,
     #[schemars(description = "Return full TraceLine fields including raw, reg_before, so_offset, mem_size (default: false)")]
@@ -62,14 +62,17 @@ pub struct SearchInstructionsRequest {
     #[schemars(description = "Case-sensitive matching")]
     #[serde(default)]
     pub case_sensitive: bool,
-    #[schemars(description = "Max results to return (default: 30, max: 200)")]
+    #[schemars(description = "Max results per page (default: 30, max: 500)")]
     pub max_results: Option<u32>,
+    #[schemars(description = "Pagination offset (default: 0). Combine with max_results to walk through all matches; total_matches always reports the exact count in the window")]
+    #[serde(default)]
+    pub offset: Option<u32>,
     #[schemars(description = "Return full TraceLine fields including raw, reg_before, so_offset, mem_size (default: false)")]
     #[serde(default)]
     pub full: bool,
-    #[schemars(description = "Limit search to seq range, e.g. '3000-6000'")]
+    #[schemars(description = "Only scan this seq window, e.g. '3000-6000' (inclusive). The window is scanned directly — matches are no longer lost to global truncation")]
     pub seq_range: Option<String>,
-    #[schemars(description = "Filter results by SO offset address range, e.g. '0x246F00-0x249800'")]
+    #[schemars(description = "Filter by instruction address range, e.g. '0x246F00-0x249800'. Matches if EITHER the module-relative SO offset OR the absolute instruction address falls in the range")]
     pub addr_range: Option<String>,
 }
 
@@ -89,6 +92,8 @@ pub struct GetTaintedLinesRequest {
     #[schemars(description = "Filter out lines that only modify stack/frame pointer registers (sp, x29). Default: true")]
     #[serde(default = "default_true")]
     pub ignore_stack_ops: bool,
+    #[schemars(description = "Extra noise registers to filter, comma-separated, e.g. 'x21,x22,x26'. Lines whose ONLY register changes are these (plus sp/x29 if ignore_stack_ops) are dropped. Use this to cut VM dispatcher noise in taint results")]
+    pub ignore_regs: Option<String>,
     #[schemars(description = "Filter by SO offset address range, e.g. '0x246F00-0x249800'")]
     pub addr_range: Option<String>,
     #[schemars(description = "Include N non-tainted context lines before/after each tainted line (default: 0, max: 5)")]
@@ -161,6 +166,8 @@ pub struct TaintAnalysisRequest {
     #[schemars(description = "Filter out lines that only modify stack/frame pointer registers (default: true)")]
     #[serde(default = "default_true")]
     pub ignore_stack_ops: bool,
+    #[schemars(description = "Extra noise registers to filter, comma-separated, e.g. 'x21,x22,x26'. Lines whose ONLY register changes are these (plus sp/x29 if ignore_stack_ops) are dropped. Use this to cut VM dispatcher noise in taint results")]
+    pub ignore_regs: Option<String>,
 }
 
 fn default_inline_lines() -> u32 { 30 }
@@ -192,3 +199,73 @@ pub struct AnalyzeCryptoRequest {
 }
 
 fn default_crypto_context() -> u32 { 3 }
+
+// ── Batch 3: 内存历史 / 按值搜索 / 寄存器快照 / 字符串交叉引用 / DEF-USE ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetMemHistoryRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Memory address in hex (e.g. '0xbffff000')")]
+    pub address: String,
+    #[schemars(description = "Filter: 'R' reads only, 'W' writes only, omit for all")]
+    pub rw: Option<String>,
+    #[schemars(description = "Reference seq: response includes center_index pointing at the first record at/after this seq")]
+    pub seq: Option<u32>,
+    #[schemars(description = "Pagination offset (default: 0)")]
+    #[serde(default)]
+    pub offset: u32,
+    #[schemars(description = "Max records per page (default: 50, max: 500)")]
+    #[serde(default = "default_mem_history_count")]
+    pub count: u32,
+}
+
+fn default_mem_history_count() -> u32 { 50 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchMemoryRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Hex bytes in MEMORY order to find in mem records, e.g. '5d13d2b15aafa27f'. \
+        Use '??' or '**' as wildcard bytes (e.g. '5d13??b1'). 1-8 bytes. Byte-aligned match at any offset inside each record")]
+    pub value: String,
+    #[schemars(description = "Search reads or writes: 'W' (default), 'R', or 'all'")]
+    pub rw: Option<String>,
+    #[schemars(description = "Pagination offset (default: 0)")]
+    #[serde(default)]
+    pub offset: u32,
+    #[schemars(description = "Max matches per page (default: 30, max: 500)")]
+    #[serde(default = "default_mem_search_count")]
+    pub count: u32,
+}
+
+fn default_mem_search_count() -> u32 { 30 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetRegistersRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Line number to get the full register snapshot at")]
+    pub seq: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetStringXrefsRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "String memory address in hex (from get_strings)")]
+    pub address: String,
+    #[schemars(description = "String byte length (from get_strings 'byte_len'; default: 64, max: 4096)")]
+    pub length: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetDefUseRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Anchor line number")]
+    pub seq: u32,
+    #[schemars(description = "Register name (e.g. 'x19'). Given → def-use chain for that register at this line; \
+        omitted → just the registers this line defines")]
+    pub reg: Option<String>,
+}

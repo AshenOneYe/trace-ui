@@ -14,6 +14,9 @@ pub struct MemAccessRecord {
     pub rw: MemRw,
     pub data: u64,
     pub size: u8,
+    /// false = trace 行中未打印数据值（如 NEON/SIMD 写入无 q 寄存器值）。
+    /// 写操作仍需记录（用于写入归因），但内存重建时应视为未知。
+    pub data_known: bool,
 }
 
 #[derive(Serialize, Deserialize)]

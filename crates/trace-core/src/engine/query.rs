@@ -36,6 +36,32 @@ fn resolve_offset(
     format!("0x{:x}", abs_addr)
 }
 
+/// FlatMemAccessRecord → MemHistoryRecord DTO（含 disasm / so_offset 解析）
+fn mem_rec_to_dto(
+    rec: &crate::flat::mem_access::FlatMemAccessRecord,
+    seq: u32,
+    line_index: &LineIndexView<'_>,
+    data: &[u8],
+    format: TraceFormat,
+) -> MemHistoryRecord {
+    let disasm = line_index.get_line(data, seq)
+        .and_then(|raw| match format {
+            TraceFormat::Unidbg => parse_trace_line(seq, raw),
+            TraceFormat::Gumtrace => parse_trace_line_gumtrace(seq, raw),
+        })
+        .map(|t| t.disasm)
+        .unwrap_or_default();
+    MemHistoryRecord {
+        seq,
+        rw: if rec.is_read() { "R".to_string() } else { "W".to_string() },
+        data: format!("0x{:x}", rec.data),
+        size: rec.size,
+        insn_addr: resolve_offset(seq, rec.insn_addr, Some(line_index), data),
+        disasm,
+        data_known: rec.is_data_known(),
+    }
+}
+
 /// 将 CallTreeNode 转为 DTO
 fn node_to_dto(
     n: &CallTreeNode,
@@ -240,12 +266,18 @@ impl super::TraceEngine {
         let mut bytes = vec![0u8; len];
         let mut known = vec![false; len];
 
+        // 数据值未知的写入归因（如 NEON/SIMD）：按 (seq, 基地址) 去重
+        let mut unknown_writes: Vec<UnknownDataWrite> = Vec::new();
+        let mut seen_unknown: std::collections::HashSet<(u32, u64)> = std::collections::HashSet::new();
+
         for offset in 0..len {
             let byte_addr = base + offset as u64;
 
             // 检查 byte_addr-7 .. byte_addr 共 8 个可能的基地址
             let mut best_seq: Option<u32> = None;
             let mut best_byte: u8 = 0;
+            let mut best_data_known = false;
+            let mut best_rec_addr: u64 = 0;
 
             for check_offset in 0u64..=7 {
                 if byte_addr < check_offset {
@@ -257,23 +289,46 @@ impl super::TraceEngine {
                     let pos = records.partition_point(|r| r.seq <= seq);
                     if pos > 0 {
                         let rec = &records[pos - 1];
-                        let candidate_seq = rec.seq;
-                        let candidate_data = rec.data;
-                        let candidate_size = rec.size;
 
-                        if check_offset < candidate_size as u64 {
-                            if best_seq.is_none() || candidate_seq > best_seq.unwrap() {
-                                best_seq = Some(candidate_seq);
-                                best_byte = ((candidate_data >> (check_offset * 8)) & 0xFF) as u8;
+                        if check_offset < rec.size as u64 {
+                            if best_seq.is_none() || rec.seq > best_seq.unwrap() {
+                                // 数据未知的 READ 不定义内存状态，跳过（回退到更早的记录）
+                                if !rec.is_data_known() && rec.is_read() {
+                                    continue;
+                                }
+                                best_seq = Some(rec.seq);
+                                best_rec_addr = check_addr;
+                                best_data_known = rec.is_data_known();
+                                best_byte = if rec.is_data_known() {
+                                    ((rec.data >> (check_offset * 8)) & 0xFF) as u8
+                                } else {
+                                    0
+                                };
                             }
                         }
                     }
                 }
             }
 
-            if best_seq.is_some() {
-                bytes[offset] = best_byte;
-                known[offset] = true;
+            if let Some(bseq) = best_seq {
+                if best_data_known {
+                    bytes[offset] = best_byte;
+                    known[offset] = true;
+                } else {
+                    // 最新写入的数据值未知（NEON/SIMD）：字节未知，但记录写入归因
+                    if seen_unknown.insert((bseq, best_rec_addr)) {
+                        if let Some(records) = mem_view.query(best_rec_addr) {
+                            if let Some(rec) = records.iter().find(|r| r.seq == bseq) {
+                                unknown_writes.push(UnknownDataWrite {
+                                    addr: format!("0x{:x}", best_rec_addr),
+                                    seq: rec.seq,
+                                    insn_addr: format!("0x{:x}", rec.insn_addr),
+                                    size: rec.size,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -282,6 +337,7 @@ impl super::TraceEngine {
             bytes,
             known,
             length: len as u32,
+            unknown_data_writes: unknown_writes,
         })
     }
 
@@ -333,6 +389,7 @@ impl super::TraceEngine {
                         size: rec.size,
                         insn_addr: resolve_offset(rec.seq, rec.insn_addr, line_index.as_ref(), data),
                         disasm,
+                        data_known: rec.is_data_known(),
                     }
                 })
                 .collect()
@@ -390,11 +447,187 @@ impl super::TraceEngine {
                     size: rec.size,
                     insn_addr: resolve_offset(rec.seq, rec.insn_addr, Some(&line_index), data),
                     disasm,
+                    data_known: rec.is_data_known(),
                 }
             })
             .collect();
 
         Ok(result)
+    }
+
+    /// 地址读写历史（rw 过滤 + 分页 + 可选 seq 定位）。
+    /// rw: Some("R") 只读 / Some("W") 只写 / None 全部
+    pub fn get_mem_history_page(
+        &self,
+        session_id: &str,
+        addr: u64,
+        rw: Option<&str>,
+        center_seq: Option<u32>,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<MemHistoryPage> {
+        let handle = self.get_handle(session_id)?;
+        let state = handle.state.read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+
+        let mem_view = state.mem_accesses_view()
+            .ok_or(TraceError::IndexNotReady)?;
+
+        let records = match mem_view.query(addr) {
+            Some(r) => r,
+            None => return Ok(MemHistoryPage { total: 0, center_index: None, records: Vec::new() }),
+        };
+
+        let want_read = rw.and_then(|s| match s.to_ascii_uppercase().as_str() {
+            "R" | "READ" => Some(true),
+            "W" | "WRITE" => Some(false),
+            _ => None,
+        });
+        let filtered: Vec<&crate::flat::mem_access::FlatMemAccessRecord> = records.iter()
+            .filter(|r| want_read.map_or(true, |wr| r.is_read() == wr))
+            .collect();
+        let total = filtered.len();
+        let center_index = center_seq
+            .map(|cs| filtered.partition_point(|r| r.seq < cs).min(total.saturating_sub(1)));
+
+        let start = start_index.min(total);
+        let end = (start + limit).min(total);
+
+        let line_index = state.line_index_view()
+            .ok_or(TraceError::IndexNotReady)?;
+        let data: &[u8] = &state.mmap;
+        let format = state.trace_format;
+
+        let dtos = filtered[start..end].iter()
+            .map(|rec| mem_rec_to_dto(rec, rec.seq, &line_index, data, format))
+            .collect();
+
+        Ok(MemHistoryPage { total, center_index, records: dtos })
+    }
+
+    /// 按值搜索内存访问记录。
+    /// pattern: 内存字节序的十六进制（如 "5d13d2b15aafa27f"），支持 ?? / ** 通配字节，
+    /// 在每条记录内做字节对齐的任意偏移匹配。rw: None=只写(默认), Some("R")=读, Some("W")=写, Some("all")=全部
+    pub fn search_memory_values(
+        &self,
+        session_id: &str,
+        pattern: &str,
+        rw: Option<&str>,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<MemoryValueSearchResult> {
+        // ── 解析 pattern → (value, mask, nbytes) ──
+        let cleaned: String = pattern.trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .replace([' ', '_', '-'], "");
+        if cleaned.is_empty() {
+            return Err(TraceError::InvalidArgument("空的搜索值".into()));
+        }
+        let mut value: u64 = 0;
+        let mut mask: u64 = 0;
+        let mut nbytes: usize = 0;
+        let raw = cleaned.as_bytes();
+        if raw.len() % 2 != 0 {
+            return Err(TraceError::InvalidArgument(format!("十六进制长度必须为偶数: {}", pattern)));
+        }
+        if raw.len() > 16 {
+            return Err(TraceError::InvalidArgument("搜索值长度须为 1-8 字节".into()));
+        }
+        let mut i = 0;
+        while i < raw.len() {
+            let pair = &cleaned[i..i + 2];
+            if pair == "??" || pair == "**" {
+                // 通配字节：value/mask 均置 0
+            } else {
+                let b = u8::from_str_radix(pair, 16)
+                    .map_err(|_| TraceError::InvalidArgument(format!("非法十六进制字节: '{}'", pair)))?;
+                value |= (b as u64) << (nbytes * 8);
+                mask |= 0xffu64 << (nbytes * 8);
+            }
+            nbytes += 1;
+            i += 2;
+        }
+        if nbytes == 0 || nbytes > 8 {
+            return Err(TraceError::InvalidArgument("搜索值长度须为 1-8 字节".into()));
+        }
+        if mask == 0 {
+            return Err(TraceError::InvalidArgument("至少需要一个非通配字节".into()));
+        }
+
+        let handle = self.get_handle(session_id)?;
+        let state = handle.state.read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+
+        let mem_view = state.mem_accesses_view()
+            .ok_or(TraceError::IndexNotReady)?;
+
+        let want_read = rw.and_then(|s| match s.to_ascii_uppercase().as_str() {
+            "R" | "READ" => Some(true),
+            "W" | "WRITE" => Some(false),
+            _ => None, // "all" / None
+        });
+
+        // ── 扫描全部记录（字节对齐任意偏移匹配）──
+        let mut matched: Vec<(u64, u32)> = Vec::new(); // (addr, seq)
+        let mut matched_recs: Vec<&crate::flat::mem_access::FlatMemAccessRecord> = Vec::new();
+        for (addr, rec) in mem_view.iter_all() {
+            if !rec.is_data_known() {
+                continue;
+            }
+            match want_read {
+                Some(wr) if rec.is_read() != wr => continue,
+                None if !rec.is_write() => continue, // 默认只搜写入
+                _ => {}
+            }
+            let rec_size = rec.size as usize;
+            if rec_size < nbytes {
+                continue;
+            }
+            for shift in 0..=(rec_size - nbytes) {
+                if (rec.data >> (shift * 8)) & mask == value {
+                    matched.push((addr + shift as u64, rec.seq));
+                    matched_recs.push(rec);
+                    break;
+                }
+            }
+        }
+
+        // 按 seq 升序（iter_all 按地址序）
+        let mut order: Vec<usize> = (0..matched.len()).collect();
+        order.sort_by_key(|&i| matched[i].1);
+        let total = matched.len();
+        let start = start_index.min(total);
+        let end = (start + limit).min(total);
+
+        let line_index = state.line_index_view()
+            .ok_or(TraceError::IndexNotReady)?;
+        let data: &[u8] = &state.mmap;
+        let format = state.trace_format;
+
+        let matches: Vec<MemoryWriteMatch> = order[start..end].iter()
+            .map(|&i| {
+                let (addr, seq) = matched[i];
+                let rec = matched_recs[i];
+                MemoryWriteMatch {
+                    seq,
+                    addr: format!("0x{:x}", addr),
+                    rw: if rec.is_read() { "R".into() } else { "W".into() },
+                    size: rec.size,
+                    data: format!("0x{:x}", rec.data),
+                    insn_addr: resolve_offset(seq, rec.insn_addr, Some(&line_index), data),
+                    disasm: line_index.get_line(data, seq)
+                        .and_then(|raw| match format {
+                            TraceFormat::Unidbg => parse_trace_line(seq, raw),
+                            TraceFormat::Gumtrace => parse_trace_line_gumtrace(seq, raw),
+                        })
+                        .map(|t| t.disasm)
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        Ok(MemoryValueSearchResult { total, matches })
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━ Registers ━━━━━━━━━━━━━━━━━━━━━━
