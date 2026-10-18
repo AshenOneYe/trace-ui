@@ -96,6 +96,8 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 > 详细的工具说明、实战场景和使用指南请参考 [MCP 使用指南](docs/mcp-guide.md)
 >
 > VM-aware 分析、工作区和持久化任务说明见 [VM Analysis Workspace](docs/vm-analysis.md)。
+>
+> 真实 AVM 形态的能力评估与已知边界见 [AzurPromilia / tprt AVM 评估](docs/case-study-azurpromilia-tprt.md)。
 
 ## 功能详解
 
