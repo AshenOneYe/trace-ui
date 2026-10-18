@@ -181,5 +181,15 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let mut tree = engine.get_call_tree(&session_id)?;
+    tree.sort_by_key(|node| std::cmp::Reverse(node.line_count));
+    println!("call_tree nodes={}", tree.len());
+    for node in tree.iter().take(15) {
+        println!(
+            "tree addr={} name={:?} lines={} seq={}..{}",
+            node.func_addr, node.func_name, node.line_count, node.entry_seq, node.exit_seq
+        );
+    }
+
     Ok(())
 }
