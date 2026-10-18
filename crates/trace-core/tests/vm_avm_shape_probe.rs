@@ -155,11 +155,13 @@ fn probe_avm_shape() {
     );
     for dispatcher in &result.dispatchers {
         println!(
-            "dispatcher line={} addr={:#x} targets={} executions={}",
+            "dispatcher line={} addr={:#x} kind={:?} targets={} executions={} reason={}",
             dispatcher.line.0,
             dispatcher.address,
+            dispatcher.kind,
             dispatcher.target_count,
-            dispatcher.execution_count
+            dispatcher.execution_count,
+            dispatcher.reason
         );
     }
     let mut negative = 0usize;

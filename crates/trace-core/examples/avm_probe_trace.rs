@@ -87,12 +87,14 @@ fn main() -> anyhow::Result<()> {
     dispatchers.sort_by_key(|d| std::cmp::Reverse((d.target_count, d.execution_count)));
     for dispatcher in dispatchers.iter().take(15) {
         println!(
-            "dispatcher line={} addr={:#x} targets={} execs={} conf={:.2}",
+            "dispatcher line={} addr={:#x} kind={:?} targets={} execs={} conf={:.2} reason={}",
             dispatcher.line.get(),
             dispatcher.address,
+            dispatcher.kind,
             dispatcher.target_count,
             dispatcher.execution_count,
-            dispatcher.confidence
+            dispatcher.confidence,
+            dispatcher.reason
         );
     }
 

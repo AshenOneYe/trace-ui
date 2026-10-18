@@ -1,13 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::position::{GlobalLine, LineRange};
 
 use super::types::{
-    CfgEdgeKind, DispatcherCandidate, EvidenceKind, EvidenceRef, HandlerCluster, HandlerInstance,
-    HandlerSemantics, VirtualCfgEdge, VmAnalysisResult, VmInstruction, VmOperation, VmRegion,
-    VmStateCandidate, VmStateRole,
+    CfgEdgeKind, DispatchKind, DispatcherCandidate, EvidenceKind, EvidenceRef, HandlerCluster,
+    HandlerInstance, HandlerSemantics, VirtualCfgEdge, VmAnalysisResult, VmInstruction,
+    VmOperation, VmRegion, VmStateCandidate, VmStateRole,
 };
 use super::{Hypothesis, HypothesisSource, HypothesisStatus};
 
@@ -86,6 +86,7 @@ pub struct VmAnalysisConfig {
     pub min_dispatch_targets: usize,
     pub min_dispatch_executions: u64,
     pub max_handler_instances: usize,
+    pub allow_provisional_primary: bool,
 }
 
 impl Default for VmAnalysisConfig {
@@ -97,6 +98,7 @@ impl Default for VmAnalysisConfig {
             min_dispatch_targets: 2,
             min_dispatch_executions: 2,
             max_handler_instances: 100_000,
+            allow_provisional_primary: false,
         }
     }
 }
@@ -124,6 +126,35 @@ impl std::error::Error for VmAnalysisError {}
 
 pub struct VmAnalyzer {
     config: VmAnalysisConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DispatchSignature {
+    guest_fetch: bool,
+    nibble_decode: bool,
+    table_load: bool,
+    callback_array_load: bool,
+    call_link: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchExecution {
+    line: GlobalLine,
+    target: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DispatchSite {
+    executions: Vec<DispatchExecution>,
+    targets: BTreeSet<u64>,
+    signature: DispatchSignature,
+    indirect_register: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DispatchInventory {
+    candidates: Vec<DispatcherCandidate>,
+    executions_by_site: BTreeMap<u64, Vec<DispatchExecution>>,
 }
 
 impl Default for VmAnalyzer {
@@ -162,6 +193,8 @@ impl VmAnalyzer {
 
         let mut frequencies: BTreeMap<u64, u64> = BTreeMap::new();
         let mut lines_by_address: BTreeMap<u64, (GlobalLine, GlobalLine)> = BTreeMap::new();
+        let mut indirect_by_address: BTreeSet<u64> = BTreeSet::new();
+        let mut targets_by_address: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
         for event in events {
             if is_cancelled() {
                 return Err(VmAnalysisError::Cancelled);
@@ -172,6 +205,15 @@ impl VmAnalyzer {
                 .or_insert((event.line, event.line));
             span.0 = span.0.min(event.line);
             span.1 = span.1.max(event.line);
+            if event.indirect_branch {
+                indirect_by_address.insert(event.address);
+                if let Some(target) = event.branch_target {
+                    targets_by_address
+                        .entry(event.address)
+                        .or_default()
+                        .insert(target);
+                }
+            }
         }
 
         let address_clusters = cluster_addresses(
@@ -204,14 +246,15 @@ impl VmAnalyzer {
                 .iter()
                 .filter(|address| frequencies.get(address).copied().unwrap_or(0) > 1)
                 .count() as u64;
-            let indirect_dispatches = events
+            let indirect_dispatches = addresses
                 .iter()
-                .filter(|event| {
-                    event.indirect_branch
-                        && addresses.binary_search(&event.address).is_ok()
-                        && event
-                            .branch_target
-                            .is_some_and(|target| target >= first_addr && target <= last_addr)
+                .filter(|address| {
+                    indirect_by_address.contains(*address)
+                        && targets_by_address.get(*address).is_some_and(|targets| {
+                            targets
+                                .iter()
+                                .any(|target| *target >= first_addr && *target <= last_addr)
+                        })
                 })
                 .count() as u64;
 
@@ -239,16 +282,7 @@ impl VmAnalyzer {
                 + (repeated_instructions as f32 * 0.025))
                 .min(0.99);
             let region_id = format!("region-{index}");
-            let region_events: Vec<&NativeEvent> = events
-                .iter()
-                .filter(|event| start_line <= event.line && event.line < end_line)
-                .collect();
-            let native_addresses: Vec<u64> = region_events
-                .iter()
-                .map(|event| event.address)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            let native_addresses = addresses.clone();
 
             regions.push(VmRegion {
                 id: region_id,
@@ -276,9 +310,7 @@ impl VmAnalyzer {
                         detail: Some(format!(
                             "executions={}, indirect_dispatch={}",
                             frequencies.get(address).copied().unwrap_or(0),
-                            region_events.iter().any(|event| {
-                                event.address == *address && event.indirect_branch
-                            })
+                            indirect_by_address.contains(address)
                         )),
                     })
                     .collect(),
@@ -293,82 +325,156 @@ impl VmAnalyzer {
             });
         }
 
-        let dispatchers = self.find_dispatchers(trace_id, events, &regions, region_end);
+        let inventory = self.find_dispatchers(trace_id, events, &regions, region_end);
         if is_cancelled() {
             return Err(VmAnalysisError::Cancelled);
         }
-        let state_candidates =
-            self.infer_state_candidates(trace_id, events, &dispatchers, region_end);
+        let dispatchers = inventory.candidates;
+        let primary_dispatchers: Vec<&DispatcherCandidate> = dispatchers
+            .iter()
+            .filter(|dispatcher| {
+                matches!(
+                    dispatcher.kind,
+                    DispatchKind::VmPrimary | DispatchKind::VmProvisional
+                )
+            })
+            .collect();
 
-        let mut handler_instances = Vec::new();
-        for region in &regions {
-            if is_cancelled() {
-                return Err(VmAnalysisError::Cancelled);
-            }
-            let dispatches: Vec<&DispatcherCandidate> = dispatchers
-                .iter()
-                .filter(|dispatcher| dispatcher.region_id == region.id)
-                .collect();
-            for (dispatch_index, dispatcher) in dispatches.iter().enumerate() {
-                if handler_instances.len() >= self.config.max_handler_instances {
-                    break;
-                }
-                let next_dispatch_line = dispatches
-                    .get(dispatch_index + 1)
-                    .map(|next| next.line)
-                    .unwrap_or(region.lines.end);
-                let instance_events: Vec<&NativeEvent> = events
-                    .iter()
-                    .filter(|event| event.line > dispatcher.line && event.line < next_dispatch_line)
-                    .collect();
-                if instance_events.is_empty() {
-                    continue;
-                }
-                let entry_line = instance_events[0].line;
-                let end_line = instance_events
-                    .last()
-                    .expect("non-empty")
+        #[derive(Debug)]
+        struct HandlerInterval<'a> {
+            dispatcher: &'a DispatcherCandidate,
+            dispatch_line: GlobalLine,
+            start: GlobalLine,
+            end: GlobalLine,
+            target: Option<u64>,
+            capped_tail: bool,
+        }
+
+        let mut intervals = Vec::new();
+        for dispatcher in &primary_dispatchers {
+            let Some(executions) = inventory.executions_by_site.get(&dispatcher.address) else {
+                continue;
+            };
+            for pair in executions.windows(2) {
+                let start = pair[0]
                     .line
                     .checked_add(1)
                     .ok_or(VmAnalysisError::LineOverflow)?;
-                let native_address = events
+                let end = pair[1].line;
+                if start < end {
+                    intervals.push(HandlerInterval {
+                        dispatcher,
+                        dispatch_line: pair[0].line,
+                        start,
+                        end,
+                        target: pair[0].target,
+                        capped_tail: false,
+                    });
+                }
+            }
+            if let Some(last) = executions.last() {
+                let start = last
+                    .line
+                    .checked_add(1)
+                    .ok_or(VmAnalysisError::LineOverflow)?;
+                let region_end_line = regions
                     .iter()
-                    .find(|event| event.line == dispatcher.line)
-                    .and_then(|event| event.branch_target)
-                    .unwrap_or(instance_events[0].address);
-                let template_hash = template_hash(&instance_events);
-                let id = format!("handler-{}-{}", dispatcher.line.0, native_address);
-                handler_instances.push(HandlerInstance {
-                    id,
-                    region_id: region.id.clone(),
-                    entry_line,
-                    end_line,
-                    native_address,
-                    dispatcher_line: Some(dispatcher.line),
-                    template_hash,
-                    cluster_id: None,
-                    unknown_effects: instance_events
-                        .iter()
-                        .filter(|event| {
-                            operation_for_mnemonic(&event.mnemonic) == VmOperation::Unknown
-                        })
-                        .map(|event| format!("unclassified {}", event.mnemonic))
-                        .collect(),
-                    evidence: vec![EvidenceRef {
-                        trace_id: trace_id.to_string(),
-                        lines: LineRange::new(dispatcher.line, end_line),
-                        native_address: Some(native_address),
-                        kind: EvidenceKind::HandlerSequence,
-                        detail: Some("execution interval between observed dispatches".to_string()),
-                    }],
-                });
+                    .find(|region| region.id == dispatcher.region_id)
+                    .map(|region| region.lines.end)
+                    .unwrap_or(region_end);
+                let capped_end = last
+                    .line
+                    .checked_add(4097)
+                    .ok_or(VmAnalysisError::LineOverflow)?;
+                let end = region_end_line.min(capped_end);
+                if start < end {
+                    intervals.push(HandlerInterval {
+                        dispatcher,
+                        dispatch_line: last.line,
+                        start,
+                        end,
+                        target: last.target,
+                        capped_tail: capped_end < region_end_line,
+                    });
+                }
             }
         }
+        intervals.sort_by_key(|interval| (interval.start, interval.end));
 
-        let mut instance_by_line: BTreeMap<GlobalLine, &NativeEvent> = BTreeMap::new();
-        for event in events {
-            instance_by_line.insert(event.line, event);
+        let mut handler_instances = Vec::new();
+        let mut instance_semantics: Vec<HandlerSemantics> = Vec::new();
+        let mut event_cursor = 0usize;
+        let mut last_handler_end = GlobalLine::ZERO;
+        let mut clipped_intervals = 0usize;
+        let mut capped_tail = false;
+        for interval in intervals {
+            if handler_instances.len() >= self.config.max_handler_instances {
+                break;
+            }
+            if is_cancelled() {
+                return Err(VmAnalysisError::Cancelled);
+            }
+            let start = interval.start.max(last_handler_end);
+            if start > interval.start {
+                clipped_intervals += 1;
+            }
+            if start >= interval.end {
+                continue;
+            }
+            while event_cursor < events.len() && events[event_cursor].line < start {
+                event_cursor += 1;
+            }
+            let begin = event_cursor;
+            while event_cursor < events.len() && events[event_cursor].line < interval.end {
+                event_cursor += 1;
+            }
+            if begin == event_cursor {
+                continue;
+            }
+            let slice = &events[begin..event_cursor];
+            let entry_line = slice[0].line;
+            let end_line = slice
+                .last()
+                .expect("non-empty slice")
+                .line
+                .checked_add(1)
+                .ok_or(VmAnalysisError::LineOverflow)?;
+            last_handler_end = end_line;
+            if interval.capped_tail {
+                capped_tail = true;
+            }
+            let template = template_hash(slice);
+            let semantics = infer_semantics(slice);
+            let native_address = interval.target.unwrap_or(slice[0].address);
+            let id = format!("handler-{}-{}", interval.dispatch_line.0, native_address);
+            handler_instances.push(HandlerInstance {
+                id,
+                region_id: interval.dispatcher.region_id.clone(),
+                entry_line,
+                end_line,
+                native_address,
+                dispatcher_line: Some(interval.dispatch_line),
+                template_hash: template,
+                cluster_id: None,
+                unknown_effects: semantics.unknown_effects.clone(),
+                evidence: vec![EvidenceRef {
+                    trace_id: trace_id.to_string(),
+                    lines: LineRange::new(interval.dispatch_line, end_line),
+                    native_address: Some(native_address),
+                    kind: EvidenceKind::HandlerSequence,
+                    detail: Some("execution interval after primary dispatcher".to_string()),
+                }],
+            });
+            instance_semantics.push(semantics);
         }
+
+        let state_candidates = self.infer_state_candidates(
+            trace_id,
+            events,
+            &dispatchers,
+            &handler_instances,
+            region_end,
+        );
 
         let mut grouped: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
         for (index, instance) in handler_instances.iter().enumerate() {
@@ -385,11 +491,7 @@ impl VmAnalyzer {
                 handler_instances[*index].cluster_id = Some(cluster_id.clone());
             }
             let representative = &handler_instances[indices[0]];
-            let semantics = infer_semantics(
-                handler_instances[indices[0]].entry_line,
-                handler_instances[indices[0]].end_line,
-                &instance_by_line,
-            );
+            let semantics = instance_semantics[indices[0]].clone();
             handler_clusters.push(HandlerCluster {
                 id: cluster_id,
                 region_id,
@@ -414,9 +516,7 @@ impl VmAnalyzer {
         }
 
         let mut vm_instructions = Vec::new();
-        for instance in &handler_instances {
-            let semantics =
-                infer_semantics(instance.entry_line, instance.end_line, &instance_by_line);
+        for (instance, semantics) in handler_instances.iter().zip(instance_semantics.iter()) {
             vm_instructions.push(VmInstruction {
                 id: format!("vm-insn-{}", instance.id),
                 handler_instance_id: instance.id.clone(),
@@ -436,7 +536,7 @@ impl VmAnalyzer {
                     .and_then(|value| u64::from_str_radix(value, 16).ok()),
                 native_lines: LineRange::new(instance.entry_line, instance.end_line),
                 confidence: semantics.confidence,
-                unknown_effects: semantics.unknown_effects,
+                unknown_effects: semantics.unknown_effects.clone(),
                 evidence: instance.evidence.clone(),
             });
         }
@@ -516,6 +616,32 @@ impl VmAnalyzer {
             }
         }
 
+        let mut warnings = vec![
+            "VM analysis is heuristic and experimental; validate every inference against native evidence"
+                .to_string(),
+        ];
+        if primary_dispatchers.is_empty() {
+            warnings.push(
+                "no dispatcher matched the VM primary signature; handler segmentation was skipped"
+                    .to_string(),
+            );
+        }
+        if clipped_intervals > 0 {
+            warnings.push(format!(
+                "{clipped_intervals} overlapping primary handler intervals were clipped"
+            ));
+        }
+        if handler_instances.len() >= self.config.max_handler_instances {
+            warnings.push(format!(
+                "handler instance limit {} reached; analysis was truncated",
+                self.config.max_handler_instances
+            ));
+        }
+        if capped_tail {
+            warnings
+                .push("an open-ended final handler interval was capped at 4096 lines".to_string());
+        }
+
         Ok(VmAnalysisResult {
             trace_id: trace_id.to_string(),
             regions,
@@ -526,10 +652,7 @@ impl VmAnalyzer {
             vm_instructions,
             cfg_edges,
             coverage: vec![LineRange::new(events[0].line, region_end)],
-            warnings: vec![
-                "VM analysis is heuristic and experimental; validate every inference against native evidence"
-                    .to_string(),
-            ],
+            warnings,
             algorithm_version: VM_ALGORITHM_VERSION.to_string(),
             experimental: true,
         })
@@ -541,56 +664,99 @@ impl VmAnalyzer {
         events: &[NativeEvent],
         regions: &[VmRegion],
         region_end: GlobalLine,
-    ) -> Vec<DispatcherCandidate> {
-        let mut by_address: BTreeMap<u64, (BTreeSet<u64>, Vec<GlobalLine>)> = BTreeMap::new();
-        for event in events.iter().filter(|event| event.indirect_branch) {
-            let Some(target) = event.branch_target else {
-                continue;
-            };
-            let entry = by_address.entry(event.address).or_default();
-            entry.0.insert(target);
-            entry.1.push(event.line);
+    ) -> DispatchInventory {
+        let mut sites: BTreeMap<u64, DispatchSite> = BTreeMap::new();
+        let mut window: VecDeque<&NativeEvent> = VecDeque::with_capacity(24);
+
+        for event in events {
+            if event.indirect_branch {
+                let site = sites.entry(event.address).or_insert_with(|| DispatchSite {
+                    executions: Vec::new(),
+                    targets: BTreeSet::new(),
+                    signature: DispatchSignature::default(),
+                    indirect_register: None,
+                });
+                let is_first_execution = site.executions.is_empty();
+                if is_first_execution {
+                    site.signature = signature_for_window(&window, event);
+                }
+                site.executions.push(DispatchExecution {
+                    line: event.line,
+                    target: event.branch_target,
+                });
+                if let Some(target) = event.branch_target {
+                    site.targets.insert(target);
+                }
+                site.indirect_register = event.indirect_register.clone();
+            }
+            window.push_back(event);
+            if window.len() > 24 {
+                window.pop_front();
+            }
         }
 
         let mut candidates = Vec::new();
-        for (address, (targets, lines)) in by_address {
-            if targets.len() < self.config.min_dispatch_targets
-                || (lines.len() as u64) < self.config.min_dispatch_executions
+        let mut executions_by_site = BTreeMap::new();
+        for (address, site) in sites {
+            let execution_count = site.executions.len() as u64;
+            if site.targets.len() < self.config.min_dispatch_targets
+                || execution_count < self.config.min_dispatch_executions
             {
                 continue;
             }
-            let execution_count = lines.len() as u64;
-            for line in lines {
-                let Some(region) = regions.iter().find(|region| {
-                    address >= region.address_start
-                        && address <= region.address_end
-                        && region.lines.contains(line)
-                }) else {
-                    continue;
-                };
-                let index = candidates.len();
-                candidates.push(DispatcherCandidate {
-                    id: format!("dispatcher-{index}"),
-                    region_id: region.id.clone(),
-                    line,
-                    address,
-                    target_count: targets.len(),
-                    execution_count,
-                    confidence: (0.4 + targets.len() as f32 * 0.1).min(0.98),
-                    evidence: vec![EvidenceRef {
-                        trace_id: trace_id.to_string(),
-                        lines: LineRange::new(line, line.checked_add(1).unwrap_or(region_end)),
-                        native_address: Some(address),
-                        kind: EvidenceKind::ControlFlow,
-                        detail: Some(format!(
-                            "observed dispatcher execution with {} distinct targets",
-                            targets.len()
-                        )),
-                    }],
-                });
-            }
+            let region = regions
+                .iter()
+                .find(|region| address >= region.address_start && address <= region.address_end);
+            let region_id = region
+                .map(|region| region.id.clone())
+                .unwrap_or_else(|| "unassigned".to_string());
+            let all_targets_in_region = region.is_some_and(|region| {
+                site.targets
+                    .iter()
+                    .all(|target| *target >= region.address_start && *target <= region.address_end)
+            });
+            let (kind, confidence, reason) = classify_dispatch_site(&site, all_targets_in_region);
+            let line = site
+                .executions
+                .first()
+                .map(|execution| execution.line)
+                .unwrap_or(GlobalLine::ZERO);
+            let index = candidates.len();
+            candidates.push(DispatcherCandidate {
+                id: format!("dispatcher-{index}-{address:x}"),
+                region_id,
+                line,
+                address,
+                target_count: site.targets.len(),
+                execution_count,
+                confidence,
+                kind,
+                reason: reason.to_string(),
+                evidence: vec![EvidenceRef {
+                    trace_id: trace_id.to_string(),
+                    lines: LineRange::new(line, line.checked_add(1).unwrap_or(region_end)),
+                    native_address: Some(address),
+                    kind: EvidenceKind::ControlFlow,
+                    detail: Some(format!(
+                        "site aggregated {} executions and {} distinct targets",
+                        execution_count,
+                        site.targets.len()
+                    )),
+                }],
+            });
+            executions_by_site.insert(address, site.executions);
         }
-        candidates
+
+        candidates.sort_by_key(|candidate| (candidate.line, candidate.address));
+        select_primary_sites(&mut candidates, self.config.allow_provisional_primary);
+        for (index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.id = format!("dispatcher-{index}-{:x}", candidate.address);
+        }
+
+        DispatchInventory {
+            candidates,
+            executions_by_site,
+        }
     }
 
     fn infer_state_candidates(
@@ -598,36 +764,100 @@ impl VmAnalyzer {
         trace_id: &str,
         events: &[NativeEvent],
         dispatchers: &[DispatcherCandidate],
+        handlers: &[HandlerInstance],
         region_end: GlobalLine,
     ) -> Vec<VmStateCandidate> {
+        if handlers.is_empty() {
+            return Vec::new();
+        }
+        let mut state_events: Vec<&NativeEvent> = Vec::new();
+        let mut cursor = 0usize;
+        for handler in handlers {
+            while cursor < events.len() && events[cursor].line < handler.entry_line {
+                cursor += 1;
+            }
+            while cursor < events.len() && events[cursor].line < handler.end_line {
+                state_events.push(&events[cursor]);
+                cursor += 1;
+            }
+        }
+        if state_events.is_empty() {
+            return Vec::new();
+        }
+
+        let primary_addresses: BTreeSet<u64> = dispatchers
+            .iter()
+            .filter(|dispatcher| {
+                matches!(
+                    dispatcher.kind,
+                    DispatchKind::VmPrimary | DispatchKind::VmProvisional
+                )
+            })
+            .map(|dispatcher| dispatcher.address)
+            .collect();
+        let mut vpc_indices = BTreeSet::new();
+        let mut vpc_samples = 0usize;
+        for (index, event) in events.iter().enumerate() {
+            if event.indirect_branch && primary_addresses.contains(&event.address) {
+                let start = index.saturating_sub(32);
+                for candidate in start..=index {
+                    vpc_indices.insert(candidate);
+                }
+                vpc_samples += 1;
+                if vpc_samples >= 4096 {
+                    break;
+                }
+            }
+        }
+        let vpc_events: Vec<&NativeEvent> =
+            vpc_indices.iter().map(|index| &events[*index]).collect();
+
+        let mut merged: BTreeMap<(VmStateRole, String), VmStateCandidate> = BTreeMap::new();
+        for candidate in detect_guest_pc_candidates(trace_id, &vpc_events, region_end) {
+            merge_state_candidate(&mut merged, candidate);
+        }
+
+        let dispatcher_lines: BTreeSet<GlobalLine> = dispatchers
+            .iter()
+            .filter(|dispatcher| {
+                matches!(
+                    dispatcher.kind,
+                    DispatchKind::VmPrimary | DispatchKind::VmProvisional
+                )
+            })
+            .map(|dispatcher| dispatcher.line)
+            .collect();
         let mut by_register: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
-        for event in events.iter().filter(|event| event.indirect_branch) {
+        for event in events
+            .iter()
+            .filter(|event| dispatcher_lines.contains(&event.line) && event.indirect_branch)
+        {
             if let Some(register) = &event.indirect_register {
                 by_register.entry(register.clone()).or_default().push(event);
             }
         }
-        let mut candidates: Vec<VmStateCandidate> = by_register
-            .into_iter()
-            .map(|(register, register_events)| {
-                let first = register_events[0].line;
-                let last = register_events
-                    .last()
-                    .map(|event| event.line)
-                    .unwrap_or(first);
-                let dispatcher_support = dispatchers
-                    .iter()
-                    .filter(|dispatcher| {
-                        events.iter().any(|event| {
-                            event.line == dispatcher.line
-                                && event.indirect_register.as_deref() == Some(register.as_str())
-                        })
-                    })
-                    .count();
+        for (register, register_events) in by_register {
+            let first = register_events[0].line;
+            let last = register_events
+                .last()
+                .map(|event| event.line)
+                .unwrap_or(first);
+            let dispatcher_support = dispatchers
+                .iter()
+                .filter(|dispatcher| {
+                    matches!(
+                        dispatcher.kind,
+                        DispatchKind::VmPrimary | DispatchKind::VmProvisional
+                    )
+                })
+                .count();
+            merge_state_candidate(
+                &mut merged,
                 VmStateCandidate {
-                    role: VmStateRole::VirtualPc,
+                    role: VmStateRole::DispatchTarget,
                     location: format!("reg:{register}"),
                     lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
-                    confidence: (0.35 + dispatcher_support as f32 * 0.15).min(0.9),
+                    confidence: (0.3 + dispatcher_support as f32 * 0.05).min(0.6),
                     evidence: register_events
                         .iter()
                         .take(16)
@@ -638,17 +868,17 @@ impl VmAnalyzer {
                                 event.line.checked_add(1).unwrap_or(region_end),
                             ),
                             native_address: Some(event.address),
-                            kind: EvidenceKind::RegisterTransition,
-                            detail: Some(format!("indirect dispatch through {register}")),
+                            kind: EvidenceKind::ControlFlow,
+                            detail: Some(format!("indirect branch target register {register}")),
                         })
                         .collect(),
-                    alternatives: vec![register.clone()],
-                }
-            })
-            .collect();
+                    alternatives: Vec::new(),
+                },
+            );
+        }
 
         let mut base_reg_events: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
-        for event in events {
+        for event in &state_events {
             if let Some(base_reg) = &event.base_reg {
                 base_reg_events
                     .entry(base_reg.clone())
@@ -660,7 +890,9 @@ impl VmAnalyzer {
             .keys()
             .map(|register| format!("reg:{register}"))
             .collect();
-        for (register, register_events) in base_reg_events {
+        let mut base_ranked: Vec<_> = base_reg_events.into_iter().collect();
+        base_ranked.sort_by_key(|(_, register_events)| std::cmp::Reverse(register_events.len()));
+        for (register, register_events) in base_ranked.into_iter().take(12) {
             let first = register_events
                 .first()
                 .map(|event| event.line)
@@ -674,39 +906,16 @@ impl VmAnalyzer {
             } else {
                 VmStateRole::VmContext
             };
-            candidates.push(VmStateCandidate {
-                role,
-                location: format!("reg:{register}"),
-                lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
-                confidence: (0.25 + register_events.len() as f32 * 0.02).min(0.8),
-                evidence: register_events
-                    .iter()
-                    .take(16)
-                    .map(|event| EvidenceRef {
-                        trace_id: trace_id.to_string(),
-                        lines: LineRange::new(
-                            event.line,
-                            event.line.checked_add(1).unwrap_or(region_end),
-                        ),
-                        native_address: Some(event.address),
-                        kind: EvidenceKind::MemoryAccess,
-                        detail: Some(format!("register used as memory base: {register}")),
-                    })
-                    .collect(),
-                alternatives: all_base_locations.clone(),
-            });
-            if register_events
-                .iter()
-                .any(|event| !event.memory_reads.is_empty() || !event.memory_writes.is_empty())
-            {
-                candidates.push(VmStateCandidate {
-                    role: VmStateRole::BytecodeBase,
+            merge_state_candidate(
+                &mut merged,
+                VmStateCandidate {
+                    role,
                     location: format!("reg:{register}"),
                     lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
-                    confidence: (0.2 + register_events.len() as f32 * 0.015).min(0.65),
+                    confidence: (0.25 + register_events.len() as f32 * 0.02).min(0.8),
                     evidence: register_events
                         .iter()
-                        .take(12)
+                        .take(16)
                         .map(|event| EvidenceRef {
                             trace_id: trace_id.to_string(),
                             lines: LineRange::new(
@@ -715,18 +924,47 @@ impl VmAnalyzer {
                             ),
                             native_address: Some(event.address),
                             kind: EvidenceKind::MemoryAccess,
-                            detail: Some(format!(
-                                "bytecode-base candidate {register} participates in memory access"
-                            )),
+                            detail: Some(format!("register used as memory base: {register}")),
                         })
                         .collect(),
                     alternatives: all_base_locations.clone(),
-                });
+                },
+            );
+            if register_events
+                .iter()
+                .any(|event| !event.memory_reads.is_empty() || !event.memory_writes.is_empty())
+            {
+                merge_state_candidate(
+                    &mut merged,
+                    VmStateCandidate {
+                        role: VmStateRole::BytecodeBase,
+                        location: format!("reg:{register}"),
+                        lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
+                        confidence: (0.2 + register_events.len() as f32 * 0.015).min(0.65),
+                        evidence: register_events
+                            .iter()
+                            .take(12)
+                            .map(|event| EvidenceRef {
+                                trace_id: trace_id.to_string(),
+                                lines: LineRange::new(
+                                    event.line,
+                                    event.line.checked_add(1).unwrap_or(region_end),
+                                ),
+                                native_address: Some(event.address),
+                                kind: EvidenceKind::MemoryAccess,
+                                detail: Some(format!(
+                                    "bytecode-base candidate {register} participates in memory access"
+                                )),
+                            })
+                            .collect(),
+                        alternatives: all_base_locations.clone(),
+                    },
+                );
             }
         }
 
         let mut written_registers: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
-        for event in events {
+        for event in &state_events {
             for register in &event.writes {
                 written_registers
                     .entry(register.clone())
@@ -745,33 +983,32 @@ impl VmAnalyzer {
                 .last()
                 .map(|event| event.line)
                 .unwrap_or(first);
-            candidates.push(VmStateCandidate {
-                role: VmStateRole::VirtualRegister,
-                location: format!("reg:{register}"),
-                lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
-                confidence: (0.18 + register_events.len() as f32 * 0.01).min(0.55),
-                evidence: register_events
-                    .iter()
-                    .take(12)
-                    .map(|event| EvidenceRef {
-                        trace_id: trace_id.to_string(),
-                        lines: LineRange::new(
-                            event.line,
-                            event.line.checked_add(1).unwrap_or(region_end),
-                        ),
-                        native_address: Some(event.address),
-                        kind: EvidenceKind::RegisterTransition,
-                        detail: Some(format!("virtual-register candidate {register}")),
-                    })
-                    .collect(),
-                alternatives: Vec::new(),
-            });
+            merge_state_candidate(
+                &mut merged,
+                VmStateCandidate {
+                    role: VmStateRole::VirtualRegister,
+                    location: format!("reg:{register}"),
+                    lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
+                    confidence: (0.18 + register_events.len() as f32 * 0.01).min(0.55),
+                    evidence: register_events
+                        .iter()
+                        .take(12)
+                        .map(|event| EvidenceRef {
+                            trace_id: trace_id.to_string(),
+                            lines: LineRange::new(
+                                event.line,
+                                event.line.checked_add(1).unwrap_or(region_end),
+                            ),
+                            native_address: Some(event.address),
+                            kind: EvidenceKind::RegisterTransition,
+                            detail: Some(format!("virtual-register candidate {register}")),
+                        })
+                        .collect(),
+                    alternatives: Vec::new(),
+                },
+            );
         }
 
-        let dispatcher_lines: BTreeSet<GlobalLine> = dispatchers
-            .iter()
-            .map(|dispatcher| dispatcher.line)
-            .collect();
         let mut dispatcher_writes: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
         for event in events
             .iter()
@@ -793,31 +1030,35 @@ impl VmAnalyzer {
                 .last()
                 .map(|event| event.line)
                 .unwrap_or(first);
-            candidates.push(VmStateCandidate {
-                role: VmStateRole::DispatcherState,
-                location: format!("reg:{register}"),
-                lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
-                confidence: (0.3 + register_events.len() as f32 * 0.08).min(0.85),
-                evidence: register_events
-                    .iter()
-                    .take(16)
-                    .map(|event| EvidenceRef {
-                        trace_id: trace_id.to_string(),
-                        lines: LineRange::new(
-                            event.line,
-                            event.line.checked_add(1).unwrap_or(region_end),
-                        ),
-                        native_address: Some(event.address),
-                        kind: EvidenceKind::RegisterTransition,
-                        detail: Some(format!("dispatcher writes state register {register}")),
-                    })
-                    .collect(),
-                alternatives: Vec::new(),
-            });
+            merge_state_candidate(
+                &mut merged,
+                VmStateCandidate {
+                    role: VmStateRole::DispatcherState,
+                    location: format!("reg:{register}"),
+                    lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
+                    confidence: (0.3 + register_events.len() as f32 * 0.08).min(0.85),
+                    evidence: register_events
+                        .iter()
+                        .take(16)
+                        .map(|event| EvidenceRef {
+                            trace_id: trace_id.to_string(),
+                            lines: LineRange::new(
+                                event.line,
+                                event.line.checked_add(1).unwrap_or(region_end),
+                            ),
+                            native_address: Some(event.address),
+                            kind: EvidenceKind::RegisterTransition,
+                            detail: Some(format!("dispatcher writes state register {register}")),
+                        })
+                        .collect(),
+                    alternatives: Vec::new(),
+                },
+            );
         }
 
-        let conditional_events: Vec<&NativeEvent> = events
+        let conditional_events: Vec<&NativeEvent> = state_events
             .iter()
+            .copied()
             .filter(|event| event.conditional_branch)
             .collect();
         if !conditional_events.is_empty() {
@@ -826,31 +1067,320 @@ impl VmAnalyzer {
                 .last()
                 .map(|event| event.line)
                 .unwrap_or(first);
+            merge_state_candidate(
+                &mut merged,
+                VmStateCandidate {
+                    role: VmStateRole::VirtualFlags,
+                    location: "reg:nzcv".to_string(),
+                    lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
+                    confidence: 0.4,
+                    evidence: conditional_events
+                        .iter()
+                        .take(16)
+                        .map(|event| EvidenceRef {
+                            trace_id: trace_id.to_string(),
+                            lines: LineRange::new(
+                                event.line,
+                                event.line.checked_add(1).unwrap_or(region_end),
+                            ),
+                            native_address: Some(event.address),
+                            kind: EvidenceKind::ControlFlow,
+                            detail: Some(
+                                "conditional branch consumes virtual flags candidate".to_string(),
+                            ),
+                        })
+                        .collect(),
+                    alternatives: Vec::new(),
+                },
+            );
+        }
+        let mut candidates: Vec<_> = merged.into_values().collect();
+        candidates.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+        candidates
+    }
+}
+
+fn merge_state_candidate(
+    merged: &mut BTreeMap<(VmStateRole, String), VmStateCandidate>,
+    candidate: VmStateCandidate,
+) {
+    let key = (candidate.role, candidate.location.clone());
+    if let Some(existing) = merged.get_mut(&key) {
+        existing.lines.start = existing.lines.start.min(candidate.lines.start);
+        existing.lines.end = existing.lines.end.max(candidate.lines.end);
+        existing.confidence = existing.confidence.max(candidate.confidence);
+        for evidence in candidate.evidence {
+            if existing.evidence.len() < 16 {
+                existing.evidence.push(evidence);
+            }
+        }
+        for alternative in candidate.alternatives {
+            if !existing.alternatives.contains(&alternative) {
+                existing.alternatives.push(alternative);
+            }
+        }
+    } else {
+        merged.insert(key, candidate);
+    }
+}
+
+fn detect_guest_pc_candidates(
+    trace_id: &str,
+    events: &[&NativeEvent],
+    region_end: GlobalLine,
+) -> Vec<VmStateCandidate> {
+    let mut candidates = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if !event.mnemonic.eq_ignore_ascii_case("add")
+            || event.writes.len() != 1
+            || event.reads.len() < 2
+        {
+            continue;
+        }
+        let Some(destination) = event.writes.first() else {
+            continue;
+        };
+        let load = events.iter().skip(index + 1).take(4).find(|candidate| {
+            candidate.mnemonic.starts_with("ldr")
+                && candidate.base_reg.as_deref() == Some(destination.as_str())
+        });
+        let Some(load) = load else {
+            continue;
+        };
+
+        let memory_base = events[index.saturating_sub(16)..index]
+            .iter()
+            .rev()
+            .find_map(|previous| {
+                if previous.mnemonic.starts_with("ldr") && !previous.memory_reads.is_empty() {
+                    previous
+                        .writes
+                        .iter()
+                        .find(|write| event.reads.contains(write))
+                        .cloned()
+                } else {
+                    None
+                }
+            });
+        let pc_registers: Vec<String> = event
+            .reads
+            .iter()
+            .filter(|register| {
+                memory_base.as_deref() != Some(register.as_str())
+                    && !matches!(register.as_str(), "sp" | "xzr" | "wzr")
+            })
+            .cloned()
+            .collect();
+        if pc_registers.is_empty() {
+            continue;
+        }
+        let lines = LineRange::new(event.line, load.line.checked_add(1).unwrap_or(region_end));
+        let alternatives: Vec<String> = pc_registers
+            .iter()
+            .map(|register| format!("reg:{register}"))
+            .collect();
+        for pc in &pc_registers {
             candidates.push(VmStateCandidate {
-                role: VmStateRole::VirtualFlags,
-                location: "reg:nzcv".to_string(),
-                lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
-                confidence: 0.4,
-                evidence: conditional_events
-                    .iter()
-                    .take(16)
-                    .map(|event| EvidenceRef {
-                        trace_id: trace_id.to_string(),
-                        lines: LineRange::new(
-                            event.line,
-                            event.line.checked_add(1).unwrap_or(region_end),
-                        ),
-                        native_address: Some(event.address),
-                        kind: EvidenceKind::ControlFlow,
-                        detail: Some(
-                            "conditional branch consumes virtual flags candidate".to_string(),
-                        ),
-                    })
-                    .collect(),
-                alternatives: Vec::new(),
+                role: VmStateRole::VirtualPc,
+                location: format!("reg:{pc}"),
+                lines,
+                confidence: if memory_base.is_some() { 0.7 } else { 0.5 },
+                evidence: vec![EvidenceRef {
+                    trace_id: trace_id.to_string(),
+                    lines,
+                    native_address: Some(event.address),
+                    kind: EvidenceKind::RegisterTransition,
+                    detail: Some(format!(
+                        "add forms a guest fetch address; {} is a PC candidate",
+                        pc
+                    )),
+                }],
+                alternatives: alternatives.clone(),
             });
         }
-        candidates
+        if let Some(base) = memory_base {
+            candidates.push(VmStateCandidate {
+                role: VmStateRole::BytecodeBase,
+                location: format!("reg:{base}"),
+                lines,
+                confidence: 0.6,
+                evidence: vec![EvidenceRef {
+                    trace_id: trace_id.to_string(),
+                    lines,
+                    native_address: Some(event.address),
+                    kind: EvidenceKind::MemoryAccess,
+                    detail: Some(format!(
+                        "{base} is combined with a guest PC before a byte load"
+                    )),
+                }],
+                alternatives,
+            });
+        }
+        if candidates.len() >= 32 {
+            break;
+        }
+    }
+    candidates
+}
+
+fn signature_for_window(
+    window: &VecDeque<&NativeEvent>,
+    branch: &NativeEvent,
+) -> DispatchSignature {
+    let mut signature = DispatchSignature {
+        call_link: branch.mnemonic.eq_ignore_ascii_case("blr"),
+        ..DispatchSignature::default()
+    };
+    for event in window {
+        let mnemonic = event.mnemonic.to_ascii_lowercase();
+        if (mnemonic.starts_with("ldrb") || mnemonic.starts_with("ldrh"))
+            && !event.memory_reads.is_empty()
+        {
+            signature.guest_fetch = true;
+        }
+        if mnemonic == "and" && (event.disasm.contains("#0xf") || event.disasm.contains("#15")) {
+            signature.nibble_decode = true;
+        }
+        if mnemonic.starts_with("ldr")
+            && (event.disasm.contains("lsl #1") || event.disasm.contains("lsl #2"))
+        {
+            signature.table_load = true;
+        }
+        if mnemonic == "ldr"
+            && !event.memory_reads.is_empty()
+            && (event.disasm.contains("lsl #3") || event.disasm.contains("uxtw #3"))
+        {
+            signature.callback_array_load = true;
+        }
+    }
+    signature
+}
+
+fn classify_dispatch_site(
+    site: &DispatchSite,
+    all_targets_in_region: bool,
+) -> (DispatchKind, f32, &'static str) {
+    let signature = site.signature;
+    if signature.guest_fetch && (signature.nibble_decode || signature.table_load) {
+        let mut confidence: f32 = 0.6;
+        if signature.nibble_decode {
+            confidence += 0.1;
+        }
+        if signature.table_load {
+            confidence += 0.1;
+        }
+        return (
+            DispatchKind::VmPrimary,
+            confidence.min(0.95),
+            "guest fetch plus nibble or table decode",
+        );
+    }
+    if signature.call_link && signature.callback_array_load {
+        return (
+            DispatchKind::Callback,
+            0.85,
+            "callback loop: indexed function-pointer load followed by blr",
+        );
+    }
+    if !signature.guest_fetch && site.targets.len() >= 8 && all_targets_in_region {
+        return (
+            DispatchKind::OllvmState,
+            0.75,
+            "large target set confined to one region without guest fetch",
+        );
+    }
+    if signature.call_link {
+        return (
+            DispatchKind::Unknown,
+            0.35,
+            "indirect call without guest-fetch evidence",
+        );
+    }
+    if signature.guest_fetch {
+        return (
+            DispatchKind::Unknown,
+            0.45,
+            "guest-memory access observed but dispatch shape is incomplete",
+        );
+    }
+    (DispatchKind::Unknown, 0.3, "ambiguous indirect branch")
+}
+
+fn select_primary_sites(candidates: &mut [DispatcherCandidate], allow_provisional: bool) {
+    let has_primary = candidates
+        .iter()
+        .any(|candidate| candidate.kind == DispatchKind::VmPrimary);
+    let has_non_vm = candidates.iter().any(|candidate| {
+        matches!(
+            candidate.kind,
+            DispatchKind::Callback | DispatchKind::OllvmState
+        )
+    });
+    if allow_provisional && !has_primary && !has_non_vm {
+        let best_unknown = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.kind == DispatchKind::Unknown)
+            .max_by(|(_, left), (_, right)| {
+                (left.target_count, left.execution_count)
+                    .cmp(&(right.target_count, right.execution_count))
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = best_unknown {
+            candidates[index].kind = DispatchKind::VmProvisional;
+            candidates[index].confidence = 0.25;
+            candidates[index].reason =
+                "provisional primary: no non-VM dispatch shape was classified".to_string();
+        }
+    }
+
+    let mut by_region: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.region_id != "unassigned" {
+            by_region
+                .entry(candidate.region_id.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    for indices in by_region.into_values() {
+        let primaries: Vec<usize> = indices
+            .into_iter()
+            .filter(|index| {
+                matches!(
+                    candidates[*index].kind,
+                    DispatchKind::VmPrimary | DispatchKind::VmProvisional
+                )
+            })
+            .collect();
+        if primaries.is_empty() {
+            continue;
+        }
+        let mut best = primaries[0];
+        let mut best_is_primary = candidates[best].kind == DispatchKind::VmPrimary;
+        for index in primaries.iter().copied().skip(1) {
+            let candidate = &candidates[index];
+            let current = &candidates[best];
+            let candidate_is_primary = candidate.kind == DispatchKind::VmPrimary;
+            if (candidate_is_primary && !best_is_primary)
+                || (candidate_is_primary == best_is_primary
+                    && (candidate.confidence > current.confidence
+                        || (candidate.confidence == current.confidence
+                            && (candidate.target_count, candidate.execution_count)
+                                > (current.target_count, current.execution_count))))
+            {
+                best = index;
+                best_is_primary = candidate_is_primary;
+            }
+        }
+        for index in primaries {
+            if index != best {
+                candidates[index].kind = DispatchKind::VmNested;
+                candidates[index].reason =
+                    "secondary primary candidate within the same region".to_string();
+                candidates[index].confidence *= 0.8;
+            }
+        }
     }
 }
 
@@ -872,7 +1402,7 @@ fn cluster_addresses(addresses: Vec<u64>, max_gap: u64) -> Vec<Vec<u64>> {
     clusters
 }
 
-fn template_hash(events: &[&NativeEvent]) -> String {
+fn template_hash(events: &[NativeEvent]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for event in events {
         for byte in event.mnemonic.to_ascii_lowercase().bytes() {
@@ -887,15 +1417,15 @@ fn template_hash(events: &[&NativeEvent]) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         hash ^= (event.memory_writes.len() as u64) << 16;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash ^= (event.conditional_branch as u64) << 24;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash ^= (event.indirect_branch as u64) << 32;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
 }
 
-fn infer_semantics(
-    start: GlobalLine,
-    end: GlobalLine,
-    events: &BTreeMap<GlobalLine, &NativeEvent>,
-) -> HandlerSemantics {
+fn infer_semantics(events: &[NativeEvent]) -> HandlerSemantics {
     let mut operations = Vec::new();
     let mut reads = BTreeSet::new();
     let mut writes = BTreeSet::new();
@@ -903,7 +1433,7 @@ fn infer_semantics(
     let mut unknown = Vec::new();
     let mut control_effect = None;
 
-    for (_, event) in events.range(start..end) {
+    for event in events {
         let operation = operation_for_mnemonic(&event.mnemonic);
         if !operations.contains(&operation) {
             operations.push(operation);
@@ -948,7 +1478,10 @@ fn infer_semantics(
 
 fn operation_for_mnemonic(mnemonic: &str) -> VmOperation {
     let mnemonic = mnemonic.to_ascii_lowercase();
-    if mnemonic.starts_with("mov") || mnemonic.starts_with("ldr") && !mnemonic.starts_with("ldrb") {
+    if mnemonic.starts_with("ldrb") || mnemonic.starts_with("ldrh") || mnemonic.starts_with("ldrs")
+    {
+        VmOperation::Load
+    } else if mnemonic.starts_with("mov") || mnemonic.starts_with("ldr") {
         VmOperation::Move
     } else if mnemonic.starts_with("add") {
         VmOperation::Add
@@ -1203,10 +1736,17 @@ mod tests {
         events
     }
 
+    fn synthetic_analyzer() -> VmAnalyzer {
+        VmAnalyzer::new(VmAnalysisConfig {
+            allow_provisional_primary: true,
+            ..VmAnalysisConfig::default()
+        })
+    }
+
     #[test]
     fn detects_dispatcher_handler_clusters_and_evidence() {
         let events = synthetic_vm_events();
-        let result = VmAnalyzer::default().analyze("trace-a", &events).unwrap();
+        let result = synthetic_analyzer().analyze("trace-a", &events).unwrap();
         assert!(!result.regions.is_empty());
         assert!(result.dispatchers.iter().any(|d| d.address == 0x100c));
         assert!(!result.handler_instances.is_empty());
@@ -1220,19 +1760,125 @@ mod tests {
     }
 
     #[test]
-    fn infers_vpc_candidate_from_dispatch_register() {
+    fn labels_indirect_dispatch_register_as_dispatch_target() {
         let events = synthetic_vm_events();
+        let result = synthetic_analyzer().analyze("trace-a", &events).unwrap();
+        assert!(result
+            .state_candidates
+            .iter()
+            .any(|state| state.role == VmStateRole::DispatchTarget && state.location == "reg:x9"));
+    }
+
+    #[test]
+    fn aggregates_dispatch_sites_across_executions() {
+        let events = synthetic_vm_events();
+        let result = synthetic_analyzer().analyze("trace-a", &events).unwrap();
+        let sites: Vec<_> = result
+            .dispatchers
+            .iter()
+            .filter(|dispatcher| dispatcher.address == 0x100c)
+            .collect();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].execution_count, 3);
+        assert_eq!(sites[0].target_count, 2);
+    }
+
+    #[test]
+    fn provisional_primary_is_opt_in() {
+        let events = synthetic_vm_events();
+        let default = VmAnalyzer::default().analyze("trace-a", &events).unwrap();
+        assert!(default.handler_instances.is_empty());
+        let provisional = synthetic_analyzer().analyze("trace-a", &events).unwrap();
+        assert!(!provisional.handler_instances.is_empty());
+    }
+
+    #[test]
+    fn classifies_callback_loop_without_vm_handlers() {
+        let mut load =
+            NativeEvent::instruction(GlobalLine(0), 0x1000, "ldr", "ldr x8, [x21, x25, lsl #3]")
+                .reads(&["x21", "x25"])
+                .writes(&["x8"]);
+        load.base_reg = Some("x21".to_string());
+        load.memory_reads = vec![0x8000_0000];
+        let events = vec![
+            load,
+            NativeEvent::instruction(GlobalLine(1), 0x1004, "blr", "blr x8")
+                .reads(&["x8"])
+                .dispatch(0x4000, "x8"),
+            NativeEvent::instruction(GlobalLine(2), 0x4000, "add", "add x0, x0, x1")
+                .reads(&["x0", "x1"])
+                .writes(&["x0"]),
+            NativeEvent::instruction(GlobalLine(3), 0x1004, "blr", "blr x8")
+                .reads(&["x8"])
+                .dispatch(0x5000, "x8"),
+            NativeEvent::instruction(GlobalLine(4), 0x5000, "sub", "sub x0, x0, x1")
+                .reads(&["x0", "x1"])
+                .writes(&["x0"]),
+        ];
+        let result = VmAnalyzer::default().analyze("trace-a", &events).unwrap();
+        let site = result
+            .dispatchers
+            .iter()
+            .find(|dispatcher| dispatcher.address == 0x1004)
+            .expect("callback site");
+        assert_eq!(site.kind, DispatchKind::Callback);
+        assert!(result.handler_instances.is_empty());
+    }
+
+    #[test]
+    fn infers_vpc_from_guest_fetch_address_dataflow() {
+        let mut ldr = NativeEvent::instruction(GlobalLine(0), 0x1000, "ldr", "ldr x11, [x8, #8]")
+            .reads(&["x8"])
+            .writes(&["x11"]);
+        ldr.base_reg = Some("x8".to_string());
+        ldr.memory_reads = vec![0x8000_0008];
+        let add = NativeEvent::instruction(GlobalLine(1), 0x1004, "add", "add x10, x11, x25")
+            .reads(&["x11", "x25"])
+            .writes(&["x10"]);
+        let mut fetch =
+            NativeEvent::instruction(GlobalLine(2), 0x1008, "ldrb", "ldrb w12, [x10, #1]")
+                .reads(&["x10"])
+                .writes(&["w12"]);
+        fetch.base_reg = Some("x10".to_string());
+        fetch.memory_reads = vec![0x8000_1001];
+        let events = vec![
+            ldr,
+            add,
+            fetch,
+            NativeEvent::instruction(GlobalLine(3), 0x100c, "and", "and w8, w12, #0xf")
+                .reads(&["w12"])
+                .writes(&["w8"]),
+            NativeEvent::instruction(GlobalLine(4), 0x1010, "cmp", "cmp w8, #5")
+                .reads(&["w8"])
+                .writes(&["nzcv"]),
+            NativeEvent::instruction(GlobalLine(5), 0x1014, "br", "br x14")
+                .reads(&["x14"])
+                .dispatch(0x3000, "x14"),
+            NativeEvent::instruction(GlobalLine(6), 0x3000, "add", "add x0, x0, x1")
+                .reads(&["x0", "x1"])
+                .writes(&["x0"]),
+            NativeEvent::instruction(GlobalLine(7), 0x1014, "br", "br x14")
+                .reads(&["x14"])
+                .dispatch(0x3010, "x14"),
+            NativeEvent::instruction(GlobalLine(8), 0x3010, "sub", "sub x0, x0, x1")
+                .reads(&["x0", "x1"])
+                .writes(&["x0"]),
+        ];
         let result = VmAnalyzer::default().analyze("trace-a", &events).unwrap();
         assert!(result
             .state_candidates
             .iter()
-            .any(|state| state.role == VmStateRole::VirtualPc && state.location == "reg:x9"));
+            .any(|state| state.role == VmStateRole::VirtualPc && state.location == "reg:x25"));
+        assert!(result
+            .state_candidates
+            .iter()
+            .any(|state| state.role == VmStateRole::DispatchTarget && state.location == "reg:x14"));
     }
 
     #[test]
     fn output_is_deterministic() {
         let events = synthetic_vm_events();
-        let analyzer = VmAnalyzer::default();
+        let analyzer = synthetic_analyzer();
         let first = analyzer.analyze("trace-a", &events).unwrap();
         let second = analyzer.analyze("trace-a", &events).unwrap();
         assert_eq!(first, second);
@@ -1273,6 +1919,7 @@ mod tests {
         let analyzer = VmAnalyzer::new(VmAnalysisConfig {
             min_region_executions: 1,
             min_repeated_instructions: 0,
+            allow_provisional_primary: true,
             ..VmAnalysisConfig::default()
         });
         let result = analyzer.analyze("trace-a", &events).unwrap();
@@ -1285,7 +1932,7 @@ mod tests {
     #[test]
     fn vm_hypotheses_are_evidence_linked_and_unique() {
         let events = synthetic_vm_events();
-        let result = VmAnalyzer::default().analyze("trace-a", &events).unwrap();
+        let result = synthetic_analyzer().analyze("trace-a", &events).unwrap();
         let hypotheses = vm_hypotheses(&result);
         assert!(!hypotheses.is_empty());
         let mut ids = std::collections::HashSet::new();
@@ -1311,6 +1958,7 @@ mod tests {
         let mut conditional =
             NativeEvent::instruction(GlobalLine(2), 0x2004, "b.eq", "b.eq 0x2000");
         conditional.conditional_branch = true;
+        conditional.base_reg = Some("x8".to_string());
         let events = vec![
             first_dispatch,
             handler,
@@ -1326,6 +1974,7 @@ mod tests {
         let result = VmAnalyzer::new(VmAnalysisConfig {
             min_region_executions: 1,
             min_repeated_instructions: 0,
+            allow_provisional_primary: true,
             ..VmAnalysisConfig::default()
         })
         .analyze("trace", &events)
@@ -1369,6 +2018,7 @@ mod tests {
         let result = VmAnalyzer::new(VmAnalysisConfig {
             min_region_executions: 1,
             min_repeated_instructions: 0,
+            allow_provisional_primary: true,
             ..VmAnalysisConfig::default()
         })
         .analyze("trace", &events)
@@ -1394,7 +2044,7 @@ mod tests {
     #[test]
     fn merged_results_namespace_ids_and_coalesce_coverage() {
         let events = synthetic_vm_events();
-        let analyzer = VmAnalyzer::default();
+        let analyzer = synthetic_analyzer();
         let first = analyzer.analyze("trace-a", &events).unwrap();
         let second = analyzer.analyze("trace-a", &events).unwrap();
         let merged = merge_vm_results("trace-a", vec![first.clone(), second]);

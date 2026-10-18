@@ -122,11 +122,17 @@ impl super::TraceEngine {
                     ),
                     None => (Vec::new(), Vec::new()),
                 };
+                let mnemonic = parsed.mnemonic.as_str();
+                let keep_disasm = mnemonic == "and" || mnemonic.starts_with("ldr");
                 events.push(NativeEvent {
                     line,
                     address,
-                    mnemonic: parsed.mnemonic.as_str().to_string(),
-                    disasm: raw.to_string(),
+                    mnemonic: mnemonic.to_string(),
+                    disasm: if keep_disasm {
+                        raw.to_string()
+                    } else {
+                        String::new()
+                    },
                     reads: uses
                         .iter()
                         .map(|register| format!("{register:?}"))

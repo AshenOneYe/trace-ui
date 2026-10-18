@@ -25,18 +25,19 @@ Trace UI 的 VM 分析方向与目标匹配，输入格式也匹配，但**当�
 
 - 还没有一份包含 AVM 的真实执行 Trace，因此没有验证真实 handler 语义、真实虚拟
   CFG、跨运行聚类或 `a64.dat` 的关系。
-- 现有算法会把 OLLVM 状态分发、7 路 guest 跳转表和嵌套跳转表都当成
-  dispatcher。合成探针中 3 个真实跳转点产生了 38 个候选，并出现 67 对重叠的
-  handler 区间。
-- 现有 `VirtualPc` 推断取“间接跳转寄存器”，会把 `x8`/`x13`/`x14` 这类跳转表
-  寄存器误标成 VPC；真正参与 guest 取指的 `x25` 反而不会被识别。
-- 现有“VM IR / CFG”描述的是宿主 ARM64 handler 区间，不是 guest 指令集语义。
-- 在真实的 710 MB `libtprt` Trace 上，索引只需 3.2 秒，但 VM 分析在 10 万行
-  就产生 1,560 个 dispatcher 候选，50 万行耗时 112 秒，全量无法在可接受时间内
-  完成。
+- 优化前，OLLVM 状态分发、7 路 guest 跳转表和嵌套跳转表会被混为 dispatcher；
+  合成探针中 3 个跳转点产生 38 个候选和 67 对重叠区间。该问题已由 P0 修复：
+  复测为 3 个站点候选、16 个 handler、0 重叠。
+- 优化前 `VirtualPc` 直接取间接跳转寄存器，会把 `x8`/`x13`/`x14` 标成 VPC。
+  现在间接跳转寄存器改为 `DispatchTarget`，并用 `ADD base, pc` + `LDRB`
+  数据流识别 `x25` 之类的 VPC 候选。
+- “VM IR / CFG”仍然主要是宿主 ARM64 handler 区间，不是 guest 指令集语义；
+  真实 guest CFG 仍待 VPC 转移驱动。
+- 真实 710 MB `libtprt` Trace 优化前 50 万行需要 112 秒；优化后全量 7.66M 行
+  约 10.95 秒，返回 4 个 dispatcher、0 个 handler，回调循环被正确归类。
 
-因此当前评价是：**基础管线可用，AVM 专用语义层尚未通过真实样本验证；需要先取得
-真实 Trace，并补齐 dispatcher 归类、站点去重和 VPC 推断，才能完成验收。**
+因此当前评价是：**基础管线可用，P0 的 dispatcher 聚合/分类、handler 切分和
+保守误报控制已经完成；AVM 专用语义层仍需真实 AVM Trace 做最终验证。**
 
 ## 1. 输入材料与静态事实
 
@@ -412,9 +413,16 @@ VM 分析结果（默认配置）：
 5. **状态推断误报明显**。该 Trace 中 `VirtualPc=reg:x8` 来自回调寄存器和
    普通分支，不是客户机 PC；`BytecodeBase` 还会落到 `sp`/`x0`。
 
-结论：**Trace UI 的索引与函数浏览能力已经能处理 710 MB / 765 万行真实日志，
-但 VM 分析层在当前实现下既慢又不可信；这份实测数据直接验证了 P0 的
-dispatcher 去重/分类和 handler 切分性能问题。**
+优化前结论：Trace UI 的索引与函数浏览能力已经能处理 710 MB / 765 万行真实
+日志，但 VM 分析层既慢又不可信；这份实测数据直接验证了 P0 的 dispatcher
+去重/分类和 handler 切分性能问题。
+
+> 该问题已在后续 P0 优化中修复。复测结果：100k 行 0.13 秒 / 2 个
+> dispatcher / 0 handler；500k 行 0.66 秒 / 3 个 dispatcher / 0 handler；
+> 全量 7.66M 行 10.95 秒 / 4 个 dispatcher / 0 handler。回调站点
+> `libtprt +0x137c8c` 正确标为 `Callback`。合成 AVM 探针保持 3 个站点、
+> 16 个 handler、0 重叠。详见
+> [VM 分析优化方案](vm-analysis-optimization-plan.md)。
 
 ## 8. 尚未解决的问题
 

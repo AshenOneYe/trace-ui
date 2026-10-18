@@ -72,7 +72,20 @@ pub struct DispatcherCandidate {
     pub target_count: usize,
     pub execution_count: u64,
     pub confidence: f32,
+    pub kind: DispatchKind,
+    pub reason: String,
     pub evidence: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchKind {
+    VmPrimary,
+    VmProvisional,
+    VmNested,
+    Callback,
+    OllvmState,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -83,6 +96,7 @@ pub enum VmStateRole {
     VirtualRegister,
     VmContext,
     BytecodeBase,
+    DispatchTarget,
     DispatcherState,
     VirtualFlags,
     Unknown,

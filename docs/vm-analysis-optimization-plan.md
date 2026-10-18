@@ -4,6 +4,36 @@
 > 实测样本：`avm_follow.log`，710,614,235 B / 7,655,977 行 GumTrace
 > 目标：先把真实大 Trace 上的误报和性能问题解决，再进入 AVM 语义验证
 
+## 0. 实施结果（2026-10-18）
+
+P0 的 dispatcher 聚合、分类、时间线切分和保守回退已经落地。
+
+| 场景 | 优化前 | 优化后 |
+|---|---:|---:|
+| 710 MB Trace / 100k 行 | 1.02 秒；1,560 dispatcher；1,559 handler | **0.13 秒**；2 dispatcher；0 handler |
+| 710 MB Trace / 500k 行 | 112.3 秒；6,621 dispatcher；6,619 handler | **0.66 秒**；3 dispatcher；0 handler |
+| 710 MB Trace / 全量 7.66M 行 | >131 秒未完成 | **10.95 秒**；4 dispatcher；0 handler |
+| 合成 AVM 探针 | 38 dispatcher；67 对重叠 | **3 dispatcher；16 handler；0 重叠** |
+| 合成 AVM 单分发点 | 16 个重复候选 | **1 个站点候选；16 handler；0 重叠** |
+
+关键结果：
+
+- `libtprt +0x137c8c` 被正确标为 `Callback`（indexed function-pointer load +
+  `blr`），不再生成 12 万级 handler。
+- 真实 `libtersafe2` 短 Trace 在缺少强 VM 特征时返回 2 个 `Unknown`
+  dispatcher、0 handler，不再触发 provisional 假阳性。
+- AVM 探针仍能识别 `+0x35e00c` 为 `VmPrimary`、`+0x35e02c` 为
+  `VmNested`。
+- 新增了 VPC 数据流候选：`ADD base, pc` + `LDRB` 会把 `x25` 标为
+  `VirtualPc`，间接分发寄存器改为 `DispatchTarget`。
+
+仍未完成：
+
+- 全量 Trace RSS 约 **3.59 GB**，尚未达到 <1.5 GB；两遍流式和寄存器/事件
+  紧凑化仍是后续 P0.4。
+- 虚拟 CFG 仍以宿主目标/执行顺序为主，尚未改为 VPC 转移驱动（P2）。
+- 跨 ASLR 的模块偏移归一化尚未接入 VM 结果（P1.2）。
+
 ## 1. 基线数据
 
 ### 1.1 索引层

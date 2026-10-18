@@ -348,6 +348,7 @@ impl StateRoleName for super::types::VmStateCandidate {
             super::types::VmStateRole::VirtualRegister => "vreg",
             super::types::VmStateRole::VmContext => "context",
             super::types::VmStateRole::BytecodeBase => "bytecode_base",
+            super::types::VmStateRole::DispatchTarget => "dispatch_target",
             super::types::VmStateRole::DispatcherState => "dispatcher_state",
             super::types::VmStateRole::VirtualFlags => "flags",
             super::types::VmStateRole::Unknown => "unknown",
@@ -394,6 +395,7 @@ mod tests {
         VmAnalyzer::new(VmAnalysisConfig {
             min_region_executions: 1,
             min_repeated_instructions: 0,
+            allow_provisional_primary: true,
             ..VmAnalysisConfig::default()
         })
         .analyze("trace", &events)

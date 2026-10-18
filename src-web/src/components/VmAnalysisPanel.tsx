@@ -446,8 +446,10 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
                   }}>
                     <strong>{dispatcher.id}</strong>
                     <Chip>0x{dispatcher.address.toString(16)}</Chip>
+                    <Chip>{dispatcher.kind}</Chip>
                     <Chip>{dispatcher.target_count} targets</Chip>
                     <Chip tone="accent">{pct(dispatcher.confidence)}</Chip>
+                    <span style={{ color: "var(--text-secondary)" }}>{dispatcher.reason}</span>
                     <button onClick={() => onJumpToSeq(dispatcher.line)} style={{ fontSize: 11, cursor: "pointer" }}>
                       line {dispatcher.line}
                     </button>

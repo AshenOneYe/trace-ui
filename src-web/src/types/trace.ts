@@ -195,6 +195,8 @@ export interface DispatcherCandidate {
   target_count: number;
   execution_count: number;
   confidence: number;
+  kind: "vm_primary" | "vm_provisional" | "vm_nested" | "callback" | "ollvm_state" | "unknown";
+  reason: string;
   evidence: EvidenceRef[];
 }
 

@@ -269,6 +269,7 @@ mod tests {
         VmAnalyzer::new(crate::analysis::VmAnalysisConfig {
             min_region_executions: 1,
             min_repeated_instructions: 0,
+            allow_provisional_primary: true,
             ..Default::default()
         })
         .analyze("trace", &events)
