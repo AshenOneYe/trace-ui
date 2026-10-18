@@ -18,7 +18,9 @@ impl Default for TraceFormat {
 ///
 /// 使用 `u8` 编码：x0-x28=0-28, x29(fp)=29, x30(lr)=30, sp=31, xzr=32,
 /// v0_lo-v31_lo=33-64, nzcv=65, v0_hi-v31_hi=66-97。总共 98 个寄存器。
-#[derive(Copy, Clone, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct RegId(pub u8);
 
 #[allow(dead_code)]
@@ -292,7 +294,7 @@ pub struct MemOp {
 
 /// ARM64 助记符的栈上存储（最长 ~7 字节）。
 /// 零堆分配，支持 &str 比较和 Display。
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct Mnemonic {
     buf: [u8; 8],
     len: u8,

@@ -1,5 +1,6 @@
 use trace_core::analysis::{CfgEdgeKind, NativeEvent, VmAnalyzer, VmStateRole};
 use trace_core::GlobalLine;
+use trace_parser::types::parse_reg;
 
 fn ev(
     line: u64,
@@ -139,8 +140,11 @@ fn probe_avm_shape() {
         .iter()
         .position(|event| event.address == fetch)
         .unwrap();
-    events[fetch_index].base_reg = Some("x10".to_string());
-    events[fetch_index].memory_reads = vec![0x8000_0000_1001, 0x8000_0000_1002];
+    events[fetch_index].base_reg = parse_reg("x10");
+    events[fetch_index].mem_start = 0x8000_0000_1001;
+    events[fetch_index].mem_width = 1;
+    events[fetch_index].mem_is_write = false;
+    events[fetch_index].mem_present = true;
 
     let result = VmAnalyzer::default().analyze("avm-probe", &events).unwrap();
     println!(

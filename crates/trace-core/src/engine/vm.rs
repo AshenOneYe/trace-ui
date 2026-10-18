@@ -1,4 +1,5 @@
-use crate::analysis::{NativeEvent, VmAnalysisConfig, VmAnalysisResult, VmAnalyzer};
+use crate::analysis::vm::vm_hint_flags;
+use crate::analysis::{NativeEvent, RegSet, VmAnalysisConfig, VmAnalysisResult, VmAnalyzer};
 use crate::error::{Result, TraceError};
 use crate::phase2;
 use crate::position::GlobalLine;
@@ -6,7 +7,7 @@ use trace_parser::def_use;
 use trace_parser::gumtrace;
 use trace_parser::insn_class::{self, InsnClass};
 use trace_parser::parser;
-use trace_parser::types::{Operand, TraceFormat};
+use trace_parser::types::{Mnemonic, Operand, TraceFormat};
 
 impl super::TraceEngine {
     pub fn analyze_vm_range(
@@ -44,7 +45,11 @@ impl super::TraceEngine {
             )));
         }
 
-        let mut events = Vec::new();
+        let estimated_events = end_line
+            .get()
+            .saturating_sub(start_line.get())
+            .min(20_000_000) as usize;
+        let mut events = Vec::with_capacity(estimated_events);
         let mut line = start_line;
         while line < end_line {
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -101,53 +106,34 @@ impl super::TraceEngine {
                         .operands
                         .first()
                         .and_then(Operand::as_reg)
-                        .map(|register| format!("{register:?}"))
+                        .map(|register| register)
                 } else {
                     None
                 };
-                let (memory_reads, memory_writes) = match parsed.mem_op {
-                    Some(ref memory) if memory.is_write => {
-                        let width = memory.elem_width as u64;
-                        (
-                            Vec::new(),
-                            vec![memory.abs, memory.abs.saturating_add(width)],
-                        )
+                let (mem_start, mem_width, mem_is_write, mem_present) = match parsed.mem_op {
+                    Some(ref memory) => {
+                        (memory.abs, memory.elem_width as u8, memory.is_write, true)
                     }
-                    Some(ref memory) => (
-                        vec![
-                            memory.abs,
-                            memory.abs.saturating_add(memory.elem_width as u64),
-                        ],
-                        Vec::new(),
-                    ),
-                    None => (Vec::new(), Vec::new()),
+                    None => (0, 0, false, false),
                 };
                 let mnemonic = parsed.mnemonic.as_str();
-                let keep_disasm = mnemonic == "and" || mnemonic.starts_with("ldr");
+                let hint_flags = vm_hint_flags(mnemonic, raw);
                 events.push(NativeEvent {
                     line,
                     address,
-                    mnemonic: mnemonic.to_string(),
-                    disasm: if keep_disasm {
-                        raw.to_string()
-                    } else {
-                        String::new()
-                    },
-                    reads: uses
-                        .iter()
-                        .map(|register| format!("{register:?}"))
-                        .collect(),
-                    writes: defs
-                        .iter()
-                        .map(|register| format!("{register:?}"))
-                        .collect(),
-                    memory_reads,
-                    memory_writes,
+                    mnemonic: Mnemonic::new(mnemonic),
+                    hint_flags,
+                    reads: uses.iter().copied().collect::<RegSet>(),
+                    writes: defs.iter().copied().collect::<RegSet>(),
+                    mem_start,
+                    mem_width,
+                    mem_is_write,
+                    mem_present,
                     branch_target,
                     indirect_branch,
                     conditional_branch,
                     indirect_register,
-                    base_reg: parsed.base_reg.map(|register| format!("{register:?}")),
+                    base_reg: parsed.base_reg,
                 });
             }
             line = line

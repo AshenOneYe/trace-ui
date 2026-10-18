@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
+use trace_parser::types::{parse_reg, Mnemonic, RegId};
 
 use crate::position::{GlobalLine, LineRange};
 
@@ -13,39 +14,92 @@ use super::{Hypothesis, HypothesisSource, HypothesisStatus};
 
 pub const VM_ALGORITHM_VERSION: &str = "vm-heuristic-v1";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NativeEvent {
     pub line: GlobalLine,
     pub address: u64,
-    pub mnemonic: String,
-    pub disasm: String,
-    pub reads: Vec<String>,
-    pub writes: Vec<String>,
-    pub memory_reads: Vec<u64>,
-    pub memory_writes: Vec<u64>,
+    pub mnemonic: Mnemonic,
+    pub hint_flags: u8,
+    pub reads: RegSet,
+    pub writes: RegSet,
+    pub mem_start: u64,
+    pub mem_width: u8,
+    pub mem_is_write: bool,
+    pub mem_present: bool,
     pub branch_target: Option<u64>,
     pub indirect_branch: bool,
     pub conditional_branch: bool,
-    pub indirect_register: Option<String>,
-    pub base_reg: Option<String>,
+    pub indirect_register: Option<RegId>,
+    pub base_reg: Option<RegId>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegSet(u128);
+
+impl RegSet {
+    pub fn insert(&mut self, register: RegId) {
+        if register.0 < 128 {
+            self.0 |= 1u128 << register.0;
+        }
+    }
+
+    pub fn contains(&self, register: RegId) -> bool {
+        register.0 < 128 && self.0 & (1u128 << register.0) != 0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub fn first(&self) -> Option<RegId> {
+        self.iter().next()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = RegId> + '_ {
+        (0..128u8).filter_map(move |register| {
+            if self.0 & (1u128 << register) != 0 {
+                Some(RegId(register))
+            } else {
+                None
+            }
+        })
+    }
+}
+
+impl FromIterator<RegId> for RegSet {
+    fn from_iter<T: IntoIterator<Item = RegId>>(iter: T) -> Self {
+        let mut set = Self::default();
+        for register in iter {
+            set.insert(register);
+        }
+        set
+    }
 }
 
 impl NativeEvent {
     pub fn instruction(
         line: GlobalLine,
         address: u64,
-        mnemonic: impl Into<String>,
-        disasm: impl Into<String>,
+        mnemonic: impl AsRef<str>,
+        disasm: impl AsRef<str>,
     ) -> Self {
+        let mnemonic = Mnemonic::new(mnemonic.as_ref());
+        let hint_flags = vm_hint_flags(mnemonic.as_str(), disasm.as_ref());
         Self {
             line,
             address,
-            mnemonic: mnemonic.into(),
-            disasm: disasm.into(),
-            reads: Vec::new(),
-            writes: Vec::new(),
-            memory_reads: Vec::new(),
-            memory_writes: Vec::new(),
+            mnemonic,
+            hint_flags,
+            reads: RegSet::default(),
+            writes: RegSet::default(),
+            mem_start: 0,
+            mem_width: 0,
+            mem_is_write: false,
+            mem_present: false,
             branch_target: None,
             indirect_branch: false,
             conditional_branch: false,
@@ -55,25 +109,45 @@ impl NativeEvent {
     }
 
     pub fn reads(mut self, reads: &[&str]) -> Self {
-        self.reads = reads
-            .iter()
-            .map(|value| value.to_ascii_lowercase())
-            .collect();
+        self.reads = RegSet::default();
+        for value in reads {
+            if let Some(register) = parse_reg(value) {
+                self.reads.insert(register);
+            }
+        }
         self
     }
 
     pub fn writes(mut self, writes: &[&str]) -> Self {
-        self.writes = writes
-            .iter()
-            .map(|value| value.to_ascii_lowercase())
-            .collect();
+        self.writes = RegSet::default();
+        for value in writes {
+            if let Some(register) = parse_reg(value) {
+                self.writes.insert(register);
+            }
+        }
         self
     }
 
     pub fn dispatch(mut self, target: u64, register: &str) -> Self {
         self.branch_target = Some(target);
         self.indirect_branch = true;
-        self.indirect_register = Some(register.to_ascii_lowercase());
+        self.indirect_register = parse_reg(register);
+        self
+    }
+
+    pub fn memory_read(mut self, start: u64, width: u8) -> Self {
+        self.mem_start = start;
+        self.mem_width = width;
+        self.mem_is_write = false;
+        self.mem_present = true;
+        self
+    }
+
+    pub fn memory_write(mut self, start: u64, width: u8) -> Self {
+        self.mem_start = start;
+        self.mem_width = width;
+        self.mem_is_write = true;
+        self.mem_present = true;
         self
     }
 }
@@ -137,6 +211,24 @@ struct DispatchSignature {
     call_link: bool,
 }
 
+const HINT_NIBBLE_DECODE: u8 = 1;
+const HINT_TABLE_LOAD: u8 = 2;
+const HINT_CALLBACK_ARRAY: u8 = 4;
+
+pub(crate) fn vm_hint_flags(mnemonic: &str, disasm: &str) -> u8 {
+    let mut flags = 0;
+    if mnemonic == "and" && (disasm.contains("#0xf") || disasm.contains("#15")) {
+        flags |= HINT_NIBBLE_DECODE;
+    }
+    if mnemonic.starts_with("ldr") && (disasm.contains("lsl #1") || disasm.contains("lsl #2")) {
+        flags |= HINT_TABLE_LOAD;
+    }
+    if mnemonic == "ldr" && (disasm.contains("lsl #3") || disasm.contains("uxtw #3")) {
+        flags |= HINT_CALLBACK_ARRAY;
+    }
+    flags
+}
+
 #[derive(Debug, Clone)]
 struct DispatchExecution {
     line: GlobalLine,
@@ -148,7 +240,7 @@ struct DispatchSite {
     executions: Vec<DispatchExecution>,
     targets: BTreeSet<u64>,
     signature: DispatchSignature,
-    indirect_register: Option<String>,
+    indirect_register: Option<RegId>,
 }
 
 #[derive(Debug, Default)]
@@ -194,7 +286,6 @@ impl VmAnalyzer {
         let mut frequencies: BTreeMap<u64, u64> = BTreeMap::new();
         let mut lines_by_address: BTreeMap<u64, (GlobalLine, GlobalLine)> = BTreeMap::new();
         let mut indirect_by_address: BTreeSet<u64> = BTreeSet::new();
-        let mut targets_by_address: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
         for event in events {
             if is_cancelled() {
                 return Err(VmAnalysisError::Cancelled);
@@ -207,12 +298,6 @@ impl VmAnalyzer {
             span.1 = span.1.max(event.line);
             if event.indirect_branch {
                 indirect_by_address.insert(event.address);
-                if let Some(target) = event.branch_target {
-                    targets_by_address
-                        .entry(event.address)
-                        .or_default()
-                        .insert(target);
-                }
             }
         }
 
@@ -246,18 +331,17 @@ impl VmAnalyzer {
                 .iter()
                 .filter(|address| frequencies.get(address).copied().unwrap_or(0) > 1)
                 .count() as u64;
+            let has_indirect_site = addresses
+                .iter()
+                .any(|address| indirect_by_address.contains(address));
             let indirect_dispatches = addresses
                 .iter()
-                .filter(|address| {
-                    indirect_by_address.contains(*address)
-                        && targets_by_address.get(*address).is_some_and(|targets| {
-                            targets
-                                .iter()
-                                .any(|target| *target >= first_addr && *target <= last_addr)
-                        })
-                })
+                .filter(|address| indirect_by_address.contains(*address))
                 .count() as u64;
 
+            if !has_indirect_site {
+                continue;
+            }
             if execution_count < self.config.min_region_executions
                 && repeated_instructions < self.config.min_repeated_instructions
                 && indirect_dispatches == 0
@@ -330,6 +414,30 @@ impl VmAnalyzer {
             return Err(VmAnalysisError::Cancelled);
         }
         let dispatchers = inventory.candidates;
+        let used_regions: BTreeSet<String> = dispatchers
+            .iter()
+            .map(|dispatcher| dispatcher.region_id.clone())
+            .filter(|region_id| region_id != "unassigned")
+            .collect();
+        let regions_before_filter = regions.len();
+        regions.retain(|region| used_regions.contains(&region.id));
+        let excluded_regions = regions_before_filter.saturating_sub(regions.len());
+        for region in &mut regions {
+            let has_vm_primary = dispatchers.iter().any(|dispatcher| {
+                dispatcher.region_id == region.id
+                    && matches!(
+                        dispatcher.kind,
+                        DispatchKind::VmPrimary | DispatchKind::VmProvisional
+                    )
+            });
+            if !has_vm_primary {
+                region.confidence = region.confidence.min(0.5);
+                region.warnings.push(
+                    "region has no VM primary dispatch candidate; role remains non-VM or ambiguous"
+                        .to_string(),
+                );
+            }
+        }
         let primary_dispatchers: Vec<&DispatcherCandidate> = dispatchers
             .iter()
             .filter(|dispatcher| {
@@ -626,6 +734,11 @@ impl VmAnalyzer {
                     .to_string(),
             );
         }
+        if excluded_regions > 0 {
+            warnings.push(format!(
+                "{excluded_regions} regions without dispatcher candidates were excluded"
+            ));
+        }
         if clipped_intervals > 0 {
             warnings.push(format!(
                 "{clipped_intervals} overlapping primary handler intervals were clipped"
@@ -687,7 +800,7 @@ impl VmAnalyzer {
                 if let Some(target) = event.branch_target {
                     site.targets.insert(target);
                 }
-                site.indirect_register = event.indirect_register.clone();
+                site.indirect_register = event.indirect_register;
             }
             window.push_back(event);
             if window.len() > 24 {
@@ -827,13 +940,13 @@ impl VmAnalyzer {
             })
             .map(|dispatcher| dispatcher.line)
             .collect();
-        let mut by_register: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
+        let mut by_register: BTreeMap<RegId, Vec<&NativeEvent>> = BTreeMap::new();
         for event in events
             .iter()
             .filter(|event| dispatcher_lines.contains(&event.line) && event.indirect_branch)
         {
             if let Some(register) = &event.indirect_register {
-                by_register.entry(register.clone()).or_default().push(event);
+                by_register.entry(*register).or_default().push(event);
             }
         }
         for (register, register_events) in by_register {
@@ -855,7 +968,7 @@ impl VmAnalyzer {
                 &mut merged,
                 VmStateCandidate {
                     role: VmStateRole::DispatchTarget,
-                    location: format!("reg:{register}"),
+                    location: format!("reg:{register:?}"),
                     lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
                     confidence: (0.3 + dispatcher_support as f32 * 0.05).min(0.6),
                     evidence: register_events
@@ -869,7 +982,7 @@ impl VmAnalyzer {
                             ),
                             native_address: Some(event.address),
                             kind: EvidenceKind::ControlFlow,
-                            detail: Some(format!("indirect branch target register {register}")),
+                            detail: Some(format!("indirect branch target register {register:?}")),
                         })
                         .collect(),
                     alternatives: Vec::new(),
@@ -877,7 +990,7 @@ impl VmAnalyzer {
             );
         }
 
-        let mut base_reg_events: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
+        let mut base_reg_events: BTreeMap<RegId, Vec<&NativeEvent>> = BTreeMap::new();
         for event in &state_events {
             if let Some(base_reg) = &event.base_reg {
                 base_reg_events
@@ -888,7 +1001,7 @@ impl VmAnalyzer {
         }
         let all_base_locations: Vec<String> = base_reg_events
             .keys()
-            .map(|register| format!("reg:{register}"))
+            .map(|register| format!("reg:{register:?}"))
             .collect();
         let mut base_ranked: Vec<_> = base_reg_events.into_iter().collect();
         base_ranked.sort_by_key(|(_, register_events)| std::cmp::Reverse(register_events.len()));
@@ -901,7 +1014,7 @@ impl VmAnalyzer {
                 .last()
                 .map(|event| event.line)
                 .unwrap_or(first);
-            let role = if register == "sp" || register == "x29" || register == "x31" {
+            let role = if matches!(register, RegId::SP | RegId::X29) {
                 VmStateRole::VirtualSp
             } else {
                 VmStateRole::VmContext
@@ -910,7 +1023,7 @@ impl VmAnalyzer {
                 &mut merged,
                 VmStateCandidate {
                     role,
-                    location: format!("reg:{register}"),
+                    location: format!("reg:{register:?}"),
                     lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
                     confidence: (0.25 + register_events.len() as f32 * 0.02).min(0.8),
                     evidence: register_events
@@ -924,21 +1037,18 @@ impl VmAnalyzer {
                             ),
                             native_address: Some(event.address),
                             kind: EvidenceKind::MemoryAccess,
-                            detail: Some(format!("register used as memory base: {register}")),
+                            detail: Some(format!("register used as memory base: {register:?}")),
                         })
                         .collect(),
                     alternatives: all_base_locations.clone(),
                 },
             );
-            if register_events
-                .iter()
-                .any(|event| !event.memory_reads.is_empty() || !event.memory_writes.is_empty())
-            {
+            if register_events.iter().any(|event| event.mem_present) {
                 merge_state_candidate(
                     &mut merged,
                     VmStateCandidate {
                         role: VmStateRole::BytecodeBase,
-                        location: format!("reg:{register}"),
+                        location: format!("reg:{register:?}"),
                         lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
                         confidence: (0.2 + register_events.len() as f32 * 0.015).min(0.65),
                         evidence: register_events
@@ -953,7 +1063,7 @@ impl VmAnalyzer {
                                 native_address: Some(event.address),
                                 kind: EvidenceKind::MemoryAccess,
                                 detail: Some(format!(
-                                    "bytecode-base candidate {register} participates in memory access"
+                                    "bytecode-base candidate {register:?} participates in memory access"
                                 )),
                             })
                             .collect(),
@@ -963,13 +1073,10 @@ impl VmAnalyzer {
             }
         }
 
-        let mut written_registers: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
+        let mut written_registers: BTreeMap<RegId, Vec<&NativeEvent>> = BTreeMap::new();
         for event in &state_events {
-            for register in &event.writes {
-                written_registers
-                    .entry(register.clone())
-                    .or_default()
-                    .push(event);
+            for register in event.writes.iter() {
+                written_registers.entry(register).or_default().push(event);
             }
         }
         let mut written_ranked: Vec<_> = written_registers.into_iter().collect();
@@ -987,7 +1094,7 @@ impl VmAnalyzer {
                 &mut merged,
                 VmStateCandidate {
                     role: VmStateRole::VirtualRegister,
-                    location: format!("reg:{register}"),
+                    location: format!("reg:{register:?}"),
                     lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
                     confidence: (0.18 + register_events.len() as f32 * 0.01).min(0.55),
                     evidence: register_events
@@ -1001,7 +1108,7 @@ impl VmAnalyzer {
                             ),
                             native_address: Some(event.address),
                             kind: EvidenceKind::RegisterTransition,
-                            detail: Some(format!("virtual-register candidate {register}")),
+                            detail: Some(format!("virtual-register candidate {register:?}")),
                         })
                         .collect(),
                     alternatives: Vec::new(),
@@ -1009,16 +1116,13 @@ impl VmAnalyzer {
             );
         }
 
-        let mut dispatcher_writes: BTreeMap<String, Vec<&NativeEvent>> = BTreeMap::new();
+        let mut dispatcher_writes: BTreeMap<RegId, Vec<&NativeEvent>> = BTreeMap::new();
         for event in events
             .iter()
             .filter(|event| dispatcher_lines.contains(&event.line))
         {
-            for register in &event.writes {
-                dispatcher_writes
-                    .entry(register.clone())
-                    .or_default()
-                    .push(event);
+            for register in event.writes.iter() {
+                dispatcher_writes.entry(register).or_default().push(event);
             }
         }
         for (register, register_events) in dispatcher_writes {
@@ -1034,7 +1138,7 @@ impl VmAnalyzer {
                 &mut merged,
                 VmStateCandidate {
                     role: VmStateRole::DispatcherState,
-                    location: format!("reg:{register}"),
+                    location: format!("reg:{register:?}"),
                     lines: LineRange::new(first, last.checked_add(1).unwrap_or(region_end)),
                     confidence: (0.3 + register_events.len() as f32 * 0.08).min(0.85),
                     evidence: register_events
@@ -1048,7 +1152,7 @@ impl VmAnalyzer {
                             ),
                             native_address: Some(event.address),
                             kind: EvidenceKind::RegisterTransition,
-                            detail: Some(format!("dispatcher writes state register {register}")),
+                            detail: Some(format!("dispatcher writes state register {register:?}")),
                         })
                         .collect(),
                     alternatives: Vec::new(),
@@ -1131,7 +1235,7 @@ fn detect_guest_pc_candidates(
 ) -> Vec<VmStateCandidate> {
     let mut candidates = Vec::new();
     for (index, event) in events.iter().enumerate() {
-        if !event.mnemonic.eq_ignore_ascii_case("add")
+        if !event.mnemonic.as_str().eq_ignore_ascii_case("add")
             || event.writes.len() != 1
             || event.reads.len() < 2
         {
@@ -1141,8 +1245,8 @@ fn detect_guest_pc_candidates(
             continue;
         };
         let load = events.iter().skip(index + 1).take(4).find(|candidate| {
-            candidate.mnemonic.starts_with("ldr")
-                && candidate.base_reg.as_deref() == Some(destination.as_str())
+            candidate.mnemonic.as_str().starts_with("ldr")
+                && candidate.base_reg == Some(destination)
         });
         let Some(load) = load else {
             continue;
@@ -1152,24 +1256,21 @@ fn detect_guest_pc_candidates(
             .iter()
             .rev()
             .find_map(|previous| {
-                if previous.mnemonic.starts_with("ldr") && !previous.memory_reads.is_empty() {
+                if previous.mnemonic.as_str().starts_with("ldr") && previous.mem_present {
                     previous
                         .writes
                         .iter()
-                        .find(|write| event.reads.contains(write))
-                        .cloned()
+                        .find(|write| event.reads.contains(*write))
                 } else {
                     None
                 }
             });
-        let pc_registers: Vec<String> = event
+        let pc_registers: Vec<RegId> = event
             .reads
             .iter()
             .filter(|register| {
-                memory_base.as_deref() != Some(register.as_str())
-                    && !matches!(register.as_str(), "sp" | "xzr" | "wzr")
+                memory_base != Some(*register) && !matches!(*register, RegId::SP | RegId::XZR)
             })
-            .cloned()
             .collect();
         if pc_registers.is_empty() {
             continue;
@@ -1177,12 +1278,12 @@ fn detect_guest_pc_candidates(
         let lines = LineRange::new(event.line, load.line.checked_add(1).unwrap_or(region_end));
         let alternatives: Vec<String> = pc_registers
             .iter()
-            .map(|register| format!("reg:{register}"))
+            .map(|register| format!("reg:{register:?}"))
             .collect();
         for pc in &pc_registers {
             candidates.push(VmStateCandidate {
                 role: VmStateRole::VirtualPc,
-                location: format!("reg:{pc}"),
+                location: format!("reg:{pc:?}"),
                 lines,
                 confidence: if memory_base.is_some() { 0.7 } else { 0.5 },
                 evidence: vec![EvidenceRef {
@@ -1191,7 +1292,7 @@ fn detect_guest_pc_candidates(
                     native_address: Some(event.address),
                     kind: EvidenceKind::RegisterTransition,
                     detail: Some(format!(
-                        "add forms a guest fetch address; {} is a PC candidate",
+                        "add forms a guest fetch address; {:?} is a PC candidate",
                         pc
                     )),
                 }],
@@ -1201,7 +1302,7 @@ fn detect_guest_pc_candidates(
         if let Some(base) = memory_base {
             candidates.push(VmStateCandidate {
                 role: VmStateRole::BytecodeBase,
-                location: format!("reg:{base}"),
+                location: format!("reg:{base:?}"),
                 lines,
                 confidence: 0.6,
                 evidence: vec![EvidenceRef {
@@ -1210,7 +1311,7 @@ fn detect_guest_pc_candidates(
                     native_address: Some(event.address),
                     kind: EvidenceKind::MemoryAccess,
                     detail: Some(format!(
-                        "{base} is combined with a guest PC before a byte load"
+                        "{base:?} is combined with a guest PC before a byte load"
                     )),
                 }],
                 alternatives,
@@ -1228,28 +1329,21 @@ fn signature_for_window(
     branch: &NativeEvent,
 ) -> DispatchSignature {
     let mut signature = DispatchSignature {
-        call_link: branch.mnemonic.eq_ignore_ascii_case("blr"),
+        call_link: branch.mnemonic.as_str().eq_ignore_ascii_case("blr"),
         ..DispatchSignature::default()
     };
     for event in window {
-        let mnemonic = event.mnemonic.to_ascii_lowercase();
-        if (mnemonic.starts_with("ldrb") || mnemonic.starts_with("ldrh"))
-            && !event.memory_reads.is_empty()
-        {
+        let mnemonic = event.mnemonic.as_str().to_ascii_lowercase();
+        if (mnemonic.starts_with("ldrb") || mnemonic.starts_with("ldrh")) && event.mem_present {
             signature.guest_fetch = true;
         }
-        if mnemonic == "and" && (event.disasm.contains("#0xf") || event.disasm.contains("#15")) {
+        if event.hint_flags & HINT_NIBBLE_DECODE != 0 {
             signature.nibble_decode = true;
         }
-        if mnemonic.starts_with("ldr")
-            && (event.disasm.contains("lsl #1") || event.disasm.contains("lsl #2"))
-        {
+        if event.hint_flags & HINT_TABLE_LOAD != 0 {
             signature.table_load = true;
         }
-        if mnemonic == "ldr"
-            && !event.memory_reads.is_empty()
-            && (event.disasm.contains("lsl #3") || event.disasm.contains("uxtw #3"))
-        {
+        if event.hint_flags & HINT_CALLBACK_ARRAY != 0 {
             signature.callback_array_load = true;
         }
     }
@@ -1405,17 +1499,19 @@ fn cluster_addresses(addresses: Vec<u64>, max_gap: u64) -> Vec<Vec<u64>> {
 fn template_hash(events: &[NativeEvent]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for event in events {
-        for byte in event.mnemonic.to_ascii_lowercase().bytes() {
+        for byte in event.mnemonic.as_str().to_ascii_lowercase().bytes() {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         for register in event.reads.iter().chain(event.writes.iter()) {
-            hash ^= register.len() as u64;
+            hash ^= register.0 as u64;
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        hash ^= (event.memory_reads.len() as u64) << 8;
+        hash ^= (event.mem_present as u64) << 8;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        hash ^= (event.memory_writes.len() as u64) << 16;
+        hash ^= (event.mem_is_write as u64) << 16;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash ^= (event.mem_width as u64) << 17;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         hash ^= (event.conditional_branch as u64) << 24;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -1434,17 +1530,23 @@ fn infer_semantics(events: &[NativeEvent]) -> HandlerSemantics {
     let mut control_effect = None;
 
     for event in events {
-        let operation = operation_for_mnemonic(&event.mnemonic);
+        let operation = operation_for_mnemonic(event.mnemonic.as_str());
         if !operations.contains(&operation) {
             operations.push(operation);
         }
-        reads.extend(event.reads.iter().cloned());
-        writes.extend(event.writes.iter().cloned());
-        for address in &event.memory_reads {
-            memory_effects.push(format!("read 0x{address:x}"));
-        }
-        for address in &event.memory_writes {
-            memory_effects.push(format!("write 0x{address:x}"));
+        reads.extend(event.reads.iter());
+        writes.extend(event.writes.iter());
+        if event.mem_present {
+            let end = event.mem_start.saturating_add(event.mem_width as u64);
+            memory_effects.push(format!(
+                "{} 0x{:x}",
+                if event.mem_is_write { "write" } else { "read" },
+                event.mem_start
+            ));
+            memory_effects.push(format!(
+                "{} 0x{end:x}",
+                if event.mem_is_write { "write" } else { "read" }
+            ));
         }
         if event.branch_target.is_some() || event.conditional_branch {
             control_effect = event
@@ -1467,8 +1569,14 @@ fn infer_semantics(events: &[NativeEvent]) -> HandlerSemantics {
     };
     HandlerSemantics {
         operations,
-        state_reads: reads.into_iter().collect(),
-        state_writes: writes.into_iter().collect(),
+        state_reads: reads
+            .into_iter()
+            .map(|register| format!("{register:?}"))
+            .collect(),
+        state_writes: writes
+            .into_iter()
+            .map(|register| format!("{register:?}"))
+            .collect(),
         memory_effects,
         control_effect,
         unknown_effects: unknown,
@@ -1798,8 +1906,8 @@ mod tests {
             NativeEvent::instruction(GlobalLine(0), 0x1000, "ldr", "ldr x8, [x21, x25, lsl #3]")
                 .reads(&["x21", "x25"])
                 .writes(&["x8"]);
-        load.base_reg = Some("x21".to_string());
-        load.memory_reads = vec![0x8000_0000];
+        load.base_reg = parse_reg("x21");
+        load = load.memory_read(0x8000_0000, 1);
         let events = vec![
             load,
             NativeEvent::instruction(GlobalLine(1), 0x1004, "blr", "blr x8")
@@ -1830,8 +1938,8 @@ mod tests {
         let mut ldr = NativeEvent::instruction(GlobalLine(0), 0x1000, "ldr", "ldr x11, [x8, #8]")
             .reads(&["x8"])
             .writes(&["x11"]);
-        ldr.base_reg = Some("x8".to_string());
-        ldr.memory_reads = vec![0x8000_0008];
+        ldr.base_reg = parse_reg("x8");
+        ldr = ldr.memory_read(0x8000_0008, 1);
         let add = NativeEvent::instruction(GlobalLine(1), 0x1004, "add", "add x10, x11, x25")
             .reads(&["x11", "x25"])
             .writes(&["x10"]);
@@ -1839,8 +1947,8 @@ mod tests {
             NativeEvent::instruction(GlobalLine(2), 0x1008, "ldrb", "ldrb w12, [x10, #1]")
                 .reads(&["x10"])
                 .writes(&["w12"]);
-        fetch.base_reg = Some("x10".to_string());
-        fetch.memory_reads = vec![0x8000_1001];
+        fetch.base_reg = parse_reg("x10");
+        fetch = fetch.memory_read(0x8000_1001, 1);
         let events = vec![
             ldr,
             add,
@@ -1949,16 +2057,16 @@ mod tests {
             .reads(&["x9"])
             .writes(&["x20"])
             .dispatch(0x2000, "x9");
-        first_dispatch.base_reg = Some("x8".to_string());
+        first_dispatch.base_reg = parse_reg("x8");
         let mut handler = NativeEvent::instruction(GlobalLine(1), 0x2000, "ldr", "ldr x0, [sp]")
             .reads(&["sp"])
             .writes(&["x0"]);
-        handler.base_reg = Some("sp".to_string());
-        handler.memory_reads = vec![0x1000];
+        handler.base_reg = parse_reg("sp");
+        handler = handler.memory_read(0x1000, 1);
         let mut conditional =
             NativeEvent::instruction(GlobalLine(2), 0x2004, "b.eq", "b.eq 0x2000");
         conditional.conditional_branch = true;
-        conditional.base_reg = Some("x8".to_string());
+        conditional.base_reg = parse_reg("x8");
         let events = vec![
             first_dispatch,
             handler,

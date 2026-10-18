@@ -4,6 +4,10 @@ use trace_core::analysis::{CfgEdgeKind, VmStateRole};
 use trace_core::{BuildOptions, GlobalLine, TraceEngine, VmAnalysisConfig};
 
 fn main() -> anyhow::Result<()> {
+    println!(
+        "native_event_size={}",
+        std::mem::size_of::<trace_core::analysis::NativeEvent>()
+    );
     let path = std::env::args()
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: avm_probe_trace <trace.log>"))?;
@@ -69,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     regions.sort_by(|a, b| b.score.total_cmp(&a.score));
     for region in regions.iter().take(10) {
         println!(
-            "region {} lines={}..{} addr={:#x}..{:#x} score={:.4} conf={:.2} exec={} repeats={} indirect={}",
+            "region {} lines={}..{} addr={:#x}..{:#x} score={:.4} conf={:.2} repeats={} indirect={} warnings={}",
             region.id,
             region.lines.start.get(),
             region.lines.end.get(),
@@ -77,9 +81,9 @@ fn main() -> anyhow::Result<()> {
             region.address_end,
             region.score,
             region.confidence,
-            region.evidence.first().and_then(|e| e.detail.as_deref()).unwrap_or(""),
             region.repeated_instructions,
-            region.indirect_dispatches
+            region.indirect_dispatches,
+            region.warnings.join("|")
         );
     }
 

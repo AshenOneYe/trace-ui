@@ -10,9 +10,9 @@ P0 的 dispatcher 聚合、分类、时间线切分和保守回退已经落地�
 
 | 场景 | 优化前 | 优化后 |
 |---|---:|---:|
-| 710 MB Trace / 100k 行 | 1.02 秒；1,560 dispatcher；1,559 handler | **0.13 秒**；2 dispatcher；0 handler |
-| 710 MB Trace / 500k 行 | 112.3 秒；6,621 dispatcher；6,619 handler | **0.66 秒**；3 dispatcher；0 handler |
-| 710 MB Trace / 全量 7.66M 行 | >131 秒未完成 | **10.95 秒**；4 dispatcher；0 handler |
+| 710 MB Trace / 100k 行 | 1.02 秒；1,560 dispatcher；1,559 handler | **0.13 秒**；2 region；2 dispatcher；0 handler；751 MB |
+| 710 MB Trace / 500k 行 | 112.3 秒；6,621 dispatcher；6,619 handler | **0.63 秒**；2 region；3 dispatcher；0 handler；798 MB |
+| 710 MB Trace / 全量 7.66M 行 | >131 秒未完成；RSS 3.09 GB（中断时） | **9.57 秒**；3 region；4 dispatcher；0 handler；RSS **1.49 GB** |
 | 合成 AVM 探针 | 38 dispatcher；67 对重叠 | **3 dispatcher；16 handler；0 重叠** |
 | 合成 AVM 单分发点 | 16 个重复候选 | **1 个站点候选；16 handler；0 重叠** |
 
@@ -20,6 +20,10 @@ P0 的 dispatcher 聚合、分类、时间线切分和保守回退已经落地�
 
 - `libtprt +0x137c8c` 被正确标为 `Callback`（indexed function-pointer load +
   `blr`），不再生成 12 万级 handler。
+- 单条 `NativeEvent` 从 128 B 压到 **96 B**：寄存器位图 `RegSet`、栈上
+  `Mnemonic`、固定内存访问字段；7.66M 行全量分析 RSS 已低于 1.5 GB。
+- 没有 dispatcher 候选的热点区域不再返回；全量 Trace 的 region 从 93 个
+  收敛到 3 个，且非 VM 区域置信度上限为 0.50。
 - 真实 `libtersafe2` 短 Trace 在缺少强 VM 特征时返回 2 个 `Unknown`
   dispatcher、0 handler，不再触发 provisional 假阳性。
 - AVM 探针仍能识别 `+0x35e00c` 为 `VmPrimary`、`+0x35e02c` 为
@@ -29,10 +33,10 @@ P0 的 dispatcher 聚合、分类、时间线切分和保守回退已经落地�
 
 仍未完成：
 
-- 全量 Trace RSS 约 **3.59 GB**，尚未达到 <1.5 GB；两遍流式和寄存器/事件
-  紧凑化仍是后续 P0.4。
 - 虚拟 CFG 仍以宿主目标/执行顺序为主，尚未改为 VPC 转移驱动（P2）。
 - 跨 ASLR 的模块偏移归一化尚未接入 VM 结果（P1.2）。
+- 真实 AVM Trace 仍未取得；当前只有非 AVM 的 710 MB `libtprt` Trace 和
+  `libtersafe2` 短 Trace。
 
 ## 1. 基线数据
 

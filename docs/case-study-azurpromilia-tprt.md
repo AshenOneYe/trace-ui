@@ -34,7 +34,8 @@ Trace UI 的 VM 分析方向与目标匹配，输入格式也匹配，但**当�
 - “VM IR / CFG”仍然主要是宿主 ARM64 handler 区间，不是 guest 指令集语义；
   真实 guest CFG 仍待 VPC 转移驱动。
 - 真实 710 MB `libtprt` Trace 优化前 50 万行需要 112 秒；优化后全量 7.66M 行
-  约 10.95 秒，返回 4 个 dispatcher、0 个 handler，回调循环被正确归类。
+  约 9.57 秒、RSS 1.49 GB，返回 3 个 region、4 个 dispatcher、0 个 handler，
+  回调循环被正确归类。
 
 因此当前评价是：**基础管线可用，P0 的 dispatcher 聚合/分类、handler 切分和
 保守误报控制已经完成；AVM 专用语义层仍需真实 AVM Trace 做最终验证。**
@@ -417,11 +418,11 @@ VM 分析结果（默认配置）：
 日志，但 VM 分析层既慢又不可信；这份实测数据直接验证了 P0 的 dispatcher
 去重/分类和 handler 切分性能问题。
 
-> 该问题已在后续 P0 优化中修复。复测结果：100k 行 0.13 秒 / 2 个
-> dispatcher / 0 handler；500k 行 0.66 秒 / 3 个 dispatcher / 0 handler；
-> 全量 7.66M 行 10.95 秒 / 4 个 dispatcher / 0 handler。回调站点
-> `libtprt +0x137c8c` 正确标为 `Callback`。合成 AVM 探针保持 3 个站点、
-> 16 个 handler、0 重叠。详见
+> 该问题已在后续 P0 优化中修复。复测结果：100k 行 0.13 秒 / 2 个 region /
+> 2 个 dispatcher / 0 handler；500k 行 0.63 秒 / 2 个 region / 3 个
+> dispatcher / 0 handler；全量 7.66M 行 **9.57 秒 / 3 个 region / 4 个
+> dispatcher / 0 handler / RSS 1.49 GB**。回调站点 `libtprt +0x137c8c`
+> 正确标为 `Callback`。合成 AVM 探针保持 3 个站点、16 个 handler、0 重叠。详见
 > [VM 分析优化方案](vm-analysis-optimization-plan.md)。
 
 ## 8. 尚未解决的问题
