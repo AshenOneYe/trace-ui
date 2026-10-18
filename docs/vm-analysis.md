@@ -114,7 +114,3 @@ so a resumed build reuses scanned chunks instead of rescanning the whole file.
 
 These limitations are surfaced in tool responses and must not be interpreted
 as confirmed VM semantics without native evidence review.
-
-For a concrete AVM-shaped evaluation (OLLVM state dispatch, nested guest
-jump tables, and a missing real trace), see
-[AzurPromilia / tprt AVM 评估](case-study-azurpromilia-tprt.md).

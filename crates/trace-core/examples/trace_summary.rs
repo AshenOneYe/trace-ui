@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     );
     let path = std::env::args()
         .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("usage: avm_probe_trace <trace.log>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: trace_summary <trace.log>"))?;
     let start_line = std::env::args()
         .nth(2)
         .map(|value| value.parse::<u64>())
