@@ -8,20 +8,19 @@ pub const FLAG_DATA_UNKNOWN: u8 = 0x01;
 
 /// A single memory access record.
 ///
-/// Layout is explicit `repr(C)` with manual padding to 24 bytes.
+/// Layout is explicit `repr(C)` with manual padding to 32 bytes.
 /// Archive type is Self — valid for same-endian (little-endian only) cache files.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FlatMemAccessRecord {
     pub insn_addr: u64, // u64 first to avoid padding
     pub data: u64,
-    pub seq: u32,
+    pub seq: u64,
     pub size: u8,
     pub rw: u8,        // 0=Read, 1=Write
     pub flags: u8,     // bit0 = data unknown (was _pad[0]; zero in old caches = known)
-    pub _pad: [u8; 1], // explicit pad to reach 24 bytes total
+    pub _pad: [u8; 5], // explicit pad to reach 32 bytes total
 }
-
 
 impl FlatMemAccessRecord {
     #[inline]
@@ -42,7 +41,7 @@ impl FlatMemAccessRecord {
 
 pub struct FlatMemAccess {
     pub addrs: Vec<u64>,   // sorted unique addresses
-    pub offsets: Vec<u32>, // CSR: records for addrs[i] = records[offsets[i]..offsets[i+1]]
+    pub offsets: Vec<u64>, // CSR: records for addrs[i] = records[offsets[i]..offsets[i+1]]
     pub records: Vec<FlatMemAccessRecord>,
 }
 
@@ -58,13 +57,21 @@ impl FlatMemAccess {
 
 pub struct MemAccessView<'a> {
     addrs: &'a [u64],
-    offsets: &'a [u32],
+    offsets: &'a [u64],
     records: &'a [FlatMemAccessRecord],
 }
 
 impl<'a> MemAccessView<'a> {
-    pub fn from_raw(addrs: &'a [u64], offsets: &'a [u32], records: &'a [FlatMemAccessRecord]) -> Self {
-        Self { addrs, offsets, records }
+    pub fn from_raw(
+        addrs: &'a [u64],
+        offsets: &'a [u64],
+        records: &'a [FlatMemAccessRecord],
+    ) -> Self {
+        Self {
+            addrs,
+            offsets,
+            records,
+        }
     }
 
     /// Binary search addrs, return records slice for the given address.
@@ -91,7 +98,11 @@ impl<'a> MemAccessView<'a> {
 
     /// Iterate (addr, records_slice) for a range of address indices.
     /// Used for parallel partitioning.
-    pub fn iter_addr_range(&self, start_idx: usize, end_idx: usize) -> impl Iterator<Item = (u64, &[FlatMemAccessRecord])> {
+    pub fn iter_addr_range(
+        &self,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> impl Iterator<Item = (u64, &[FlatMemAccessRecord])> {
         let addrs = &self.addrs[start_idx..end_idx];
         let offsets = &self.offsets[start_idx..=end_idx]; // inclusive end for CSR
         addrs.iter().zip(offsets.windows(2)).map(|(&addr, window)| {
@@ -128,7 +139,7 @@ mod tests {
                     size: 4,
                     rw: 1,
                     flags: 0,
-                    _pad: [0; 1],
+                    _pad: [0; 5],
                 },
                 FlatMemAccessRecord {
                     insn_addr: 0x104,
@@ -137,7 +148,7 @@ mod tests {
                     size: 4,
                     rw: 0,
                     flags: 0,
-                    _pad: [0; 1],
+                    _pad: [0; 5],
                 },
                 FlatMemAccessRecord {
                     insn_addr: 0x200,
@@ -146,7 +157,7 @@ mod tests {
                     size: 1,
                     rw: 1,
                     flags: 0,
-                    _pad: [0; 1],
+                    _pad: [0; 5],
                 },
             ],
         }
@@ -187,7 +198,7 @@ mod tests {
             size: 1,
             rw: 0,
             flags: 0,
-            _pad: [0; 1],
+            _pad: [0; 5],
         };
         assert!(r.is_read());
         let w = FlatMemAccessRecord {
@@ -197,13 +208,13 @@ mod tests {
             size: 1,
             rw: 1,
             flags: 0,
-            _pad: [0; 1],
+            _pad: [0; 5],
         };
         assert!(w.is_write());
     }
 
     #[test]
     fn test_record_size() {
-        assert_eq!(std::mem::size_of::<FlatMemAccessRecord>(), 24);
+        assert_eq!(std::mem::size_of::<FlatMemAccessRecord>(), 32);
     }
 }

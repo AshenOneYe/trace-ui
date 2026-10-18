@@ -13,22 +13,22 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 
 use crate::line_index::LineIndexBuilder;
-use crate::phase2;
 use crate::parallel_types::*;
+use crate::phase2;
 use crate::query::mem_access::{MemAccessIndex, MemAccessRecord, MemRw};
 use crate::query::registers::RegCheckpoints;
 use crate::query::strings::{StringBuilder, StringRw};
+use crate::scan_unified::bytes_to_hex_escaped;
 use crate::scanner::{
     mem_access_width, push_unique, CompactDeps, MemLastDef, PairSplitDeps, RegLastDef,
     CONTROL_DEP_BIT, PAIR_HALF2_BIT, PAIR_SHARED_BIT,
 };
-use crate::scan_unified::bytes_to_hex_escaped;
 use trace_parser::gumtrace as gumtrace_parser;
 use trace_parser::insn_class::{self, InsnClass};
 use trace_parser::parser;
 use trace_parser::types::{Operand, RegId, TraceFormat};
 
-const CHECKPOINT_INTERVAL: u32 = 1000;
+const CHECKPOINT_INTERVAL: u64 = 1000;
 
 /// Scan a single chunk of trace data, producing a `ChunkResult`.
 ///
@@ -41,7 +41,7 @@ pub fn scan_chunk(
     data: &[u8],
     start_byte: usize,
     end_byte: usize,
-    start_line: u32,
+    start_line: u64,
     format: TraceFormat,
     data_only: bool,
     no_prune: bool,
@@ -55,14 +55,14 @@ pub fn scan_chunk(
     // ── ScanState-like initialization ──
     let mut reg_last_def = RegLastDef::new();
     let mut mem_last_def = MemLastDef::default();
-    let mut last_cond_branch: Option<u32> = None;
+    let mut last_cond_branch: Option<u64> = None;
     let mut deps = CompactDeps::with_capacity(line_count_est, line_count_est * 2);
-    let mut line_count: u32 = start_line;
-    let mut parsed_count: u32 = 0;
-    let mut mem_op_count: u32 = 0;
-    let mut unknown_mnemonics: FxHashMap<String, (u32, u32)> = FxHashMap::default();
+    let mut line_count: u64 = start_line;
+    let mut parsed_count: u64 = 0;
+    let mut mem_op_count: u64 = 0;
+    let mut unknown_mnemonics: FxHashMap<String, (u64, u64)> = FxHashMap::default();
     let mut init_mem_loads = BitVec::with_capacity(line_count_est);
-    let mut pair_split: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
+    let mut pair_split: FxHashMap<u64, PairSplitDeps> = FxHashMap::default();
 
     // ── Phase2 data ──
     let mut mem_idx = MemAccessIndex::new();
@@ -80,7 +80,7 @@ pub fn scan_chunk(
     }
 
     // ── String writes (for precise string scanning in merge phase) ──
-    let mut string_accesses: Vec<(u64, u64, u8, u32, StringRw)> = Vec::new();
+    let mut string_accesses: Vec<(u64, u64, u8, u64, StringRw)> = Vec::new();
 
     // ── Unresolved tracking ──
     let mut unresolved_loads: Vec<UnresolvedLoad> = Vec::new();
@@ -90,13 +90,13 @@ pub fn scan_chunk(
     let mut unresolved_reg_uses: Vec<UnresolvedRegUse> = Vec::new();
 
     // ── Control dep tracking ──
-    let mut first_local_cond_branch: Option<u32> = None;
+    let mut first_local_cond_branch: Option<u64> = None;
     let mut needs_control_dep = BitVec::with_capacity(line_count_est);
 
     // ── Event logs ──
     let mut call_tree_events: Vec<CallTreeEvent> = Vec::new();
     let mut gumtrace_annot_events: Vec<GumtraceAnnotEvent> = Vec::new();
-    let mut consumed_seqs: Vec<u32> = Vec::new();
+    let mut consumed_seqs: Vec<u64> = Vec::new();
 
     // ── LineIndex builder ──
     let mut li_builder = LineIndexBuilder::with_start_line(start_line, line_count_est);
@@ -272,7 +272,7 @@ pub fn scan_chunk(
             let mut any_byte_unresolved = false;
             let mut missing_addrs: SmallVec<[u64; 8]> = SmallVec::new();
             let mut all_same_store = true;
-            let mut first_store_raw: Option<u32> = None;
+            let mut first_store_raw: Option<u64> = None;
             let mut store_val: Option<u64> = None;
             let mut has_init_mem = false;
 
@@ -400,8 +400,8 @@ pub fn scan_chunk(
                         // Check unresolved status for each half
                         let mut half1_unresolved = true;
                         let mut half2_unresolved = true;
-                        let mut half1_deps_local: SmallVec<[u32; 4]> = SmallVec::new();
-                        let mut half2_deps_local: SmallVec<[u32; 4]> = SmallVec::new();
+                        let mut half1_deps_local: SmallVec<[u64; 4]> = SmallVec::new();
+                        let mut half2_deps_local: SmallVec<[u64; 4]> = SmallVec::new();
 
                         // half1 mem deps (first elem_width bytes)
                         for offset in 0..ew as u64 {
@@ -537,7 +537,11 @@ pub fn scan_chunk(
             // After SIMD expansion, defs may be [rt1_lo, rt1_hi, rt2_lo, rt2_hi, base?]
             // or [rt1, rt2, base?] for scalar. Split data defs at midpoint.
             let has_base_wb = line.writeback && line.base_reg.is_some();
-            let data_defs = if has_base_wb { &defs[..defs.len() - 1] } else { &defs[..] };
+            let data_defs = if has_base_wb {
+                &defs[..defs.len() - 1]
+            } else {
+                &defs[..]
+            };
             let mid = data_defs.len() / 2;
 
             for r in &data_defs[..mid] {
@@ -654,7 +658,11 @@ pub fn scan_chunk(
         // ── Phase2: MemAccess ──
         if let Some(ref mem_op) = line.mem_op {
             mem_op_count += 1;
-            let rw = if mem_op.is_write { MemRw::Write } else { MemRw::Read };
+            let rw = if mem_op.is_write {
+                MemRw::Write
+            } else {
+                MemRw::Read
+            };
             let insn_addr = phase2::extract_insn_addr(raw_line);
 
             if mem_op.elem_width <= 8 {
@@ -694,44 +702,86 @@ pub fn scan_chunk(
                 // NEON/SIMD 行常不打印 q 寄存器值 → data_known=false，但写入仍需归因
                 let lo_known = mem_op.value_lo.is_some();
                 if lo_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value_lo.unwrap_or(0), size: 8,
-                        data_known: lo_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value_lo.unwrap_or(0),
+                            size: 8,
+                            data_known: lo_known,
+                        },
+                    );
                 }
                 let hi_known = mem_op.value_hi.is_some();
                 if hi_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs + 8, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value_hi.unwrap_or(0), size: 8,
-                        data_known: hi_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs + 8,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value_hi.unwrap_or(0),
+                            size: 8,
+                            data_known: hi_known,
+                        },
+                    );
                 }
                 // Pair 128-bit: 第二个寄存器
                 let lo2_known = mem_op.value2_lo.is_some();
                 if lo2_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs + 16, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value2_lo.unwrap_or(0), size: 8,
-                        data_known: lo2_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs + 16,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value2_lo.unwrap_or(0),
+                            size: 8,
+                            data_known: lo2_known,
+                        },
+                    );
                 }
                 let hi2_known = mem_op.value2_hi.is_some();
                 if hi2_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs + 24, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value2_hi.unwrap_or(0), size: 8,
-                        data_known: hi2_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs + 24,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value2_hi.unwrap_or(0),
+                            size: 8,
+                            data_known: hi2_known,
+                        },
+                    );
                 }
             }
 
             // ── 记录内存访问（merge 阶段用于精确字符串构建） ──
             if mem_op.elem_width <= 8 {
                 if let Some(value) = mem_op.value {
-                    let rw = if mem_op.is_write { StringRw::Write } else { StringRw::Read };
+                    let rw = if mem_op.is_write {
+                        StringRw::Write
+                    } else {
+                        StringRw::Read
+                    };
                     string_accesses.push((mem_op.abs, value, mem_op.elem_width, i, rw));
                 }
                 if let Some(val2) = mem_op.value2 {
-                    let rw = if mem_op.is_write { StringRw::Write } else { StringRw::Read };
-                    string_accesses.push((mem_op.abs + mem_op.elem_width as u64, val2, mem_op.elem_width, i, rw));
+                    let rw = if mem_op.is_write {
+                        StringRw::Write
+                    } else {
+                        StringRw::Read
+                    };
+                    string_accesses.push((
+                        mem_op.abs + mem_op.elem_width as u64,
+                        val2,
+                        mem_op.elem_width,
+                        i,
+                        rw,
+                    ));
                 }
             }
 
@@ -739,12 +789,26 @@ pub fn scan_chunk(
             if let Some(ref mut sb) = string_builder {
                 if mem_op.elem_width <= 8 {
                     if let Some(value) = mem_op.value {
-                        let rw = if mem_op.is_write { StringRw::Write } else { StringRw::Read };
+                        let rw = if mem_op.is_write {
+                            StringRw::Write
+                        } else {
+                            StringRw::Read
+                        };
                         sb.process_access(mem_op.abs, value, mem_op.elem_width, i, rw);
                     }
                     if let Some(val2) = mem_op.value2 {
-                        let rw = if mem_op.is_write { StringRw::Write } else { StringRw::Read };
-                        sb.process_access(mem_op.abs + mem_op.elem_width as u64, val2, mem_op.elem_width, i, rw);
+                        let rw = if mem_op.is_write {
+                            StringRw::Write
+                        } else {
+                            StringRw::Read
+                        };
+                        sb.process_access(
+                            mem_op.abs + mem_op.elem_width as u64,
+                            val2,
+                            mem_op.elem_width,
+                            i,
+                            rw,
+                        );
                     }
                 }
             }
@@ -874,7 +938,17 @@ mod tests {
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 0, TraceFormat::Unidbg, false, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            0,
+            TraceFormat::Unidbg,
+            false,
+            false,
+            true,
+            None,
+        );
 
         // Basic counts
         assert_eq!(result.end_line, 3);
@@ -882,8 +956,14 @@ mod tests {
 
         // add x0 (line 2) should depend on mov x8 (line 0) and mov x9 (line 1)
         let row2 = result.deps.row(2);
-        assert!(row2.iter().any(|&d| d == 0), "add should depend on mov x8 (line 0)");
-        assert!(row2.iter().any(|&d| d == 1), "add should depend on mov x9 (line 1)");
+        assert!(
+            row2.iter().any(|&d| d == 0),
+            "add should depend on mov x8 (line 0)"
+        );
+        assert!(
+            row2.iter().any(|&d| d == 1),
+            "add should depend on mov x9 (line 1)"
+        );
 
         // No unresolved items since all defs are local
         assert!(result.unresolved_reg_uses.is_empty());
@@ -900,7 +980,17 @@ mod tests {
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 0, TraceFormat::Unidbg, true, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            0,
+            TraceFormat::Unidbg,
+            true,
+            false,
+            true,
+            None,
+        );
 
         // ldr (line 2) should depend on str (line 1) via memory
         let row2 = result.deps.row(2);
@@ -920,7 +1010,17 @@ mod tests {
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 0, TraceFormat::Unidbg, true, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            0,
+            TraceFormat::Unidbg,
+            true,
+            false,
+            true,
+            None,
+        );
 
         // x8 and x9 have no local def → should be unresolved
         assert!(
@@ -933,13 +1033,21 @@ mod tests {
     #[test]
     fn test_scan_chunk_unresolved_load() {
         // A load from memory that was never written in this chunk
-        let lines = vec![
-            ldr_line("x0", "sp", 0xbffff010),
-        ];
+        let lines = vec![ldr_line("x0", "sp", 0xbffff010)];
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 0, TraceFormat::Unidbg, true, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            0,
+            TraceFormat::Unidbg,
+            true,
+            false,
+            true,
+            None,
+        );
 
         // Fully unresolved load
         assert_eq!(
@@ -953,14 +1061,21 @@ mod tests {
     #[test]
     fn test_scan_chunk_with_start_line() {
         // Test that line numbering starts at start_line
-        let lines = vec![
-            mov_line("x8", 5),
-            mov_line("x9", 10),
-        ];
+        let lines = vec![mov_line("x8", 5), mov_line("x9", 10)];
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 100, TraceFormat::Unidbg, false, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            100,
+            TraceFormat::Unidbg,
+            false,
+            false,
+            true,
+            None,
+        );
 
         assert_eq!(result.start_line, 100);
         assert_eq!(result.end_line, 102);
@@ -978,6 +1093,35 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_chunk_preserves_global_lines_above_legacy_limit() {
+        let lines = vec![mov_line("x8", 5), add_line("x0", "x8", "x8")];
+        let trace = lines.join("\n");
+        let data = trace.as_bytes();
+        let start_line = (1u64 << 29) + 12_345;
+
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            start_line,
+            TraceFormat::Unidbg,
+            false,
+            false,
+            true,
+            None,
+        );
+
+        assert_eq!(result.start_line, start_line);
+        assert_eq!(result.end_line, start_line + 2);
+        assert_eq!(
+            result.boundary.final_reg_last_def.get(&RegId::X8),
+            Some(&start_line)
+        );
+        assert_eq!(result.deps.row(1), &[start_line]);
+        assert_eq!(result.line_index.total_lines(), start_line + 2);
+    }
+
+    #[test]
     fn test_scan_chunk_calltree_events() {
         let lines = vec![
             r#"[00:00:00 001][lib.so 0x100] [94000000] 0x40000100: "bl #0x40000200" => x30=0x40000104"#.to_string(),
@@ -985,11 +1129,27 @@ mod tests {
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 0, TraceFormat::Unidbg, false, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            0,
+            TraceFormat::Unidbg,
+            false,
+            false,
+            true,
+            None,
+        );
 
         // Should have CallTreeEvent::SetRootAddr, LineAddr, and Call
-        let has_root = result.call_tree_events.iter().any(|e| matches!(e, CallTreeEvent::SetRootAddr { .. }));
-        let has_call = result.call_tree_events.iter().any(|e| matches!(e, CallTreeEvent::Call { .. }));
+        let has_root = result
+            .call_tree_events
+            .iter()
+            .any(|e| matches!(e, CallTreeEvent::SetRootAddr { .. }));
+        let has_call = result
+            .call_tree_events
+            .iter()
+            .any(|e| matches!(e, CallTreeEvent::Call { .. }));
         assert!(has_root, "should emit SetRootAddr");
         assert!(has_call, "should emit Call event for bl");
     }
@@ -1004,7 +1164,17 @@ mod tests {
         let trace = lines.join("\n");
         let data = trace.as_bytes();
 
-        let result = scan_chunk(data, 0, data.len(), 0, TraceFormat::Unidbg, false, false, true, None);
+        let result = scan_chunk(
+            data,
+            0,
+            data.len(),
+            0,
+            TraceFormat::Unidbg,
+            false,
+            false,
+            true,
+            None,
+        );
 
         // b.eq sets first_local_cond_branch
         assert_eq!(result.first_local_cond_branch, Some(1));

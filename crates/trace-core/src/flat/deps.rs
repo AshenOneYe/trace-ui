@@ -1,12 +1,57 @@
+use smallvec::SmallVec;
+
+pub const COMPACT_LOCAL_LINE_MASK: u64 = (1 << 29) - 1;
+pub const COMPACT_PAIR_HALF2_BIT: u32 = 1 << 29;
+pub const COMPACT_PAIR_SHARED_BIT: u32 = 1 << 30;
+pub const COMPACT_CONTROL_DEP_BIT: u32 = 1 << 31;
+
+pub fn encode_compact_dep(global_dep: u64, chunk_start_line: u64) -> Option<u32> {
+    use crate::scanner::{CONTROL_DEP_BIT, LINE_MASK, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
+
+    let global_line = global_dep & LINE_MASK;
+    let local_line = global_line.checked_sub(chunk_start_line)?;
+    if local_line > COMPACT_LOCAL_LINE_MASK {
+        return None;
+    }
+    let mut flags = 0u32;
+    if global_dep & PAIR_HALF2_BIT != 0 {
+        flags |= COMPACT_PAIR_HALF2_BIT;
+    }
+    if global_dep & PAIR_SHARED_BIT != 0 {
+        flags |= COMPACT_PAIR_SHARED_BIT;
+    }
+    if global_dep & CONTROL_DEP_BIT != 0 {
+        flags |= COMPACT_CONTROL_DEP_BIT;
+    }
+    Some(local_line as u32 | flags)
+}
+
+pub fn decode_compact_dep(compact_dep: u32, chunk_start_line: u64) -> u64 {
+    use crate::scanner::{CONTROL_DEP_BIT, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
+
+    let local_line = (compact_dep & COMPACT_LOCAL_LINE_MASK as u32) as u64;
+    let mut global_dep = chunk_start_line + local_line;
+    if compact_dep & COMPACT_PAIR_HALF2_BIT != 0 {
+        global_dep |= PAIR_HALF2_BIT;
+    }
+    if compact_dep & COMPACT_PAIR_SHARED_BIT != 0 {
+        global_dep |= PAIR_SHARED_BIT;
+    }
+    if compact_dep & COMPACT_CONTROL_DEP_BIT != 0 {
+        global_dep |= CONTROL_DEP_BIT;
+    }
+    global_dep
+}
+
 pub struct FlatDeps {
-    pub chunk_start_lines: Vec<u32>,
-    pub chunk_offsets_start: Vec<u32>, // where chunk i's offsets begin in all_offsets
-    pub chunk_data_start: Vec<u32>,    // where chunk i's data begins in all_data
-    pub all_offsets: Vec<u32>,
+    pub chunk_start_lines: Vec<u64>,
+    pub chunk_offsets_start: Vec<u64>, // where chunk i's offsets begin in all_offsets
+    pub chunk_data_start: Vec<u64>,    // where chunk i's data begins in all_data
+    pub all_offsets: Vec<u64>,
     pub all_data: Vec<u32>,
-    pub patch_lines: Vec<u32>,   // sorted line numbers with patches
-    pub patch_offsets: Vec<u32>, // CSR into patch_data
-    pub patch_data: Vec<u32>,
+    pub patch_lines: Vec<u64>,   // sorted line numbers with patches
+    pub patch_offsets: Vec<u64>, // CSR into patch_data
+    pub patch_data: Vec<u64>,
 }
 
 impl FlatDeps {
@@ -25,26 +70,26 @@ impl FlatDeps {
 }
 
 pub struct DepsView<'a> {
-    chunk_start_lines: &'a [u32],
-    chunk_offsets_start: &'a [u32],
-    chunk_data_start: &'a [u32],
-    all_offsets: &'a [u32],
+    chunk_start_lines: &'a [u64],
+    chunk_offsets_start: &'a [u64],
+    chunk_data_start: &'a [u64],
+    all_offsets: &'a [u64],
     all_data: &'a [u32],
-    patch_lines: &'a [u32],
-    patch_offsets: &'a [u32],
-    patch_data: &'a [u32],
+    patch_lines: &'a [u64],
+    patch_offsets: &'a [u64],
+    patch_data: &'a [u64],
 }
 
 impl<'a> DepsView<'a> {
     pub fn from_raw(
-        chunk_start_lines: &'a [u32],
-        chunk_offsets_start: &'a [u32],
-        chunk_data_start: &'a [u32],
-        all_offsets: &'a [u32],
+        chunk_start_lines: &'a [u64],
+        chunk_offsets_start: &'a [u64],
+        chunk_data_start: &'a [u64],
+        all_offsets: &'a [u64],
         all_data: &'a [u32],
-        patch_lines: &'a [u32],
-        patch_offsets: &'a [u32],
-        patch_data: &'a [u32],
+        patch_lines: &'a [u64],
+        patch_offsets: &'a [u64],
+        patch_data: &'a [u64],
     ) -> Self {
         Self {
             chunk_start_lines,
@@ -59,23 +104,27 @@ impl<'a> DepsView<'a> {
     }
 
     /// Return dependency data for a given global line number.
-    pub fn row(&self, global_line: usize) -> &'a [u32] {
-        let line = global_line as u32;
+    pub fn row(&self, global_line: u64) -> SmallVec<[u64; 8]> {
+        let line = global_line;
         let chunk_idx = match self.chunk_start_lines.binary_search(&line) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
         };
         let offsets_base = self.chunk_offsets_start[chunk_idx] as usize;
         let data_base = self.chunk_data_start[chunk_idx] as usize;
-        let local = global_line - self.chunk_start_lines[chunk_idx] as usize;
+        let local = (global_line - self.chunk_start_lines[chunk_idx]) as usize;
         let start = self.all_offsets[offsets_base + local] as usize + data_base;
         let end = self.all_offsets[offsets_base + local + 1] as usize + data_base;
-        &self.all_data[start..end]
+        let chunk_start = self.chunk_start_lines[chunk_idx];
+        self.all_data[start..end]
+            .iter()
+            .map(|&dep| decode_compact_dep(dep, chunk_start))
+            .collect()
     }
 
     /// Return patch data for a given global line number (empty slice if no patch).
-    pub fn patch_row(&self, global_line: usize) -> &'a [u32] {
-        let line = global_line as u32;
+    pub fn patch_row(&self, global_line: u64) -> &'a [u64] {
+        let line = global_line;
         match self.patch_lines.binary_search(&line) {
             Ok(idx) => {
                 let start = self.patch_offsets[idx] as usize;
@@ -112,17 +161,17 @@ mod tests {
     fn test_single_chunk_rows() {
         let flat = single_chunk();
         let view = flat.view();
-        assert_eq!(view.row(0), &[10u32, 20]);
-        assert_eq!(view.row(1), &[30u32]);
-        assert_eq!(view.row(2), &[] as &[u32]);
+        assert_eq!(view.row(0).as_slice(), &[10u64, 20]);
+        assert_eq!(view.row(1).as_slice(), &[30u64]);
+        assert_eq!(view.row(2).as_slice(), &[] as &[u64]);
     }
 
     #[test]
     fn test_patch_row_miss() {
         let flat = single_chunk();
         let view = flat.view();
-        assert_eq!(view.patch_row(0), &[] as &[u32]);
-        assert_eq!(view.patch_row(1), &[] as &[u32]);
+        assert_eq!(view.patch_row(0), &[] as &[u64]);
+        assert_eq!(view.patch_row(1), &[] as &[u64]);
     }
 
     /// Two chunks: chunk 0 covers lines [0,1], chunk 1 covers lines [5,6].
@@ -150,7 +199,7 @@ mod tests {
             chunk_offsets_start: vec![0, 3],
             chunk_data_start: vec![0, 4],
             all_offsets: vec![0, 3, 4, 0, 2, 3],
-            all_data: vec![1, 2, 3, 4, 7, 8, 9],
+            all_data: vec![1, 2, 3, 4, 2, 3, 4],
             patch_lines: vec![1, 5],
             patch_offsets: vec![0, 1, 3],
             patch_data: vec![100, 200, 201],
@@ -161,10 +210,10 @@ mod tests {
     fn test_multi_chunk_rows() {
         let flat = multi_chunk_with_patches();
         let view = flat.view();
-        assert_eq!(view.row(0), &[1u32, 2, 3]);
-        assert_eq!(view.row(1), &[4u32]);
-        assert_eq!(view.row(5), &[7u32, 8]);
-        assert_eq!(view.row(6), &[9u32]);
+        assert_eq!(view.row(0).as_slice(), &[1u64, 2, 3]);
+        assert_eq!(view.row(1).as_slice(), &[4u64]);
+        assert_eq!(view.row(5).as_slice(), &[7u64, 8]);
+        assert_eq!(view.row(6).as_slice(), &[9u64]);
     }
 
     #[test]
@@ -172,12 +221,12 @@ mod tests {
         let flat = multi_chunk_with_patches();
         let view = flat.view();
         // line 1 has patch
-        assert_eq!(view.patch_row(1), &[100u32]);
+        assert_eq!(view.patch_row(1), &[100u64]);
         // line 5 has patch
-        assert_eq!(view.patch_row(5), &[200u32, 201]);
+        assert_eq!(view.patch_row(5), &[200u64, 201]);
         // line 0 has no patch
-        assert_eq!(view.patch_row(0), &[] as &[u32]);
+        assert_eq!(view.patch_row(0), &[] as &[u64]);
         // line 6 has no patch
-        assert_eq!(view.patch_row(6), &[] as &[u32]);
+        assert_eq!(view.patch_row(6), &[] as &[u64]);
     }
 }

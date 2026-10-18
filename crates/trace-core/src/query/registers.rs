@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use trace_parser::types::RegId;
 
 /// 包装 [u64; RegId::COUNT] 以支持 serde（serde 原生不支持长度 > 32 的数组）
@@ -15,20 +15,24 @@ impl<'de> Deserialize<'de> for RegSnapshot {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let v: Vec<u64> = Vec::deserialize(deserializer)?;
         let arr: [u64; RegId::COUNT] = v.try_into().map_err(|v: Vec<u64>| {
-            serde::de::Error::custom(format!("expected {} elements, got {}", RegId::COUNT, v.len()))
+            serde::de::Error::custom(format!(
+                "expected {} elements, got {}",
+                RegId::COUNT,
+                v.len()
+            ))
         })?;
         Ok(RegSnapshot(arr))
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegCheckpoints {
-    pub interval: u32,
+    pub interval: u64,
     pub snapshots: Vec<RegSnapshot>,
 }
 
 impl RegCheckpoints {
-    pub fn new(interval: u32) -> Self {
+    pub fn new(interval: u64) -> Self {
         Self {
             interval,
             snapshots: Vec::new(),
@@ -40,12 +44,12 @@ impl RegCheckpoints {
     }
 
     #[allow(dead_code)]
-    pub fn get_nearest_before(&self, seq: u32) -> Option<(u32, &[u64; RegId::COUNT])> {
+    pub fn get_nearest_before(&self, seq: u64) -> Option<(u64, &[u64; RegId::COUNT])> {
         if self.snapshots.is_empty() {
             return None;
         }
         let idx = (seq / self.interval) as usize;
         let clamped = idx.min(self.snapshots.len() - 1);
-        Some((clamped as u32 * self.interval, &self.snapshots[clamped].0))
+        Some((clamped as u64 * self.interval, &self.snapshots[clamped].0))
     }
 }

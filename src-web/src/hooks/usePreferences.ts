@@ -17,6 +17,11 @@ export interface Preferences {
   addrColorHighlight: boolean;
   mcpPort: number | null; // null = use default port (19821)
   autoStartMcp: boolean;
+  maxMemoryMB: number;
+  maxIndexCacheMB: number;
+  maxParallelScans: number;
+  maxConcurrentQueries: number;
+  backgroundPriority: "low" | "normal" | "high";
 }
 
 export interface TaintConfig {
@@ -52,6 +57,11 @@ const DEFAULTS: Preferences = {
   addrColorHighlight: false,
   mcpPort: null,
   autoStartMcp: true,
+  maxMemoryMB: 0,
+  maxIndexCacheMB: 0,
+  maxParallelScans: 4,
+  maxConcurrentQueries: 4,
+  backgroundPriority: "normal",
 };
 
 function load(): Preferences {

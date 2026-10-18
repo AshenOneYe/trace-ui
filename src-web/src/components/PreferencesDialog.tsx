@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Preferences } from "../hooks/usePreferences";
 import { THEMES } from "../theme/themes";
 import type { ThemeId } from "../theme/themes";
+import type { ResourceBudgets } from "../types/trace";
 import { themeStore } from "../stores/themeStore";
 
 interface Props {
@@ -90,6 +91,14 @@ export default function PreferencesDialog({ preferences, onSave, onClose, onClea
     if (local.mcpPort !== preferences.mcpPort && local.autoStartMcp) {
       invoke("start_mcp", { port: local.mcpPort }).catch(console.error);
     }
+    const budgets: ResourceBudgets = {
+      max_memory_bytes: Math.max(0, local.maxMemoryMB) * 1024 * 1024,
+      max_index_cache_bytes: Math.max(0, local.maxIndexCacheMB) * 1024 * 1024,
+      max_parallel_scans: Math.max(1, local.maxParallelScans),
+      max_concurrent_queries: Math.max(0, local.maxConcurrentQueries),
+      background_priority: local.backgroundPriority,
+    };
+    invoke("set_resource_budgets", { budgets }).catch(console.error);
     onSave(local);
     onClose();
   }, [local, preferences.mcpPort, onSave, onClose]);
@@ -345,6 +354,41 @@ export default function PreferencesDialog({ preferences, onSave, onClose, onClea
                 </label>
                 <div style={{ fontSize: 10, color: "var(--text-secondary)", lineHeight: 1.4, marginTop: -6 }}>
                   When enabled, a confirmation dialog will be shown before restoring the previous taint analysis state on file reopen. Useful for large traces where re-analysis may take a long time.
+                </div>
+
+                <div style={{ fontSize: 11, color: "var(--text-secondary)", fontWeight: 600, marginTop: 8 }}>
+                  Resource Budgets
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
+                    Max indexing memory (MB, 0 = unlimited)
+                    <input type="number" min={0} value={local.maxMemoryMB}
+                      onChange={e => setLocal(prev => ({ ...prev, maxMemoryMB: Number(e.target.value) || 0 }))} />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
+                    Max index cache (MB, 0 = unlimited)
+                    <input type="number" min={0} value={local.maxIndexCacheMB}
+                      onChange={e => setLocal(prev => ({ ...prev, maxIndexCacheMB: Number(e.target.value) || 0 }))} />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
+                    Parallel scans
+                    <input type="number" min={1} value={local.maxParallelScans}
+                      onChange={e => setLocal(prev => ({ ...prev, maxParallelScans: Number(e.target.value) || 1 }))} />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
+                    Concurrent queries (0 = unlimited)
+                    <input type="number" min={0} value={local.maxConcurrentQueries}
+                      onChange={e => setLocal(prev => ({ ...prev, maxConcurrentQueries: Number(e.target.value) || 0 }))} />
+                  </label>
+                  <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
+                    Background priority
+                    <select value={local.backgroundPriority}
+                      onChange={e => setLocal(prev => ({ ...prev, backgroundPriority: e.target.value as Preferences["backgroundPriority"] }))}>
+                      <option value="low">Low</option>
+                      <option value="normal">Normal</option>
+                      <option value="high">High</option>
+                    </select>
+                  </label>
                 </div>
               </div>
             )}

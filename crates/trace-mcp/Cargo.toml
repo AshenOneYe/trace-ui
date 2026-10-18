@@ -12,7 +12,7 @@ rmcp = { version = "1.2", features = [
     "transport-io",
     "schemars",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 axum = "0.8"
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

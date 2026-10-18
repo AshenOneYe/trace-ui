@@ -4,30 +4,30 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::flat::line_index::LineIndexView;
 use crate::flat::scan_view::ScanView;
 use crate::scanner::{CONTROL_DEP_BIT, LINE_MASK, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
+use rustc_hash::FxHashMap;
 use trace_parser::gumtrace as gumtrace_parser;
 use trace_parser::insn_class;
 use trace_parser::insn_class::InsnClass;
 use trace_parser::parser;
 use trace_parser::types::{Operand, ParsedLine, TraceFormat};
-use rustc_hash::FxHashMap;
 
 /// 扁平 DAG：节点数组 + 边列表，无递归嵌套
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyGraph {
     pub nodes: Vec<NodeInfo>,
-    pub edges: Vec<[u32; 2]>,   // [parent_seq, child_seq]
-    pub root_seq: u32,
-    pub total_reachable: u32,   // BFS 可达的总节点数
-    pub truncated: bool,        // 是否因超出 max_nodes 而截断
+    pub edges: Vec<[u64; 2]>, // [parent_seq, child_seq]
+    pub root_seq: u64,
+    pub total_reachable: u64, // BFS 可达的总节点数
+    pub truncated: bool,      // 是否因超出 max_nodes 而截断
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
-    pub seq: u32,
+    pub seq: u64,
     pub expression: String,
-    pub asm: String,           // 新增：原始汇编文本
+    pub asm: String, // 新增：原始汇编文本
     pub operation: String,
     pub is_leaf: bool,
     pub value: Option<String>,
@@ -36,19 +36,24 @@ pub struct NodeInfo {
 
 /// 构建扁平依赖图：BFS 遍历依赖关系，输出去重的节点数组和边列表。
 /// `max_nodes` 限制收集的节点数量，超出后仅计数不再收集。
-pub fn build_graph(view: &ScanView, start_index: u32, data_only: bool, max_nodes: u32) -> DependencyGraph {
+pub fn build_graph(
+    view: &ScanView,
+    start_index: u64,
+    data_only: bool,
+    max_nodes: u32,
+) -> DependencyGraph {
     let n = view.line_count as usize;
     let mut visited = bitvec::prelude::bitvec![0; n];
-    let mut pair_visited: FxHashMap<u32, u8> = FxHashMap::default();
-    let mut queue: VecDeque<u32> = VecDeque::new();
+    let mut pair_visited: FxHashMap<u64, u8> = FxHashMap::default();
+    let mut queue: VecDeque<u64> = VecDeque::new();
 
     // BFS 产出：节点集合（保留发现顺序）+ 去重边列表
-    let mut node_seqs: Vec<u32> = Vec::new();
-    let mut node_set: HashSet<u32> = HashSet::new();
-    let mut edges: Vec<[u32; 2]> = Vec::new();
-    let mut edge_set: HashSet<u64> = HashSet::new();
-    let mut depth_map: HashMap<u32, u32> = HashMap::new();
-    let mut children_exist: HashSet<u32> = HashSet::new();
+    let mut node_seqs: Vec<u64> = Vec::new();
+    let mut node_set: HashSet<u64> = HashSet::new();
+    let mut edges: Vec<[u64; 2]> = Vec::new();
+    let mut edge_set: HashSet<(u64, u64)> = HashSet::new();
+    let mut depth_map: HashMap<u64, u32> = HashMap::new();
+    let mut children_exist: HashSet<u64> = HashSet::new();
     let mut collecting = true; // 是否仍在收集节点（未超限）
 
     let root_line = start_index & LINE_MASK;
@@ -67,11 +72,15 @@ pub fn build_graph(view: &ScanView, start_index: u32, data_only: bool, max_nodes
     node_seqs.push(root_line);
     node_set.insert(root_line);
     depth_map.insert(root_line, 0);
-    let mut total_reachable: u32 = 1;
+    let mut total_reachable: u64 = 1;
 
     while let Some(raw) = queue.pop_front() {
         let parent_line = raw & LINE_MASK;
-        let parent_depth = if collecting { depth_map.get(&parent_line).copied().unwrap_or(0) } else { 0 };
+        let parent_depth = if collecting {
+            depth_map.get(&parent_line).copied().unwrap_or(0)
+        } else {
+            0
+        };
         let deps = collect_deps(raw, view, data_only);
 
         for dep_raw in deps {
@@ -82,10 +91,10 @@ pub fn build_graph(view: &ScanView, start_index: u32, data_only: bool, max_nodes
 
             // 收集阶段：记录边（去重），仅对已收集的节点间的边
             if collecting && node_set.contains(&parent_line) {
-                let edge_key = ((parent_line as u64) << 32) | (dep_line as u64);
+                let edge_key = (parent_line, dep_line);
                 if edge_set.insert(edge_key) {
                     // 只保留两端都在收集范围内的边（dep_line 可能超限）
-                    if node_set.contains(&dep_line) || total_reachable < max_nodes {
+                    if node_set.contains(&dep_line) || total_reachable < max_nodes as u64 {
                         edges.push([parent_line, dep_line]);
                         children_exist.insert(parent_line);
                     }
@@ -119,7 +128,7 @@ pub fn build_graph(view: &ScanView, start_index: u32, data_only: bool, max_nodes
                 }
                 depth_map.insert(dep_line, parent_depth + 1);
                 // 检查是否达到上限
-                if node_seqs.len() as u32 >= max_nodes {
+                if node_seqs.len() as u64 >= max_nodes as u64 {
                     collecting = false;
                     // 清理收集阶段的数据结构，释放内存
                     node_set.clear();
@@ -133,7 +142,7 @@ pub fn build_graph(view: &ScanView, start_index: u32, data_only: bool, max_nodes
     }
 
     // 重建 node_set 用于 is_leaf 判断
-    let node_set_final: HashSet<u32> = node_seqs.iter().copied().collect();
+    let node_set_final: HashSet<u64> = node_seqs.iter().copied().collect();
     // 过滤边：只保留两端都在节点集内的
     edges.retain(|[p, c]| node_set_final.contains(p) && node_set_final.contains(c));
 
@@ -150,7 +159,7 @@ pub fn build_graph(view: &ScanView, start_index: u32, data_only: bool, max_nodes
         })
         .collect();
 
-    let truncated = total_reachable > nodes.len() as u32;
+    let truncated = total_reachable > nodes.len() as u64;
 
     DependencyGraph {
         nodes,
@@ -204,7 +213,7 @@ fn fill_node_info(
     }
 }
 
-fn collect_deps(raw: u32, view: &ScanView, data_only: bool) -> Vec<u32> {
+fn collect_deps(raw: u64, view: &ScanView, data_only: bool) -> Vec<u64> {
     let line = raw & LINE_MASK;
     let mut deps = Vec::new();
 
@@ -235,9 +244,9 @@ fn collect_deps(raw: u32, view: &ScanView, data_only: bool) -> Vec<u32> {
     } else {
         for &dep in view
             .deps
-            .row(line as usize)
+            .row(line)
             .iter()
-            .chain(view.deps.patch_row(line as usize).iter())
+            .chain(view.deps.patch_row(line).iter())
         {
             if data_only && (dep & CONTROL_DEP_BIT) != 0 {
                 continue;
@@ -270,13 +279,15 @@ fn extract_asm(line_str: &str, format: TraceFormat) -> String {
             } else {
                 return String::new();
             };
-            let insn_start = rest.find('!')
+            let insn_start = rest
+                .find('!')
                 .and_then(|bang| rest[bang + 1..].find(' ').map(|p| bang + 1 + p + 1))
                 .unwrap_or(0);
             if insn_start == 0 || insn_start >= rest.len() {
                 return String::new();
             }
-            let insn_end = rest[insn_start..].find(';')
+            let insn_end = rest[insn_start..]
+                .find(';')
                 .map(|p| insn_start + p)
                 .unwrap_or(rest.len());
             rest[insn_start..insn_end].trim().to_string()
@@ -343,7 +354,11 @@ fn fallback_expr(m: &str, ops: &[Operand]) -> String {
         "{} = {}({})",
         fmt_operand(&ops[0]),
         m,
-        ops[1..].iter().map(fmt_operand).collect::<Vec<_>>().join(", ")
+        ops[1..]
+            .iter()
+            .map(fmt_operand)
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -405,13 +420,7 @@ fn to_c_expr(class: InsnClass, p: &ParsedLine) -> String {
             } else if m == "mvn" {
                 format!("{} = ~{}", op(ops, 0), op(ops, 1))
             } else if ops.len() >= 3 {
-                format!(
-                    "{} = {} {} {}",
-                    op(ops, 0),
-                    op(ops, 1),
-                    c_op,
-                    op(ops, 2)
-                )
+                format!("{} = {} {} {}", op(ops, 0), op(ops, 1), c_op, op(ops, 2))
             } else if ops.len() == 2 {
                 format!("{} = {} {}", op(ops, 0), c_op, op(ops, 1))
             } else {
@@ -507,12 +516,9 @@ fn to_c_expr(class: InsnClass, p: &ParsedLine) -> String {
 
         // FlagUse
         InsnClass::FlagUse => match m {
-            "csel" | "fcsel" => format!(
-                "{} = (cond) ? {} : {}",
-                op(ops, 0),
-                op(ops, 1),
-                op(ops, 2)
-            ),
+            "csel" | "fcsel" => {
+                format!("{} = (cond) ? {} : {}", op(ops, 0), op(ops, 1), op(ops, 2))
+            }
             "cset" => format!("{} = (cond) ? 1 : 0", op(ops, 0)),
             "csetm" => format!("{} = (cond) ? -1 : 0", op(ops, 0)),
             "csinc" => format!(
@@ -521,36 +527,16 @@ fn to_c_expr(class: InsnClass, p: &ParsedLine) -> String {
                 op(ops, 1),
                 op(ops, 2)
             ),
-            "csinv" => format!(
-                "{} = (cond) ? {} : ~{}",
-                op(ops, 0),
-                op(ops, 1),
-                op(ops, 2)
-            ),
-            "csneg" => format!(
-                "{} = (cond) ? {} : -{}",
-                op(ops, 0),
-                op(ops, 1),
-                op(ops, 2)
-            ),
+            "csinv" => format!("{} = (cond) ? {} : ~{}", op(ops, 0), op(ops, 1), op(ops, 2)),
+            "csneg" => format!("{} = (cond) ? {} : -{}", op(ops, 0), op(ops, 1), op(ops, 2)),
             "cinc" => format!(
                 "{} = (cond) ? {} + 1 : {}",
                 op(ops, 0),
                 op(ops, 1),
                 op(ops, 1)
             ),
-            "cinv" => format!(
-                "{} = (cond) ? ~{} : {}",
-                op(ops, 0),
-                op(ops, 1),
-                op(ops, 1)
-            ),
-            "cneg" => format!(
-                "{} = (cond) ? -{} : {}",
-                op(ops, 0),
-                op(ops, 1),
-                op(ops, 1)
-            ),
+            "cinv" => format!("{} = (cond) ? ~{} : {}", op(ops, 0), op(ops, 1), op(ops, 1)),
+            "cneg" => format!("{} = (cond) ? -{} : {}", op(ops, 0), op(ops, 1), op(ops, 1)),
             _ => fallback_expr(m, ops),
         },
 
@@ -727,13 +713,7 @@ fn to_c_expr(class: InsnClass, p: &ParsedLine) -> String {
             let stripped = m.trim_start_matches('f');
             let c_op = mnemonic_to_c_op(stripped);
             if c_op != stripped && ops.len() >= 3 {
-                format!(
-                    "{} = {} {} {}",
-                    op(ops, 0),
-                    op(ops, 1),
-                    c_op,
-                    op(ops, 2)
-                )
+                format!("{} = {} {} {}", op(ops, 0), op(ops, 1), c_op, op(ops, 2))
             } else if m == "fneg" {
                 format!("{} = -{}", op(ops, 0), op(ops, 1))
             } else if m == "fabs" {

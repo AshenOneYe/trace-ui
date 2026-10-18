@@ -5,7 +5,9 @@ use rayon::prelude::*;
 use trace_parser::gumtrace::CallAnnotation;
 use trace_parser::types::TraceFormat;
 
-use crate::api_types::{CallInfoDto, SearchMatch, SearchOptions, SearchResultLite, RangeSearchOutcome};
+use crate::api_types::{
+    CallInfoDto, RangeSearchOutcome, SearchMatch, SearchOptions, SearchResultLite,
+};
 use crate::browse::{parse_trace_line, parse_trace_line_gumtrace};
 use crate::error::{Result, TraceError};
 use crate::utils::ascii_contains;
@@ -57,11 +59,15 @@ fn parse_search_mode(
         if tokens.len() > 1 {
             Ok(SearchMode::FuzzyText(tokens))
         } else {
-            Ok(SearchMode::TextInsensitive(query.to_lowercase().into_bytes()))
+            Ok(SearchMode::TextInsensitive(
+                query.to_lowercase().into_bytes(),
+            ))
         }
     } else {
         // 默认：整体子串匹配（含空格）
-        Ok(SearchMode::TextInsensitive(query.to_lowercase().into_bytes()))
+        Ok(SearchMode::TextInsensitive(
+            query.to_lowercase().into_bytes(),
+        ))
     }
 }
 
@@ -81,7 +87,9 @@ fn ascii_contains_sensitive(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() {
         return false;
     }
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// 对一行执行匹配（支持原始行 + call_search_text 双重匹配）
@@ -150,16 +158,16 @@ fn rendered_search_text(
 /// 轻量搜索：只收集匹配的 seq 号，不解析行内容
 fn search_chunk_seqs(
     data: &[u8],
-    start_seq: u32,
-    end_seq: u32,
+    start_seq: u64,
+    end_seq: u64,
     start_offset: usize,
     mode: &SearchMode,
-    consumed_seqs: &HashSet<u32>,
-    call_search_texts: &HashMap<u32, String>,
+    consumed_seqs: &HashSet<u64>,
+    call_search_texts: &HashMap<u64, String>,
     max_results_per_chunk: usize,
-) -> (Vec<u32>, u32) {
+) -> (Vec<u64>, u64) {
     let mut match_seqs = Vec::new();
-    let mut total_matches = 0u32;
+    let mut total_matches = 0u64;
     let mut pos = start_offset;
     let mut seq = start_seq;
 
@@ -190,17 +198,17 @@ fn search_chunk_seqs(
 /// 可选按指令地址（so_offset 或绝对地址）过滤，保留前 keep_cap 个匹配供分页。
 fn search_range_chunk(
     data: &[u8],
-    start_seq: u32,
-    end_seq: u32,
+    start_seq: u64,
+    end_seq: u64,
     start_offset: usize,
     mode: &SearchMode,
-    consumed_seqs: &HashSet<u32>,
-    call_search_texts: &HashMap<u32, String>,
+    consumed_seqs: &HashSet<u64>,
+    call_search_texts: &HashMap<u64, String>,
     addr_filter: Option<(u64, u64)>,
     keep_cap: usize,
-) -> (Vec<u32>, u32) {
+) -> (Vec<u64>, u64) {
     let mut kept = Vec::new();
-    let mut total = 0u32;
+    let mut total = 0u64;
     let mut pos = start_offset;
     let mut seq = start_seq;
 
@@ -251,7 +259,9 @@ impl TraceEngine {
         let handle = self.get_handle(session_id)?;
 
         if query.is_empty() {
-            *handle.search_cache.lock()
+            *handle
+                .search_cache
+                .lock()
                 .map_err(|e| TraceError::Internal(e.to_string()))? = (0, Vec::new());
             return Ok(SearchResultLite {
                 match_seqs: Vec::new(),
@@ -261,9 +271,18 @@ impl TraceEngine {
             });
         }
 
-        let mode = parse_search_mode(query, options.case_sensitive, options.use_regex, options.fuzzy)?;
+        let mode = parse_search_mode(
+            query,
+            options.case_sensitive,
+            options.use_regex,
+            options.fuzzy,
+        )?;
         let paginated = options.max_results.is_none();
-        let max_results = if paginated { usize::MAX } else { options.max_results.unwrap() as usize };
+        let max_results = if paginated {
+            usize::MAX
+        } else {
+            options.max_results.unwrap() as usize
+        };
 
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -282,32 +301,29 @@ impl TraceEngine {
                 .map(|s| s.total_lines())
                 .unwrap_or(0);
 
-            let chunks: Option<Vec<(u32, u32, usize)>> =
-                if num_cpus > 1 && total_lines > 10000 {
-                    state.line_index_view().map(|li| {
-                        let data: &[u8] = &state.mmap;
-                        let num_chunks = num_cpus.min(16);
-                        let lines_per_chunk =
-                            (total_lines as usize + num_chunks - 1) / num_chunks;
-                        let mut result = Vec::with_capacity(num_chunks);
-                        for i in 0..num_chunks {
-                            let start_seq = (i * lines_per_chunk) as u32;
-                            if start_seq >= total_lines {
-                                break;
-                            }
-                            let end_seq =
-                                ((i + 1) * lines_per_chunk).min(total_lines as usize) as u32;
-                            let start_offset =
-                                li.line_byte_offset(data, start_seq).unwrap_or(0) as usize;
-                            result.push((start_seq, end_seq, start_offset));
+            let chunks: Option<Vec<(u64, u64, usize)>> = if num_cpus > 1 && total_lines > 10000 {
+                state.line_index_view().map(|li| {
+                    let data: &[u8] = &state.mmap;
+                    let num_chunks = num_cpus.min(16);
+                    let lines_per_chunk = (total_lines as usize + num_chunks - 1) / num_chunks;
+                    let mut result = Vec::with_capacity(num_chunks);
+                    for i in 0..num_chunks {
+                        let start_seq = (i * lines_per_chunk) as u64;
+                        if start_seq >= total_lines {
+                            break;
                         }
-                        result
-                    })
-                } else {
-                    None
-                };
+                        let end_seq = ((i + 1) * lines_per_chunk).min(total_lines as usize) as u64;
+                        let start_offset =
+                            li.line_byte_offset(data, start_seq).unwrap_or(0) as usize;
+                        result.push((start_seq, end_seq, start_offset));
+                    }
+                    result
+                })
+            } else {
+                None
+            };
 
-            let consumed: HashSet<u32> = state.consumed_seqs.iter().copied().collect();
+            let consumed: HashSet<u64> = state.consumed_seqs.iter().copied().collect();
 
             (
                 state.mmap.clone(),
@@ -321,7 +337,7 @@ impl TraceEngine {
         let data: Arc<memmap2::Mmap> = mmap_arc;
 
         let (all_seqs, total_matches) = if let Some(chunks) = chunks {
-            let chunk_results: Vec<(Vec<u32>, u32)> = chunks
+            let chunk_results: Vec<(Vec<u64>, u64)> = chunks
                 .par_iter()
                 .map(|&(start_seq, end_seq, start_offset)| {
                     search_chunk_seqs(
@@ -338,7 +354,7 @@ impl TraceEngine {
                 .collect();
 
             let mut merged = Vec::new();
-            let mut tm = 0u32;
+            let mut tm = 0u64;
             for (chunk_seqs, chunk_total) in chunk_results {
                 tm += chunk_total;
                 if paginated {
@@ -367,7 +383,9 @@ impl TraceEngine {
             // 全量模式：缓存结果，只返回首页
             let first_page_end = SEARCH_FIRST_PAGE_SIZE.min(all_seqs.len());
             let first_page = all_seqs[..first_page_end].to_vec();
-            let mut cache = handle.search_cache.lock()
+            let mut cache = handle
+                .search_cache
+                .lock()
                 .map_err(|e| TraceError::Internal(e.to_string()))?;
             let gen = cache.0 + 1;
             *cache = (gen, all_seqs); // move, not clone
@@ -383,7 +401,7 @@ impl TraceEngine {
                 match_seqs: all_seqs,
                 total_scanned: total_lines,
                 total_matches,
-                truncated: total_matches > max_results as u32,
+                truncated: total_matches > max_results as u64,
             })
         }
     }
@@ -394,9 +412,11 @@ impl TraceEngine {
         session_id: &str,
         offset: u32,
         count: u32,
-    ) -> Result<(u64, Vec<u32>)> {
+    ) -> Result<(u64, Vec<u64>)> {
         let handle = self.get_handle(session_id)?;
-        let cache = handle.search_cache.lock()
+        let cache = handle
+            .search_cache
+            .lock()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
         let (gen, ref all_seqs) = *cache;
         let start = (offset as usize).min(all_seqs.len());
@@ -415,11 +435,11 @@ impl TraceEngine {
         session_id: &str,
         query: &str,
         options: SearchOptions,
-        start_seq: u32,
-        end_seq: u32,
+        start_seq: u64,
+        end_seq: u64,
         addr_filter: Option<(u64, u64)>,
-        offset: u32,
-        limit: u32,
+        offset: u64,
+        limit: u64,
     ) -> Result<RangeSearchOutcome> {
         if query.is_empty() || limit == 0 {
             return Ok(RangeSearchOutcome {
@@ -429,7 +449,12 @@ impl TraceEngine {
             });
         }
         let handle = self.get_handle(session_id)?;
-        let mode = parse_search_mode(query, options.case_sensitive, options.use_regex, options.fuzzy)?;
+        let mode = parse_search_mode(
+            query,
+            options.case_sensitive,
+            options.use_regex,
+            options.fuzzy,
+        )?;
 
         let (mmap_arc, call_search_texts, consumed_seqs, chunks, start, end) = {
             let state = handle
@@ -458,29 +483,27 @@ impl TraceEngine {
                 .unwrap_or(4);
 
             // 窗口较大时并行分块（与 search 相同的分块策略）
-            let chunks: Option<Vec<(u32, u32, usize)>> =
-                if num_cpus > 1 && end - start > 200_000 {
-                    state.line_index_view().map(|li| {
-                        let data: &[u8] = &state.mmap;
-                        let num_chunks = num_cpus.min(16);
-                        let lines_per_chunk =
-                            ((end - start) as usize + num_chunks - 1) / num_chunks;
-                        let mut result = Vec::with_capacity(num_chunks);
-                        let mut chunk_start = start;
-                        while chunk_start < end {
-                            let chunk_end = (chunk_start + lines_per_chunk as u32).min(end);
-                            let start_offset =
-                                li.line_byte_offset(data, chunk_start).unwrap_or(0) as usize;
-                            result.push((chunk_start, chunk_end, start_offset));
-                            chunk_start = chunk_end;
-                        }
-                        result
-                    })
-                } else {
-                    None
-                };
+            let chunks: Option<Vec<(u64, u64, usize)>> = if num_cpus > 1 && end - start > 200_000 {
+                state.line_index_view().map(|li| {
+                    let data: &[u8] = &state.mmap;
+                    let num_chunks = num_cpus.min(16);
+                    let lines_per_chunk = ((end - start) as usize + num_chunks - 1) / num_chunks;
+                    let mut result = Vec::with_capacity(num_chunks);
+                    let mut chunk_start = start;
+                    while chunk_start < end {
+                        let chunk_end = (chunk_start + lines_per_chunk as u64).min(end);
+                        let start_offset =
+                            li.line_byte_offset(data, chunk_start).unwrap_or(0) as usize;
+                        result.push((chunk_start, chunk_end, start_offset));
+                        chunk_start = chunk_end;
+                    }
+                    result
+                })
+            } else {
+                None
+            };
 
-            let consumed: HashSet<u32> = state.consumed_seqs.iter().copied().collect();
+            let consumed: HashSet<u64> = state.consumed_seqs.iter().copied().collect();
 
             (
                 state.mmap.clone(),
@@ -496,7 +519,7 @@ impl TraceEngine {
         let keep_cap = offset.saturating_add(limit) as usize;
 
         let (kept, total_in_range) = if let Some(chunks) = chunks {
-            let chunk_results: Vec<(Vec<u32>, u32)> = chunks
+            let chunk_results: Vec<(Vec<u64>, u64)> = chunks
                 .par_iter()
                 .map(|&(cs, ce, coff)| {
                     search_range_chunk(
@@ -513,7 +536,7 @@ impl TraceEngine {
                 })
                 .collect();
             let mut merged = Vec::new();
-            let mut total = 0u32;
+            let mut total = 0u64;
             for (chunk_kept, chunk_total) in chunk_results {
                 total += chunk_total;
                 // 各块保留的是自身匹配的前缀，按块序拼接后截断即得全局前 keep_cap 个
@@ -564,7 +587,7 @@ impl TraceEngine {
         &self,
         session_id: &str,
         query: &str,
-        seqs: &[u32],
+        seqs: &[u64],
         case_sensitive: bool,
         use_regex: bool,
         fuzzy: bool,
@@ -589,12 +612,13 @@ impl TraceEngine {
 
             let data: &[u8] = &state.mmap;
             // 预计算各 seq 的字节偏移，同时过滤 consumed_seqs
-            let consumed: HashSet<u32> = state.consumed_seqs.iter().copied().collect();
-            let offsets: Vec<(u32, usize)> = seqs
+            let consumed: HashSet<u64> = state.consumed_seqs.iter().copied().collect();
+            let offsets: Vec<(u64, usize)> = seqs
                 .iter()
                 .filter(|&&seq| !consumed.contains(&seq))
                 .filter_map(|&seq| {
-                    li.line_byte_offset(data, seq).map(|off| (seq, off as usize))
+                    li.line_byte_offset(data, seq)
+                        .map(|off| (seq, off as usize))
                 })
                 .collect();
 
@@ -623,7 +647,8 @@ impl TraceEngine {
 
             if let Some(parsed) = parsed {
                 let mut hidden_content = None;
-                let call_info = call_annotations.get(&seq).map(|ann: &CallAnnotation| {
+                let annotation = call_annotations.get(&seq);
+                let call_info = annotation.map(|ann: &CallAnnotation| {
                     let summary = ann.summary();
                     let tooltip = ann.tooltip();
                     // 前端 UI 将 summary 截断到 80 字符显示，

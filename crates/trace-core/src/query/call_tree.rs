@@ -4,8 +4,8 @@ pub struct CallTreeNode {
     pub func_addr: u64,
     #[serde(default)]
     pub func_name: Option<String>,
-    pub entry_seq: u32,
-    pub exit_seq: u32,
+    pub entry_seq: u64,
+    pub exit_seq: u64,
     pub parent_id: Option<u32>,
     pub children_ids: Vec<u32>,
 }
@@ -29,7 +29,7 @@ impl CallTreeBuilder {
             func_addr: 0,
             func_name: None,
             entry_seq: 0,
-            exit_seq: u32::MAX,
+            exit_seq: u64::MAX,
             parent_id: None,
             children_ids: Vec::new(),
         };
@@ -46,7 +46,7 @@ impl CallTreeBuilder {
         self.nodes[0].func_addr = addr;
     }
 
-    pub fn on_call(&mut self, seq: u32, target_addr: u64) {
+    pub fn on_call(&mut self, seq: u64, target_addr: u64) {
         let child_id = self.next_id;
         self.next_id += 1;
         let child = CallTreeNode {
@@ -54,18 +54,20 @@ impl CallTreeBuilder {
             func_addr: target_addr,
             func_name: None,
             entry_seq: seq,
-            exit_seq: u32::MAX,
+            exit_seq: u64::MAX,
             parent_id: Some(self.current_id),
             children_ids: Vec::new(),
         };
         self.nodes.push(child);
-        self.nodes[self.current_id as usize].children_ids.push(child_id);
+        self.nodes[self.current_id as usize]
+            .children_ids
+            .push(child_id);
         self.call_stack.push(self.current_id);
         self.current_id = child_id;
     }
 
     /// 根据 entry_seq 查找节点并设置 func_name
-    pub fn set_func_name_by_entry_seq(&mut self, entry_seq: u32, name: &str) {
+    pub fn set_func_name_by_entry_seq(&mut self, entry_seq: u64, name: &str) {
         for node in self.nodes.iter_mut().rev() {
             if node.entry_seq == entry_seq {
                 node.func_name = Some(name.to_string());
@@ -81,14 +83,14 @@ impl CallTreeBuilder {
         }
     }
 
-    pub fn on_ret(&mut self, seq: u32) {
+    pub fn on_ret(&mut self, seq: u64) {
         if let Some(parent_id) = self.call_stack.pop() {
             self.nodes[self.current_id as usize].exit_seq = seq;
             self.current_id = parent_id;
         }
     }
 
-    pub fn finish(mut self, total_lines: u32) -> CallTree {
+    pub fn finish(mut self, total_lines: u64) -> CallTree {
         self.nodes[0].exit_seq = total_lines.saturating_sub(1);
         while let Some(parent_id) = self.call_stack.pop() {
             self.nodes[self.current_id as usize].exit_seq = total_lines.saturating_sub(1);

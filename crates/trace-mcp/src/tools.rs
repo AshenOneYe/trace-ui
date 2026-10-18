@@ -1,14 +1,20 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router, ServerHandler,
 };
+use serde_json::Value;
 
-use trace_core::{TraceEngine, BuildOptions, SearchOptions, SliceOptions, StringQueryOptions, parse_hex_addr, api_types::TraceLine};
+use crate::jobs::{AnalysisJobInput, JobKind, JobManager};
+use crate::results::ResultManager;
 use crate::types::*;
+use trace_core::{
+    api_types::TraceLine, parse_hex_addr, BuildOptions, SearchOptions, SliceOptions,
+    StringQueryOptions, TraceEngine,
+};
+use trace_core::{GlobalLine, VmAnalysisConfig};
 
 // ── 截断常量 ──
 // NOTE: 修改这些值时，需同步更新对应 #[tool] 描述中的硬编码数字。
@@ -20,7 +26,8 @@ const MAX_SEARCH: u32 = 500;
 const DEFAULT_SEARCH: u32 = 30;
 
 fn json(val: &impl serde::Serialize) -> String {
-    serde_json::to_string(val).unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e))
+    serde_json::to_string(val)
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e))
 }
 
 /// Run a blocking closure on the tokio blocking thread pool to avoid starving
@@ -67,9 +74,13 @@ fn compact_line(line: &TraceLine) -> serde_json::Value {
 
 fn format_lines(lines: &[TraceLine], full: bool) -> Vec<serde_json::Value> {
     if full {
-        lines.iter().map(|l| serde_json::to_value(l)
-            .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
-        ).collect()
+        lines
+            .iter()
+            .map(|l| {
+                serde_json::to_value(l)
+                    .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+            })
+            .collect()
     } else {
         lines.iter().map(|l| compact_line(l)).collect()
     }
@@ -78,8 +89,14 @@ fn format_lines(lines: &[TraceLine], full: bool) -> Vec<serde_json::Value> {
 /// 检查 changes 字段是否仅包含噪音寄存器变化。
 /// 基础噪音集 = 栈/帧指针（sp/x29/fp/wsp/w29，当 stack=true 时），
 /// 可扩展 extra_regs（如 VM 调度器的 x21/x22/x26）。
-fn is_noise_only_change(changes: &str, stack: bool, extra_regs: &std::collections::HashSet<String>) -> bool {
-    if changes.is_empty() { return false; }
+fn is_noise_only_change(
+    changes: &str,
+    stack: bool,
+    extra_regs: &std::collections::HashSet<String>,
+) -> bool {
+    if changes.is_empty() {
+        return false;
+    }
     let mut has_any = false;
     for token in changes.split_whitespace() {
         if let Some(eq_pos) = token.find('=') {
@@ -120,31 +137,43 @@ fn parse_addr_range(range: &str) -> Result<(u64, u64), String> {
     let parts: Vec<&str> = range.split('-').collect();
     if parts.len() != 2 {
         return Err(format!(
-            "Invalid addr_range format '{}'. Expected: '0x246F00-0x249800'", range
+            "Invalid addr_range format '{}'. Expected: '0x246F00-0x249800'",
+            range
         ));
     }
     let start = parse_hex_addr(parts[0].trim())?;
     let end = parse_hex_addr(parts[1].trim())?;
     if start > end {
-        return Err(format!("Invalid addr_range: start (0x{:x}) > end (0x{:x})", start, end));
+        return Err(format!(
+            "Invalid addr_range: start (0x{:x}) > end (0x{:x})",
+            start, end
+        ));
     }
     Ok((start, end))
 }
 
 /// Parse seq range string like "3000-6000"
-fn parse_seq_range(range: &str) -> Result<(u32, u32), String> {
+fn parse_seq_range(range: &str) -> Result<(u64, u64), String> {
     let parts: Vec<&str> = range.split('-').collect();
     if parts.len() != 2 {
         return Err(format!(
-            "Invalid seq_range format '{}'. Expected: '3000-6000'", range
+            "Invalid seq_range format '{}'. Expected: '3000-6000'",
+            range
         ));
     }
-    let start: u32 = parts[0].trim().parse()
+    let start: u64 = parts[0]
+        .trim()
+        .parse()
         .map_err(|_| format!("Invalid start seq: '{}'", parts[0].trim()))?;
-    let end: u32 = parts[1].trim().parse()
+    let end: u64 = parts[1]
+        .trim()
+        .parse()
         .map_err(|_| format!("Invalid end seq: '{}'", parts[1].trim()))?;
     if start > end {
-        return Err(format!("Invalid seq_range: start ({}) > end ({})", start, end));
+        return Err(format!(
+            "Invalid seq_range: start ({}) > end ({})",
+            start, end
+        ));
     }
     Ok((start, end))
 }
@@ -159,6 +188,9 @@ fn line_in_addr_range(line: &TraceLine, start: u64, end: u64) -> bool {
 #[derive(Clone)]
 pub struct TraceToolHandler {
     engine: Arc<TraceEngine>,
+    jobs: Arc<JobManager>,
+    results: Arc<ResultManager>,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -172,6 +204,8 @@ impl std::fmt::Debug for TraceToolHandler {
 impl TraceToolHandler {
     pub fn new(engine: Arc<TraceEngine>) -> Self {
         Self {
+            jobs: Arc::new(JobManager::new(engine.clone())),
+            results: Arc::new(ResultManager::new()),
             engine,
             tool_router: Self::tool_router(),
         }
@@ -188,7 +222,8 @@ impl TraceToolHandler {
                     1 => Ok(sessions[0].session_id.clone()),
                     n => Err(format!(
                         "Multiple sessions active ({}). Please specify session_id. \
-                         Use list_sessions to see all sessions.", n
+                         Use list_sessions to see all sessions.",
+                        n
                     )),
                 }
             }
@@ -204,10 +239,14 @@ impl TraceToolHandler {
             function_count, and other metadata needed for all subsequent operations. \
             Building the index may take a few seconds for large files."
     )]
-    async fn open_trace(&self, Parameters(req): Parameters<OpenTraceRequest>) -> Result<String, String> {
+    async fn open_trace(
+        &self,
+        Parameters(req): Parameters<OpenTraceRequest>,
+    ) -> Result<String, String> {
         let engine = self.engine.clone();
         blocking(move || {
-            let session = engine.create_session(&req.file_path)
+            let session = engine
+                .create_session(&req.file_path)
                 .map_err(|e| format!("Failed to open trace: {}", e))?;
 
             let session_id = session.session_id.clone();
@@ -219,15 +258,18 @@ impl TraceToolHandler {
             match engine.build_index(&session_id, options, None) {
                 Ok(build) => {
                     // Extract additional info (graceful fallback on failure)
-                    let module_name = engine.get_lines(&session_id, &[0])
+                    let module_name = engine
+                        .get_lines(&session_id, &[0])
                         .ok()
                         .and_then(|lines| lines.first().and_then(|l| l.so_name.clone()));
 
-                    let entry_address = engine.get_call_tree_children(&session_id, 0, true)
+                    let entry_address = engine
+                        .get_call_tree_children(&session_id, 0, true)
                         .ok()
                         .and_then(|nodes| nodes.first().map(|n| n.func_addr.clone()));
 
-                    let trace_format = engine.get_session_info(&session_id)
+                    let trace_format = engine
+                        .get_session_info(&session_id)
                         .ok()
                         .and_then(|info| info.trace_format.map(|f| format!("{:?}", f)));
 
@@ -245,13 +287,851 @@ impl TraceToolHandler {
                         "trace_format": trace_format,
                         "function_count": function_count,
                     })))
-                },
+                }
                 Err(e) => {
                     let _ = engine.close_session(&session_id);
                     Err(format!("Failed to build index: {}", e))
                 }
             }
-        }).await
+        })
+        .await
+    }
+
+    #[tool(
+        name = "get_index_status",
+        description = "Report index schema, completed stages, chunk progress, coverage and resume state. \
+            A partial stage must be treated as partial coverage rather than 'no matches'."
+    )]
+    fn get_index_status(
+        &self,
+        Parameters(req): Parameters<GetIndexStatusRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let status = self
+            .engine
+            .get_index_status(&sid)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&status))
+    }
+
+    #[tool(
+        name = "start_analysis_job",
+        description = "Start a persistent background job for index building or VM analysis. The call returns \
+            immediately with a job_id. Jobs survive MCP disconnects and can be resumed after a process restart. \
+            Use get_job_status and get_job_result to collect the outcome."
+    )]
+    fn start_analysis_job(
+        &self,
+        Parameters(req): Parameters<StartAnalysisJobRequest>,
+    ) -> Result<String, String> {
+        let kind = match req.kind.as_str() {
+            "base_index" => JobKind::BaseIndex,
+            "phase2_index" => JobKind::Phase2Index,
+            "dependency_index" => JobKind::DependencyIndex,
+            "string_index" => JobKind::StringIndex,
+            "build_index" => JobKind::BuildIndex,
+            "vm_analysis" => JobKind::VmAnalysis,
+            other => {
+                return Err(format!(
+                    "unknown job kind '{other}'; expected base_index, phase2_index, dependency_index, string_index, build_index or vm_analysis"
+                ))
+            }
+        };
+        let job = self.jobs.start(
+            kind,
+            AnalysisJobInput {
+                file_path: req.file_path,
+                session_id: req.session_id,
+                force_rebuild: req.force_rebuild,
+                skip_strings: req.skip_strings,
+                start_line: req.start_line,
+                end_line: req.end_line,
+                ranges: Vec::new(),
+                vm_config: (kind == JobKind::VmAnalysis).then(VmAnalysisConfig::default),
+            },
+        )?;
+        Ok(json(&job))
+    }
+
+    #[tool(
+        name = "get_job_status",
+        description = "Get one persistent analysis job: status, progress, timestamps, input, summary and errors. \
+            Status interrupted means the previous MCP process stopped and the job can be resumed safely."
+    )]
+    fn get_job_status(&self, Parameters(req): Parameters<JobIdRequest>) -> Result<String, String> {
+        Ok(json(&self.jobs.get(&req.job_id)?))
+    }
+
+    #[tool(
+        name = "list_analysis_jobs",
+        description = "List all persisted analysis jobs so an Agent can recover work after switching sessions."
+    )]
+    fn list_analysis_jobs(&self) -> Result<String, String> {
+        let jobs = self.jobs.list()?;
+        Ok(json(&serde_json::json!({
+            "jobs": jobs,
+            "total": jobs.len(),
+        })))
+    }
+
+    #[tool(
+        name = "cancel_analysis_job",
+        description = "Cancel a queued/running/interrupted analysis job. Cancellation is persisted."
+    )]
+    fn cancel_analysis_job(
+        &self,
+        Parameters(req): Parameters<JobIdRequest>,
+    ) -> Result<String, String> {
+        Ok(json(&self.jobs.cancel(&req.job_id)?))
+    }
+
+    #[tool(
+        name = "resume_analysis_job",
+        description = "Resume an interrupted, failed, cancelled or completed job from its persisted input. \
+            The job is safely re-executed; index artifacts continue to use atomic commits."
+    )]
+    fn resume_analysis_job(
+        &self,
+        Parameters(req): Parameters<JobIdRequest>,
+    ) -> Result<String, String> {
+        Ok(json(&self.jobs.resume(&req.job_id)?))
+    }
+
+    #[tool(
+        name = "get_job_result",
+        description = "Return the result of a completed persistent analysis job."
+    )]
+    fn get_job_result(&self, Parameters(req): Parameters<JobIdRequest>) -> Result<String, String> {
+        Ok(json(&self.jobs.result(&req.job_id)?))
+    }
+
+    #[tool(
+        name = "get_result_page",
+        description = "Page through a server-side result handle. Handles include total count, summary, \
+            coverage, completeness, warnings and expiry. Large VM result arrays are not re-sent in full."
+    )]
+    fn get_result_page(
+        &self,
+        Parameters(req): Parameters<GetResultPageRequest>,
+    ) -> Result<String, String> {
+        Ok(json(&self.results.page(
+            &req.result_id,
+            req.offset,
+            req.limit,
+        )?))
+    }
+
+    fn hypothesis_status(value: &str) -> Result<trace_core::analysis::HypothesisStatus, String> {
+        match value {
+            "proposed" => Ok(trace_core::analysis::HypothesisStatus::Proposed),
+            "confirmed" => Ok(trace_core::analysis::HypothesisStatus::Confirmed),
+            "locked" => Ok(trace_core::analysis::HypothesisStatus::Locked),
+            "rejected" => Ok(trace_core::analysis::HypothesisStatus::Rejected),
+            "conflicted" => Ok(trace_core::analysis::HypothesisStatus::Conflicted),
+            "superseded" => Ok(trace_core::analysis::HypothesisStatus::Superseded),
+            other => Err(format!(
+                "invalid hypothesis status '{other}'; expected proposed/confirmed/locked/rejected/conflicted/superseded"
+            )),
+        }
+    }
+
+    #[tool(
+        name = "get_vm_hypotheses",
+        description = "List evidence-linked VM hypotheses from the persistent analysis workspace. Includes \
+            revision, confidence, source, lock state, dependencies and evidence references."
+    )]
+    fn get_vm_hypotheses(
+        &self,
+        Parameters(req): Parameters<GetHypothesesRequest>,
+    ) -> Result<String, String> {
+        let workspace = self
+            .engine
+            .get_analysis_workspace()
+            .map_err(|e| e.to_string())?;
+        let prefix = req.session_id.map(|session| format!("vm:{session}:"));
+        let hypotheses: Vec<_> = workspace
+            .hypotheses
+            .hypotheses
+            .values()
+            .filter(|hypothesis| {
+                prefix
+                    .as_ref()
+                    .is_none_or(|prefix| hypothesis.id.starts_with(prefix))
+            })
+            .filter(|hypothesis| {
+                req.kind
+                    .as_ref()
+                    .is_none_or(|kind| hypothesis.kind == *kind)
+            })
+            .collect();
+        Ok(json(&serde_json::json!({
+            "hypotheses": hypotheses,
+            "total": hypotheses.len(),
+            "conflicts": workspace.artifacts.conflicts,
+        })))
+    }
+
+    #[tool(
+        name = "get_analysis_workspace",
+        description = "Return the persistent Agent workspace: project/traces, hypotheses, VM analyses, alignments, \
+            verified conclusions, open questions, notes and conflicts. Use this to recover work in a new session."
+    )]
+    fn get_analysis_workspace(&self) -> Result<String, String> {
+        let workspace = self
+            .engine
+            .get_analysis_workspace()
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({
+            "schema_version": workspace.schema_version,
+            "project": workspace.project,
+            "hypotheses": workspace.hypotheses.hypotheses,
+            "analysis": {
+                "vm_result_sessions": workspace.artifacts.vm_results.keys().collect::<Vec<_>>(),
+                "trace_alignments": workspace.artifacts.trace_alignments,
+                "verified_conclusions": workspace.artifacts.verified_conclusions,
+                "open_questions": workspace.artifacts.open_questions,
+                "notes": workspace.artifacts.notes,
+                "conflicts": workspace.artifacts.conflicts,
+            },
+            "created_at_unix_ms": workspace.created_at_unix_ms,
+            "updated_at_unix_ms": workspace.updated_at_unix_ms,
+        })))
+    }
+
+    #[tool(
+        name = "get_resource_budgets",
+        description = "Return indexing/query resource budgets: memory, parallel scans, cache bytes, concurrent \
+            queries and background priority."
+    )]
+    fn get_resource_budgets(&self) -> Result<String, String> {
+        Ok(json(
+            &self
+                .engine
+                .get_resource_budgets()
+                .map_err(|e| e.to_string())?,
+        ))
+    }
+
+    #[tool(
+        name = "set_resource_budgets",
+        description = "Set indexing/query resource budgets. Zero disables the corresponding byte/query limit. \
+            max_parallel_scans must be greater than zero."
+    )]
+    fn set_resource_budgets(
+        &self,
+        Parameters(req): Parameters<SetResourceBudgetsRequest>,
+    ) -> Result<String, String> {
+        let priority = match req.background_priority.as_str() {
+            "low" => trace_core::BackgroundPriority::Low,
+            "normal" => trace_core::BackgroundPriority::Normal,
+            "high" => trace_core::BackgroundPriority::High,
+            other => return Err(format!("invalid background priority: {other}")),
+        };
+        let budgets = trace_core::ResourceBudgets {
+            max_memory_bytes: req.max_memory_bytes,
+            max_parallel_scans: req.max_parallel_scans,
+            max_index_cache_bytes: req.max_index_cache_bytes,
+            max_concurrent_queries: req.max_concurrent_queries,
+            background_priority: priority,
+        };
+        self.engine
+            .set_resource_budgets(budgets.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(json(&budgets))
+    }
+
+    #[tool(
+        name = "add_analysis_note",
+        description = "Persist an Agent/human note in the Analysis Workspace."
+    )]
+    fn add_analysis_note(
+        &self,
+        Parameters(req): Parameters<WorkspaceTextRequest>,
+    ) -> Result<String, String> {
+        self.engine
+            .add_analysis_note(req.text)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({"saved": true})))
+    }
+
+    #[tool(
+        name = "add_open_question",
+        description = "Persist an unresolved analysis question in the Analysis Workspace."
+    )]
+    fn add_open_question(
+        &self,
+        Parameters(req): Parameters<WorkspaceTextRequest>,
+    ) -> Result<String, String> {
+        self.engine
+            .add_open_question(req.text)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({"saved": true})))
+    }
+
+    #[tool(
+        name = "resolve_open_question",
+        description = "Mark an exact open question as resolved by removing it from the workspace."
+    )]
+    fn resolve_open_question(
+        &self,
+        Parameters(req): Parameters<ResolveQuestionRequest>,
+    ) -> Result<String, String> {
+        let removed = self
+            .engine
+            .resolve_open_question(&req.question)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({"removed": removed})))
+    }
+
+    #[tool(
+        name = "add_verified_conclusion",
+        description = "Persist a conclusion that has been checked against Native Trace evidence."
+    )]
+    fn add_verified_conclusion(
+        &self,
+        Parameters(req): Parameters<WorkspaceTextRequest>,
+    ) -> Result<String, String> {
+        self.engine
+            .add_verified_conclusion(req.text)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({"saved": true})))
+    }
+
+    #[tool(
+        name = "validate_vm_hypothesis",
+        description = "Confirm, lock or reject a VM hypothesis. Revision checks prevent overwriting concurrent edits. \
+            Locked hypotheses are never overwritten by automatic analysis."
+    )]
+    fn validate_vm_hypothesis(
+        &self,
+        Parameters(req): Parameters<ValidateHypothesisRequest>,
+    ) -> Result<String, String> {
+        let workspace = self
+            .engine
+            .get_analysis_workspace()
+            .map_err(|e| e.to_string())?;
+        let hypothesis = workspace
+            .hypotheses
+            .hypotheses
+            .get(&req.hypothesis_id)
+            .ok_or_else(|| format!("hypothesis {} not found", req.hypothesis_id))?;
+        let status = Self::hypothesis_status(&req.status)?;
+        let record = self
+            .engine
+            .override_hypothesis(
+                &req.hypothesis_id,
+                hypothesis.inferred_value.clone(),
+                status,
+                trace_core::analysis::HypothesisSource::Agent,
+                req.expected_revision.or(Some(hypothesis.revision)),
+                req.note,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(json(&record))
+    }
+
+    #[tool(
+        name = "set_vm_override",
+        description = "Apply a manual/Agent override to a VM hypothesis. The prior revision is persisted for undo."
+    )]
+    fn set_vm_override(
+        &self,
+        Parameters(req): Parameters<OverrideHypothesisRequest>,
+    ) -> Result<String, String> {
+        let status = Self::hypothesis_status(&req.status)?;
+        let record = self
+            .engine
+            .override_hypothesis(
+                &req.hypothesis_id,
+                req.value,
+                status,
+                trace_core::analysis::HypothesisSource::Agent,
+                req.expected_revision,
+                req.note,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(json(&record))
+    }
+
+    #[tool(
+        name = "undo_vm_override",
+        description = "Undo the most recent VM hypothesis override and restore the previous revision."
+    )]
+    fn undo_vm_override(&self) -> Result<String, String> {
+        Ok(json(
+            &self
+                .engine
+                .undo_hypothesis_override()
+                .map_err(|e| e.to_string())?,
+        ))
+    }
+
+    #[tool(
+        name = "redo_vm_override",
+        description = "Redo the most recently undone VM hypothesis override."
+    )]
+    fn redo_vm_override(&self) -> Result<String, String> {
+        Ok(json(
+            &self
+                .engine
+                .redo_hypothesis_override()
+                .map_err(|e| e.to_string())?,
+        ))
+    }
+
+    #[tool(
+        name = "get_analysis_conflicts",
+        description = "List persisted conflicts between automatic inference and confirmed/locked overrides."
+    )]
+    fn get_analysis_conflicts(&self) -> Result<String, String> {
+        let workspace = self
+            .engine
+            .get_analysis_workspace()
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({
+            "conflicts": workspace.artifacts.conflicts,
+            "total": workspace.artifacts.conflicts.len(),
+        })))
+    }
+
+    #[tool(
+        name = "reanalyze_affected",
+        description = "Compute the dependency impact of a hypothesis. With execute=true and a session_id, start \
+            a background VM reanalysis over the persisted analysis coverage. Locked downstream hypotheses are preserved."
+    )]
+    fn reanalyze_affected(
+        &self,
+        Parameters(req): Parameters<ImpactRequest>,
+    ) -> Result<String, String> {
+        let impact = self
+            .engine
+            .dry_run_hypothesis_impact(&req.hypothesis_id, req.max_depth.unwrap_or(32).min(256))
+            .map_err(|e| e.to_string())?;
+        let (job, reanalysis_range) = if req.execute {
+            let session_id = req
+                .session_id
+                .ok_or_else(|| "session_id is required when execute=true".to_string())?;
+            let workspace = self
+                .engine
+                .get_analysis_workspace()
+                .map_err(|e| e.to_string())?;
+            let saved = workspace
+                .artifacts
+                .vm_results
+                .get(&session_id)
+                .ok_or_else(|| format!("no persisted VM analysis for session {session_id}"))?;
+            let mut affected_ids = impact.directly_affected.clone();
+            affected_ids.extend(impact.transitively_affected.iter().cloned());
+            affected_ids.push(req.hypothesis_id.clone());
+            let affected_ranges: Vec<_> = affected_ids
+                .iter()
+                .filter_map(|id| workspace.hypotheses.hypotheses.get(id))
+                .flat_map(|hypothesis| hypothesis.evidence.iter())
+                .map(|evidence| evidence.lines)
+                .filter(|range| range.end > range.start)
+                .collect();
+            let coverage = if affected_ranges.is_empty() {
+                saved.coverage.first().copied()
+            } else {
+                Some(trace_core::LineRange::new(
+                    affected_ranges
+                        .iter()
+                        .map(|range| range.start)
+                        .min()
+                        .unwrap(),
+                    affected_ranges.iter().map(|range| range.end).max().unwrap(),
+                ))
+            };
+            let info = self
+                .engine
+                .get_session_info(&session_id)
+                .map_err(|e| e.to_string())?;
+            (
+                Some(self.jobs.start(
+                    JobKind::VmAnalysis,
+                    AnalysisJobInput {
+                        file_path: info.file_path,
+                        session_id: Some(session_id),
+                        force_rebuild: false,
+                        skip_strings: false,
+                        start_line: coverage.map(|range| range.start.0),
+                        end_line: coverage.map(|range| range.end.0),
+                        ranges: affected_ranges,
+                        vm_config: Some(VmAnalysisConfig::default()),
+                    },
+                )?),
+                coverage,
+            )
+        } else {
+            (None, None)
+        };
+        Ok(json(&serde_json::json!({
+            "dry_run": job.is_none(),
+            "impact": impact,
+            "affected_range": reanalysis_range,
+            "job": job,
+            "note": "native indexes are preserved; only dependent Vm semantics need recomputation",
+        })))
+    }
+
+    fn run_vm_analysis(
+        &self,
+        req: VmAnalysisRequest,
+    ) -> Result<trace_core::VmAnalysisResult, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        self.analyze_vm_session(&sid, req.start_line, req.end_line)
+    }
+
+    fn analyze_vm_session(
+        &self,
+        session_id: &str,
+        start_line: Option<u64>,
+        end_line: Option<u64>,
+    ) -> Result<trace_core::VmAnalysisResult, String> {
+        let info = self
+            .engine
+            .get_session_info(session_id)
+            .map_err(|e| e.to_string())?;
+        let start = GlobalLine::new(start_line.unwrap_or(0));
+        let end = GlobalLine::new(end_line.unwrap_or(info.total_lines));
+        let result = self
+            .engine
+            .analyze_vm_range(session_id, start, end, VmAnalysisConfig::default())
+            .map_err(|e| e.to_string())?;
+        self.engine
+            .save_vm_analysis(session_id, &result)
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    #[tool(
+        name = "detect_vm_regions",
+        description = "Detect experimental VM execution regions from repeated dynamic instructions and indirect \
+            dispatches. Every candidate includes confidence, warnings and native trace evidence. \
+            Multiple regions may be returned. Results are evidence-linked inferences, not facts."
+    )]
+    async fn detect_vm_regions(
+        &self,
+        Parameters(req): Parameters<VmAnalysisRequest>,
+    ) -> Result<String, String> {
+        let limit = req.limit.unwrap_or(20).min(100) as usize;
+        let handler = self.clone();
+        blocking(move || {
+            let start_line = req.start_line;
+            let end_line = req.end_line;
+            let result = handler.run_vm_analysis(req)?;
+            let regions: Vec<_> = result.regions.iter().take(limit).collect();
+            let region_values: Vec<_> = result
+                .regions
+                .iter()
+                .map(|region| serde_json::to_value(region).unwrap_or(Value::Null))
+                .collect();
+            let region_handle = handler
+                .results
+                .store(
+                    "vm_regions",
+                    region_values,
+                    serde_json::json!({
+                        "trace_id": result.trace_id,
+                        "dispatchers": result.dispatchers.len(),
+                        "state_candidates": result.state_candidates.len(),
+                    }),
+                    serde_json::to_value(&result.coverage).unwrap_or(Value::Null),
+                    "experimental",
+                    result.warnings.clone(),
+                )
+                .ok();
+            Ok(json(&serde_json::json!({
+                "trace_id": result.trace_id,
+                "algorithm_version": result.algorithm_version,
+                "experimental": result.experimental,
+                "range": {
+                    "start_line": start_line.unwrap_or(0),
+                    "end_line": end_line,
+                },
+                "coverage": result.coverage,
+                "total_regions": result.regions.len(),
+                "regions_result": region_handle,
+                "regions": regions,
+                "dispatchers": result.dispatchers,
+                "state_candidates": result.state_candidates,
+                "warnings": result.warnings,
+            })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "get_vm_handlers",
+        description = "Return experimental handler instances and clusters inferred from observed dispatch \
+            intervals. Includes template hashes, confidence, partial semantics, unknown effects and native \
+            line evidence. Use the returned native lines to validate every inference."
+    )]
+    async fn get_vm_handlers(
+        &self,
+        Parameters(req): Parameters<VmAnalysisRequest>,
+    ) -> Result<String, String> {
+        let limit = req.limit.unwrap_or(20).min(100) as usize;
+        let handler = self.clone();
+        blocking(move || {
+            let result = handler.run_vm_analysis(req)?;
+            let cluster_values: Vec<_> = result
+                .handler_clusters
+                .iter()
+                .map(|cluster| serde_json::to_value(cluster).unwrap_or(Value::Null))
+                .collect();
+            let instance_values: Vec<_> = result
+                .handler_instances
+                .iter()
+                .map(|instance| serde_json::to_value(instance).unwrap_or(Value::Null))
+                .collect();
+            let cluster_handle = handler
+                .results
+                .store(
+                    "vm_handler_clusters",
+                    cluster_values,
+                    serde_json::json!({"trace_id": result.trace_id}),
+                    serde_json::to_value(&result.coverage).unwrap_or(Value::Null),
+                    "experimental",
+                    result.warnings.clone(),
+                )
+                .ok();
+            let instance_handle = handler
+                .results
+                .store(
+                    "vm_handler_instances",
+                    instance_values,
+                    serde_json::json!({"trace_id": result.trace_id}),
+                    serde_json::to_value(&result.coverage).unwrap_or(Value::Null),
+                    "experimental",
+                    result.warnings.clone(),
+                )
+                .ok();
+            Ok(json(&serde_json::json!({
+                "trace_id": result.trace_id,
+                "algorithm_version": result.algorithm_version,
+                "experimental": result.experimental,
+                "coverage": result.coverage,
+                "total_clusters": result.handler_clusters.len(),
+                "clusters_result": cluster_handle,
+                "clusters": result.handler_clusters.iter().take(limit).collect::<Vec<_>>(),
+                "total_instances": result.handler_instances.len(),
+                "instances_result": instance_handle,
+                "instances": result.handler_instances.iter().take(limit * 8).collect::<Vec<_>>(),
+                "warnings": result.warnings,
+            })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "cluster_vm_handlers",
+        description = "Apply Must-link, Cannot-link and locked-label constraints to handler clusters, persist \
+            the revised result/hypotheses, and report constraint conflicts. Unknown labels remain possible."
+    )]
+    async fn cluster_vm_handlers(
+        &self,
+        Parameters(req): Parameters<ClusterVmHandlersRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let handler = self.clone();
+        blocking(move || {
+            let mut result = handler.analyze_vm_session(&sid, req.start_line, req.end_line)?;
+            let constraints = trace_core::analysis::HandlerClusteringConstraints {
+                must_link: req
+                    .must_link
+                    .into_iter()
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect(),
+                cannot_link: req
+                    .cannot_link
+                    .into_iter()
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect(),
+                locked_labels: req.locked_labels,
+            };
+            let conflicts =
+                trace_core::analysis::apply_handler_constraints(&mut result, &constraints);
+            handler
+                .engine
+                .save_vm_analysis(&sid, &result)
+                .map_err(|e| e.to_string())?;
+            Ok(json(&serde_json::json!({
+                "trace_id": result.trace_id,
+                "clusters": result.handler_clusters,
+                "instances": result.handler_instances,
+                "conflicts": conflicts,
+                "warnings": result.warnings,
+            })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "compare_vm_traces",
+        description = "Align two VM analyses by handler template and semantic features. Returns matched, \
+            left-only, right-only, uncertain and state-divergence evidence. Raw line numbers are not used \
+            as the sole alignment key."
+    )]
+    async fn compare_vm_traces(
+        &self,
+        Parameters(req): Parameters<CompareVmTracesRequest>,
+    ) -> Result<String, String> {
+        let handler = self.clone();
+        blocking(move || {
+            let left = handler.analyze_vm_session(
+                &req.left_session_id,
+                req.left_start_line,
+                req.left_end_line,
+            )?;
+            let right = handler.analyze_vm_session(
+                &req.right_session_id,
+                req.right_start_line,
+                req.right_end_line,
+            )?;
+            let alignment = trace_core::analysis::compare_vm_traces(
+                &req.left_session_id,
+                &req.right_session_id,
+                &left,
+                &right,
+            );
+            handler
+                .engine
+                .save_trace_alignment(alignment.clone())
+                .map_err(|e| e.to_string())?;
+            let points: Vec<_> = alignment
+                .points
+                .iter()
+                .map(|point| serde_json::to_value(point).unwrap_or(Value::Null))
+                .collect();
+            let point_handle = handler
+                .results
+                .store(
+                    "vm_alignment_points",
+                    points,
+                    serde_json::to_value(&alignment.summary).unwrap_or(Value::Null),
+                    serde_json::json!({
+                        "left_trace_id": req.left_session_id,
+                        "right_trace_id": req.right_session_id,
+                    }),
+                    if alignment.summary.uncertain_points > 0 {
+                        "partial"
+                    } else {
+                        "complete"
+                    },
+                    alignment.warnings.clone(),
+                )
+                .ok();
+            Ok(json(&serde_json::json!({
+                "alignment_result": point_handle,
+                "alignment": alignment,
+                "left": {
+                    "regions": left.regions.len(),
+                    "clusters": left.handler_clusters.len(),
+                    "instances": left.handler_instances.len(),
+                },
+                "right": {
+                    "regions": right.regions.len(),
+                    "clusters": right.handler_clusters.len(),
+                    "instances": right.handler_instances.len(),
+                },
+            })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "get_vm_artifacts",
+        description = "Return a selected VM analysis artifact: state candidates, VM IR, virtual CFG, handler \
+            details or inferred handler state transitions. Every item retains confidence and native evidence."
+    )]
+    async fn get_vm_artifacts(
+        &self,
+        Parameters(req): Parameters<VmArtifactRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let handler = self.clone();
+        blocking(move || {
+            let result =
+                handler.analyze_vm_session(&sid, req.start_line, req.end_line)?;
+            let (artifact, payload) = match req.artifact.as_str() {
+                "state" => ("state", serde_json::to_value(&result.state_candidates).unwrap_or_default()),
+                "ir" => (
+                    "ir",
+                    serde_json::to_value(
+                        result
+                            .vm_instructions
+                            .iter()
+                            .filter(|instruction| {
+                                req.id.as_ref().is_none_or(|id| {
+                                    instruction.handler_instance_id == *id || instruction.id == *id
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default(),
+                ),
+                "cfg" => ("cfg", serde_json::to_value(&result.cfg_edges).unwrap_or_default()),
+                "handlers" => {
+                    let clusters: Vec<_> = result
+                        .handler_clusters
+                        .iter()
+                        .filter(|cluster| req.id.as_ref().is_none_or(|id| cluster.id == *id))
+                        .collect();
+                    let instances: Vec<_> = result
+                        .handler_instances
+                        .iter()
+                        .filter(|instance| {
+                            req.id.as_ref().is_none_or(|id| {
+                                instance.id == *id
+                                    || instance.cluster_id.as_deref() == Some(id.as_str())
+                            })
+                        })
+                        .collect();
+                    (
+                        "handlers",
+                        serde_json::json!({
+                            "clusters": clusters,
+                            "instances": instances,
+                        }),
+                    )
+                }
+                "transitions" => {
+                    let transitions: Vec<_> = result
+                        .handler_clusters
+                        .iter()
+                        .map(|cluster| {
+                            serde_json::json!({
+                                "cluster_id": cluster.id,
+                                "operations": cluster.semantics.operations,
+                                "state_reads": cluster.semantics.state_reads,
+                                "state_writes": cluster.semantics.state_writes,
+                                "memory_effects": cluster.semantics.memory_effects,
+                                "control_effect": cluster.semantics.control_effect,
+                                "unknown_effects": cluster.semantics.unknown_effects,
+                                "confidence": cluster.semantics.confidence,
+                                "evidence": cluster.evidence,
+                            })
+                        })
+                        .collect();
+                    ("transitions", serde_json::to_value(transitions).unwrap_or_default())
+                }
+                other => {
+                    return Err(format!(
+                        "unknown VM artifact '{other}'; expected state, ir, cfg, handlers or transitions"
+                    ))
+                }
+            };
+            Ok(json(&serde_json::json!({
+                "artifact": artifact,
+                "coverage": result.coverage,
+                "algorithm_version": result.algorithm_version,
+                "experimental": result.experimental,
+                "warnings": result.warnings,
+                "data": payload,
+            })))
+        })
+        .await
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━ 数据查看 ━━━━━━━━━━━━━━━━━━━━━━
@@ -263,12 +1143,17 @@ impl TraceToolHandler {
             Lines are identified by 0-based sequence numbers. \
             Returns up to 2000 lines per call."
     )]
-    fn get_trace_lines(&self, Parameters(req): Parameters<GetTraceLinesRequest>) -> Result<String, String> {
+    fn get_trace_lines(
+        &self,
+        Parameters(req): Parameters<GetTraceLinesRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let count = req.count.min(MAX_LINES);
-        let end = req.start_seq.saturating_add(count);
-        let seqs: Vec<u32> = (req.start_seq..end).collect();
-        let lines = self.engine.get_lines(&sid, &seqs)
+        let end = req.start_seq.saturating_add(count as u64);
+        let seqs: Vec<u64> = (req.start_seq..end).collect();
+        let lines = self
+            .engine
+            .get_lines(&sid, &seqs)
             .map_err(|e| e.to_string())?;
         Ok(json(&serde_json::json!({
             "lines": format_lines(&lines, req.full),
@@ -291,11 +1176,15 @@ impl TraceToolHandler {
         let seq = match req.seq {
             Some(s) => s,
             None => {
-                let info = self.engine.get_session_info(&sid).map_err(|e| e.to_string())?;
+                let info = self
+                    .engine
+                    .get_session_info(&sid)
+                    .map_err(|e| e.to_string())?;
                 info.total_lines.saturating_sub(1)
             }
         };
-        self.engine.get_memory_at(&sid, addr, seq, length)
+        self.engine
+            .get_memory_at(&sid, addr, seq, length)
             .map(|snap| json(&snap))
             .map_err(|e| e.to_string())
     }
@@ -308,11 +1197,23 @@ impl TraceToolHandler {
             (returns center_index), paginate with offset+count. Records with data_known=false are \
             writes whose value was not printed in the trace (e.g. NEON q-register stores)."
     )]
-    fn get_mem_history(&self, Parameters(req): Parameters<GetMemHistoryRequest>) -> Result<String, String> {
+    fn get_mem_history(
+        &self,
+        Parameters(req): Parameters<GetMemHistoryRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let addr = parse_hex_addr(&req.address)?;
         let count = req.count.min(500) as usize;
-        let page = self.engine.get_mem_history_page(&sid, addr, req.rw.as_deref(), req.seq, req.offset as usize, count)
+        let page = self
+            .engine
+            .get_mem_history_page(
+                &sid,
+                addr,
+                req.rw.as_deref(),
+                req.seq,
+                req.offset as usize,
+                count,
+            )
             .map_err(|e| e.to_string())?;
         let response = serde_json::json!({
             "address": req.address,
@@ -334,10 +1235,21 @@ impl TraceToolHandler {
             rw='R' for reads, 'all' for both), byte-aligned at any offset inside each record. \
             Ideal for locating where key material, config blobs or constants land in memory."
     )]
-    fn search_memory(&self, Parameters(req): Parameters<SearchMemoryRequest>) -> Result<String, String> {
+    fn search_memory(
+        &self,
+        Parameters(req): Parameters<SearchMemoryRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let count = req.count.min(500) as usize;
-        let result = self.engine.search_memory_values(&sid, &req.value, req.rw.as_deref(), req.offset as usize, count)
+        let result = self
+            .engine
+            .search_memory_values(
+                &sid,
+                &req.value,
+                req.rw.as_deref(),
+                req.offset as usize,
+                count,
+            )
             .map_err(|e| e.to_string())?;
         let response = serde_json::json!({
             "value": req.value,
@@ -356,9 +1268,14 @@ impl TraceToolHandler {
             reconstructed from checkpoints, not just the line's incremental changes. \
             Also reports 'changed' (regs modified by this line) and 'read' (regs consumed)."
     )]
-    fn get_registers(&self, Parameters(req): Parameters<GetRegistersRequest>) -> Result<String, String> {
+    fn get_registers(
+        &self,
+        Parameters(req): Parameters<GetRegistersRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
-        let mut regs = self.engine.get_registers_at(&sid, req.seq)
+        let mut regs = self
+            .engine
+            .get_registers_at(&sid, req.seq)
             .map_err(|e| e.to_string())?;
         let pc = regs.remove("PC");
         let changed = regs.remove("__changed");
@@ -374,16 +1291,127 @@ impl TraceToolHandler {
     }
 
     #[tool(
+        name = "batch_query",
+        description = "Run a bounded batch of register snapshots, memory reads and taint summaries in one MCP \
+            call. Per-query errors are returned without aborting the batch."
+    )]
+    async fn batch_query(
+        &self,
+        Parameters(req): Parameters<BatchQueryRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let engine = self.engine.clone();
+        blocking(move || {
+            let registers = req
+                .registers
+                .into_iter()
+                .take(200)
+                .map(|query| match engine.get_registers_at(&sid, query.seq) {
+                    Ok(mut snapshot) => {
+                        let changed = snapshot.remove("__changed");
+                        let read = snapshot.remove("__read");
+                        let values = if let Some(names) = query.registers {
+                            let wanted: std::collections::HashSet<String> = names
+                                .into_iter()
+                                .map(|name| name.to_ascii_uppercase())
+                                .collect();
+                            snapshot
+                                .into_iter()
+                                .filter(|(name, _)| wanted.contains(name))
+                                .collect()
+                        } else {
+                            snapshot
+                        };
+                        serde_json::json!({
+                            "seq": query.seq,
+                            "registers": values,
+                            "changed": changed,
+                            "read": read,
+                        })
+                    }
+                    Err(error) => serde_json::json!({
+                        "seq": query.seq,
+                        "error": error.to_string(),
+                    }),
+                })
+                .collect::<Vec<_>>();
+            let memory = req
+                .memory
+                .into_iter()
+                .take(200)
+                .map(|query| {
+                    match parse_hex_addr(&query.address).and_then(|address| {
+                        engine
+                            .get_memory_at(&sid, address, query.seq, query.length.min(256))
+                            .map_err(|error| error.to_string())
+                    }) {
+                        Ok(snapshot) => serde_json::json!({
+                            "seq": query.seq,
+                            "address": query.address,
+                            "snapshot": snapshot,
+                        }),
+                        Err(error) => serde_json::json!({
+                            "seq": query.seq,
+                            "address": query.address,
+                            "error": error,
+                        }),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut taint = Vec::new();
+            for query in req.taint.into_iter().take(50) {
+                match engine.run_slice(
+                    &sid,
+                    &query.from_specs,
+                    SliceOptions {
+                        start_seq: None,
+                        end_seq: None,
+                        data_only: query.data_only,
+                    },
+                ) {
+                    Ok(result) => taint.push(serde_json::json!({
+                        "from_specs": query.from_specs,
+                        "data_only": query.data_only,
+                        "marked_count": result.marked_count,
+                        "total_lines": result.total_lines,
+                        "percentage": result.percentage,
+                    })),
+                    Err(error) => taint.push(serde_json::json!({
+                        "from_specs": query.from_specs,
+                        "error": error.to_string(),
+                    })),
+                }
+            }
+            Ok(json(&serde_json::json!({
+                "registers": registers,
+                "memory": memory,
+                "taint": taint,
+                "summary": {
+                    "register_queries": registers.len(),
+                    "memory_queries": memory.len(),
+                    "taint_queries": taint.len(),
+                },
+            })))
+        })
+        .await
+    }
+
+    #[tool(
         name = "get_string_xrefs",
         description = "Cross-references of a string: every instruction that reads or writes the \
             string's memory range (seq, rw, insn_addr, disasm). Get the address and byte_len from \
             get_strings, then use this to find the code consuming the string."
     )]
-    fn get_string_xrefs(&self, Parameters(req): Parameters<GetStringXrefsRequest>) -> Result<String, String> {
+    fn get_string_xrefs(
+        &self,
+        Parameters(req): Parameters<GetStringXrefsRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let addr = parse_hex_addr(&req.address)?;
         let length = req.length.unwrap_or(64).min(4096);
-        let xrefs = self.engine.get_string_xrefs(&sid, addr, length)
+        let xrefs = self
+            .engine
+            .get_string_xrefs(&sid, addr, length)
             .map_err(|e| e.to_string())?;
         let response = serde_json::json!({
             "address": req.address,
@@ -404,26 +1432,39 @@ impl TraceToolHandler {
     )]
     fn get_def_use(&self, Parameters(req): Parameters<GetDefUseRequest>) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
-        let line_defs = self.engine.get_line_def_registers(&sid, req.seq)
+        let line_defs = self
+            .engine
+            .get_line_def_registers(&sid, req.seq)
             .map_err(|e| e.to_string())?;
         let mut response = serde_json::json!({
             "seq": req.seq,
             "line_defs": line_defs,
         });
         if let Some(reg) = &req.reg {
-            let chain = self.engine.get_def_use_chain(&sid, req.seq, &reg.to_lowercase())
+            let chain = self
+                .engine
+                .get_def_use_chain(&sid, req.seq, &reg.to_lowercase())
                 .map_err(|e| e.to_string())?;
             // 补充相关行的 disasm
-            let mut wanted: Vec<u32> = vec![req.seq];
-            if let Some(d) = chain.def_seq { wanted.push(d); }
-            if let Some(r) = chain.redefined_seq { wanted.push(r); }
+            let mut wanted: Vec<u64> = vec![req.seq];
+            if let Some(d) = chain.def_seq {
+                wanted.push(d);
+            }
+            if let Some(r) = chain.redefined_seq {
+                wanted.push(r);
+            }
             wanted.extend(chain.use_seqs.iter().take(20).copied());
-            let lines = self.engine.get_lines(&sid, &wanted)
+            let lines = self
+                .engine
+                .get_lines(&sid, &wanted)
                 .map_err(|e| e.to_string())?;
-            let disasm_of = |s: u32| lines.iter()
-                .find(|l| l.seq == s)
-                .map(|l| l.disasm.clone())
-                .unwrap_or_default();
+            let disasm_of = |s: u64| {
+                lines
+                    .iter()
+                    .find(|l| l.seq == s)
+                    .map(|l| l.disasm.clone())
+                    .unwrap_or_default()
+            };
             response["chain"] = serde_json::json!({
                 "reg": reg.to_lowercase(),
                 "anchor_disasm": disasm_of(req.seq),
@@ -449,7 +1490,10 @@ impl TraceToolHandler {
             instruction address (matches SO offset OR absolute address), applied during the scan so \
             total_matches is exact. Paginate large result sets with offset + max_results (up to 500 per page)."
     )]
-    async fn search_instructions(&self, Parameters(req): Parameters<SearchInstructionsRequest>) -> Result<String, String> {
+    async fn search_instructions(
+        &self,
+        Parameters(req): Parameters<SearchInstructionsRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let engine = self.engine.clone();
         blocking(move || {
@@ -477,16 +1521,30 @@ impl TraceToolHandler {
             };
 
             let outcome = engine
-                .search_in_range(&sid, &req.query, options, start_seq, end_seq, addr_filter, offset, max)
+                .search_in_range(
+                    &sid,
+                    &req.query,
+                    options,
+                    start_seq,
+                    end_seq,
+                    addr_filter,
+                    offset as u64,
+                    max as u64,
+                )
                 .map_err(|e| e.to_string())?;
 
-            let lines = engine.get_lines(&sid, &outcome.match_seqs)
+            let lines = engine
+                .get_lines(&sid, &outcome.match_seqs)
                 .map_err(|e| e.to_string())?;
 
             let matches: Vec<serde_json::Value> = if req.full {
-                lines.iter().map(|l| serde_json::to_value(l)
-                    .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
-                ).collect()
+                lines
+                    .iter()
+                    .map(|l| {
+                        serde_json::to_value(l)
+                            .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                    })
+                    .collect()
             } else {
                 lines.iter().map(|l| compact_line(l)).collect()
             };
@@ -503,7 +1561,8 @@ impl TraceToolHandler {
                 "has_more": has_more,
                 "truncated": has_more,
             })))
-        }).await
+        })
+        .await
     }
 
     #[tool(
@@ -514,104 +1573,123 @@ impl TraceToolHandler {
             By default, filters out lines that only modify stack/frame pointer registers. \
             Supports addr_range filter and context_lines to show surrounding non-tainted lines."
     )]
-    fn get_tainted_lines(&self, Parameters(req): Parameters<GetTaintedLinesRequest>) -> Result<String, String> {
+    fn get_tainted_lines(
+        &self,
+        Parameters(req): Parameters<GetTaintedLinesRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let limit = req.limit.min(200);
         let ctx_lines = req.context_lines.min(5);
 
-        let all_seqs = self.engine.get_tainted_seqs(&sid)
+        let all_seqs = self
+            .engine
+            .get_tainted_seqs(&sid)
             .map_err(|e| e.to_string())?;
 
-        let total_tainted = all_seqs.len() as u32;
+        let total_tainted = all_seqs.len() as u64;
 
         // 噪音过滤：栈/帧指针 + 额外噪音寄存器（如 VM 调度器）
         let noise_regs = parse_noise_regs(&req.ignore_regs);
         let filter_active = req.ignore_stack_ops || !noise_regs.is_empty();
         let (after_stack_filter, stack_ops_filtered) = if filter_active && !all_seqs.is_empty() {
-            let all_lines = self.engine.get_lines(&sid, &all_seqs)
+            let all_lines = self
+                .engine
+                .get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
-            let kept: Vec<TraceLine> = all_lines.into_iter()
-                .filter(|line| !is_noise_only_change(&line.changes, req.ignore_stack_ops, &noise_regs))
+            let kept: Vec<TraceLine> = all_lines
+                .into_iter()
+                .filter(|line| {
+                    !is_noise_only_change(&line.changes, req.ignore_stack_ops, &noise_regs)
+                })
                 .collect();
-            let filtered_count = total_tainted - kept.len() as u32;
+            let filtered_count = total_tainted - kept.len() as u64;
             (kept, filtered_count)
         } else {
-            let all_lines = self.engine.get_lines(&sid, &all_seqs)
+            let all_lines = self
+                .engine
+                .get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
-            (all_lines, 0u32)
+            (all_lines, 0u64)
         };
 
         // 地址范围过滤
         let after_addr_filter: Vec<TraceLine> = if let Some(ref range) = req.addr_range {
             let (start, end) = parse_addr_range(range)?;
-            after_stack_filter.into_iter()
+            after_stack_filter
+                .into_iter()
                 .filter(|l| line_in_addr_range(l, start, end))
                 .collect()
         } else {
             after_stack_filter
         };
 
-        let total_after_filter = after_addr_filter.len() as u32;
+        let total_after_filter = after_addr_filter.len() as u64;
 
         // 分页
-        let page_lines: Vec<TraceLine> = after_addr_filter.into_iter()
+        let page_lines: Vec<TraceLine> = after_addr_filter
+            .into_iter()
             .skip(req.offset as usize)
             .take(limit as usize)
             .collect();
 
         // 上下文摘要
-        let context = self.engine.get_slice_origin(&sid)
-            .ok()
-            .flatten()
-            .map(|o| {
-                let mut ctx = format!("taint from {}, data_only={}",
-                    o.from_specs.join(", "), o.data_only);
-                if let Some(s) = o.start_seq {
-                    ctx.push_str(&format!(", start_seq={}", s));
-                }
-                if let Some(e) = o.end_seq {
-                    ctx.push_str(&format!(", end_seq={}", e));
-                }
-                ctx
-            });
+        let context = self.engine.get_slice_origin(&sid).ok().flatten().map(|o| {
+            let mut ctx = format!(
+                "taint from {}, data_only={}",
+                o.from_specs.join(", "),
+                o.data_only
+            );
+            if let Some(s) = o.start_seq {
+                ctx.push_str(&format!(", start_seq={}", s));
+            }
+            if let Some(e) = o.end_seq {
+                ctx.push_str(&format!(", end_seq={}", e));
+            }
+            ctx
+        });
 
         // 上下文行展开
         if ctx_lines > 0 && !page_lines.is_empty() {
-            let tainted_seqs: std::collections::HashSet<u32> = page_lines.iter().map(|l| l.seq).collect();
+            let tainted_seqs: std::collections::HashSet<u64> =
+                page_lines.iter().map(|l| l.seq).collect();
             let mut expanded_seqs = std::collections::BTreeSet::new();
             for line in &page_lines {
-                let start = line.seq.saturating_sub(ctx_lines);
-                let end = line.seq.saturating_add(ctx_lines);
+                let start = line.seq.saturating_sub(ctx_lines as u64);
+                let end = line.seq.saturating_add(ctx_lines as u64);
                 for s in start..=end {
                     expanded_seqs.insert(s);
                 }
             }
-            let extra_seqs: Vec<u32> = expanded_seqs.iter().copied()
+            let extra_seqs: Vec<u64> = expanded_seqs
+                .iter()
+                .copied()
                 .filter(|s| !tainted_seqs.contains(s))
                 .collect();
-            let extra_lines = self.engine.get_lines(&sid, &extra_seqs)
-                .unwrap_or_default();
-            let extra_map: std::collections::HashMap<u32, &TraceLine> = extra_lines.iter()
-                .map(|l| (l.seq, l))
-                .collect();
+            let extra_lines = self.engine.get_lines(&sid, &extra_seqs).unwrap_or_default();
+            let extra_map: std::collections::HashMap<u64, &TraceLine> =
+                extra_lines.iter().map(|l| (l.seq, l)).collect();
 
             let mut output_lines: Vec<serde_json::Value> = Vec::new();
             for seq in expanded_seqs {
                 if let Some(tl) = page_lines.iter().find(|l| l.seq == seq) {
                     let mut obj = if req.full {
-                        serde_json::to_value(tl).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                        serde_json::to_value(tl)
+                            .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
                     } else {
                         compact_line(tl)
                     };
-                    obj.as_object_mut().map(|o| o.insert("tainted".to_string(), serde_json::json!(true)));
+                    obj.as_object_mut()
+                        .map(|o| o.insert("tainted".to_string(), serde_json::json!(true)));
                     output_lines.push(obj);
                 } else if let Some(el) = extra_map.get(&seq) {
                     let mut obj = if req.full {
-                        serde_json::to_value(*el).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                        serde_json::to_value(*el)
+                            .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
                     } else {
                         compact_line(el)
                     };
-                    obj.as_object_mut().map(|o| o.insert("tainted".to_string(), serde_json::json!(false)));
+                    obj.as_object_mut()
+                        .map(|o| o.insert("tainted".to_string(), serde_json::json!(false)));
                     output_lines.push(obj);
                 }
             }
@@ -641,7 +1719,6 @@ impl TraceToolHandler {
         })))
     }
 
-
     // ━━━━━━━━━━━━━━━━━━━━━━ 结构信息 ━━━━━━━━━━━━━━━━━━━━━━
 
     fn collect_tree_to_depth(
@@ -651,21 +1728,27 @@ impl TraceToolHandler {
         depth: u32,
         max_nodes: u32,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let nodes = self.engine.get_call_tree_children(session_id, node_id, true)
+        let nodes = self
+            .engine
+            .get_call_tree_children(session_id, node_id, true)
             .map_err(|e| e.to_string())?;
         if nodes.is_empty() {
             return Ok(vec![]);
         }
-        let mut result: Vec<serde_json::Value> = vec![serde_json::to_value(&nodes[0])
-            .map_err(|e| e.to_string())?];
+        let mut result: Vec<serde_json::Value> =
+            vec![serde_json::to_value(&nodes[0]).map_err(|e| e.to_string())?];
         if depth <= 1 {
             for child in &nodes[1..] {
-                if result.len() as u32 >= max_nodes { break; }
+                if result.len() as u32 >= max_nodes {
+                    break;
+                }
                 result.push(serde_json::to_value(child).map_err(|e| e.to_string())?);
             }
         } else {
             for child in &nodes[1..] {
-                if result.len() as u32 >= max_nodes { break; }
+                if result.len() as u32 >= max_nodes {
+                    break;
+                }
                 let remaining = max_nodes - result.len() as u32;
                 let sub = self.collect_tree_to_depth(session_id, child.id, depth - 1, remaining)?;
                 result.extend(sub);
@@ -681,7 +1764,10 @@ impl TraceToolHandler {
             Returns nodes array, count, total_node_count (full tree size), and depth used. \
             Each node contains: function address, name, entry/exit line numbers, and child node IDs."
     )]
-    fn get_call_tree(&self, Parameters(req): Parameters<GetCallTreeRequest>) -> Result<String, String> {
+    fn get_call_tree(
+        &self,
+        Parameters(req): Parameters<GetCallTreeRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let depth = req.depth.min(3).max(1);
         let max_nodes: u32 = 500;
@@ -703,7 +1789,10 @@ impl TraceToolHandler {
             Supports filtering by minimum length and search query. \
             Each string includes its memory address, content, encoding, and access type."
     )]
-    fn get_strings(&self, Parameters(req): Parameters<GetStringsRequest>) -> Result<String, String> {
+    fn get_strings(
+        &self,
+        Parameters(req): Parameters<GetStringsRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let limit = req.limit.min(200);
         let options = StringQueryOptions {
@@ -712,14 +1801,16 @@ impl TraceToolHandler {
             limit,
             search: req.search,
         };
-        let result = self.engine.get_strings(&sid, options)
+        let result = self
+            .engine
+            .get_strings(&sid, options)
             .map_err(|e| e.to_string())?;
         let has_results = !result.strings.is_empty();
         let mut response = serde_json::json!({
             "strings": result.strings,
             "total": result.total,
             "offset": req.offset,
-            "has_more": (req.offset + result.strings.len() as u32) < result.total,
+            "has_more": (req.offset as u64 + result.strings.len() as u64) < result.total,
         });
         if has_results {
             response["hint"] = serde_json::json!("Use search_instructions with the string's memory address to find which instructions access it.");
@@ -737,7 +1828,10 @@ impl TraceToolHandler {
             Use get_tainted_lines to paginate if has_more is true. \
             Tip: on VM-obfuscated traces, pass ignore_regs like 'x21,x22,x26' to drop dispatcher noise."
     )]
-    async fn taint_analysis(&self, Parameters(req): Parameters<TaintAnalysisRequest>) -> Result<String, String> {
+    async fn taint_analysis(
+        &self,
+        Parameters(req): Parameters<TaintAnalysisRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let engine = self.engine.clone();
         blocking(move || {
@@ -747,33 +1841,37 @@ impl TraceToolHandler {
                 end_seq: req.end_seq,
                 data_only: req.data_only,
             };
-            let result = engine.run_slice(&sid, &req.from_specs, options)
+            let result = engine
+                .run_slice(&sid, &req.from_specs, options)
                 .map_err(|e| e.to_string())?;
 
             // 2. 仅返回统计信息
             let include = req.include_lines.min(200);
             if include == 0 {
                 // stats-only 也应用噪音/地址过滤，保证 total_after_filter 与 get_tainted_lines 一致
-                let all_seqs = engine.get_tainted_seqs(&sid)
-                    .map_err(|e| e.to_string())?;
+                let all_seqs = engine.get_tainted_seqs(&sid).map_err(|e| e.to_string())?;
                 let noise_regs = parse_noise_regs(&req.ignore_regs);
                 let filter_active = req.ignore_stack_ops || !noise_regs.is_empty();
                 let (total_after_filter, stack_ops_filtered) =
                     if !all_seqs.is_empty() && (filter_active || req.addr_range.is_some()) {
-                        let all_lines = engine.get_lines(&sid, &all_seqs)
+                        let all_lines = engine
+                            .get_lines(&sid, &all_seqs)
                             .map_err(|e| e.to_string())?;
                         let before = all_lines.len();
-                        let mut kept: Vec<TraceLine> = all_lines.into_iter()
-                            .filter(|l| !is_noise_only_change(&l.changes, req.ignore_stack_ops, &noise_regs))
+                        let mut kept: Vec<TraceLine> = all_lines
+                            .into_iter()
+                            .filter(|l| {
+                                !is_noise_only_change(&l.changes, req.ignore_stack_ops, &noise_regs)
+                            })
                             .collect();
-                        let stack_filtered = (before - kept.len()) as u32;
+                        let stack_filtered = (before - kept.len()) as u64;
                         if let Some(ref range) = req.addr_range {
                             let (start, end) = parse_addr_range(range)?;
                             kept.retain(|l| line_in_addr_range(l, start, end));
                         }
-                        (kept.len() as u32, stack_filtered)
+                        (kept.len() as u64, stack_filtered)
                     } else {
-                        (all_seqs.len() as u32, 0)
+                        (all_seqs.len() as u64, 0)
                     };
                 return Ok(json(&serde_json::json!({
                     "marked_count": result.marked_count,
@@ -789,8 +1887,7 @@ impl TraceToolHandler {
             }
 
             // 3. 获取污点行
-            let all_seqs = engine.get_tainted_seqs(&sid)
-                .map_err(|e| e.to_string())?;
+            let all_seqs = engine.get_tainted_seqs(&sid).map_err(|e| e.to_string())?;
 
             if all_seqs.is_empty() {
                 return Ok(json(&serde_json::json!({
@@ -805,7 +1902,8 @@ impl TraceToolHandler {
                 })));
             }
 
-            let all_lines = engine.get_lines(&sid, &all_seqs)
+            let all_lines = engine
+                .get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
 
             // 4. 噪音过滤：栈/帧指针 + 额外噪音寄存器（如 VM 调度器）
@@ -813,13 +1911,16 @@ impl TraceToolHandler {
             let filter_active = req.ignore_stack_ops || !noise_regs.is_empty();
             let (kept, stack_filtered) = if filter_active {
                 let before = all_lines.len();
-                let filtered: Vec<TraceLine> = all_lines.into_iter()
-                    .filter(|l| !is_noise_only_change(&l.changes, req.ignore_stack_ops, &noise_regs))
+                let filtered: Vec<TraceLine> = all_lines
+                    .into_iter()
+                    .filter(|l| {
+                        !is_noise_only_change(&l.changes, req.ignore_stack_ops, &noise_regs)
+                    })
                     .collect();
                 let diff = before - filtered.len();
-                (filtered, diff as u32)
+                (filtered, diff as u64)
             } else {
-                (all_lines, 0u32)
+                (all_lines, 0u64)
             };
 
             // 5. 地址范围过滤
@@ -854,7 +1955,8 @@ impl TraceToolHandler {
                     "All tainted lines included."
                 },
             })))
-        }).await
+        })
+        .await
     }
 
     #[tool(
@@ -864,18 +1966,26 @@ impl TraceToolHandler {
             (2) func_name: find all calls matching a name (partial, case-insensitive). \
             (3) No arguments: list all functions with pagination (use offset/limit)."
     )]
-    fn analyze_function(&self, Parameters(req): Parameters<AnalyzeFunctionRequest>) -> Result<String, String> {
+    fn analyze_function(
+        &self,
+        Parameters(req): Parameters<AnalyzeFunctionRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
 
         if let Some(node_id) = req.node_id {
             // Mode 1: 按 node_id 分析函数调用详情
-            let nodes = self.engine.get_call_tree_children(&sid, node_id, true)
+            let nodes = self
+                .engine
+                .get_call_tree_children(&sid, node_id, true)
                 .map_err(|e| e.to_string())?;
-            let node = nodes.first()
+            let node = nodes
+                .first()
                 .ok_or_else(|| format!("Node {} not found", node_id))?;
 
             // 获取入口参数 X0-X7
-            let entry_regs = self.engine.get_registers_at(&sid, node.entry_seq)
+            let entry_regs = self
+                .engine
+                .get_registers_at(&sid, node.entry_seq)
                 .unwrap_or_default();
             let mut args = serde_json::Map::new();
             for i in 0..=7 {
@@ -887,7 +1997,8 @@ impl TraceToolHandler {
 
             // 获取返回值
             let return_value = if node.exit_seq > node.entry_seq {
-                self.engine.get_registers_at(&sid, node.exit_seq)
+                self.engine
+                    .get_registers_at(&sid, node.exit_seq)
                     .ok()
                     .and_then(|regs| regs.get("X0").cloned())
             } else {
@@ -896,16 +2007,19 @@ impl TraceToolHandler {
 
             // 子调用
             let children = nodes.iter().skip(1).collect::<Vec<_>>();
-            let sub_calls: Vec<serde_json::Value> = children.iter().map(|c| {
-                serde_json::json!({
-                    "node_id": c.id,
-                    "func_name": c.func_name,
-                    "func_addr": c.func_addr,
-                    "entry_seq": c.entry_seq,
-                    "exit_seq": c.exit_seq,
-                    "line_count": c.line_count,
+            let sub_calls: Vec<serde_json::Value> = children
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "node_id": c.id,
+                        "func_name": c.func_name,
+                        "func_addr": c.func_addr,
+                        "entry_seq": c.entry_seq,
+                        "exit_seq": c.exit_seq,
+                        "line_count": c.line_count,
+                    })
                 })
-            }).collect();
+                .collect();
 
             Ok(json(&serde_json::json!({
                 "node_id": node.id,
@@ -919,22 +2033,29 @@ impl TraceToolHandler {
                 "sub_calls": sub_calls,
                 "sub_call_count": sub_calls.len(),
             })))
-
         } else if let Some(ref func_name) = req.func_name {
             // Mode 2: 按名称搜索函数
-            let result = self.engine.get_function_calls(&sid)
+            let result = self
+                .engine
+                .get_function_calls(&sid)
                 .map_err(|e| e.to_string())?;
 
             let query_lower = func_name.to_lowercase();
-            let matched: Vec<serde_json::Value> = result.functions.iter()
+            let matched: Vec<serde_json::Value> = result
+                .functions
+                .iter()
                 .filter(|f| f.func_name.to_lowercase().contains(&query_lower))
                 .map(|f| {
-                    let occs: Vec<serde_json::Value> = f.occurrences.iter()
+                    let occs: Vec<serde_json::Value> = f
+                        .occurrences
+                        .iter()
                         .take(50)
-                        .map(|o| serde_json::json!({
-                            "seq": o.seq,
-                            "summary": o.summary,
-                        }))
+                        .map(|o| {
+                            serde_json::json!({
+                                "seq": o.seq,
+                                "summary": o.summary,
+                            })
+                        })
                         .collect();
                     let total_occs = f.occurrences.len();
                     serde_json::json!({
@@ -957,22 +2078,27 @@ impl TraceToolHandler {
                     "Use analyze_function with node_id from get_call_tree to inspect a specific call's arguments and return value."
                 },
             })))
-
         } else {
             // Mode 3: list all functions with pagination
-            let result = self.engine.get_function_calls(&sid)
+            let result = self
+                .engine
+                .get_function_calls(&sid)
                 .map_err(|e| e.to_string())?;
 
             let limit = req.limit.min(100) as usize;
             let total = result.functions.len();
-            let page: Vec<serde_json::Value> = result.functions.iter()
+            let page: Vec<serde_json::Value> = result
+                .functions
+                .iter()
                 .skip(req.offset as usize)
                 .take(limit)
-                .map(|f| serde_json::json!({
-                    "func_name": f.func_name,
-                    "call_count": f.occurrences.len(),
-                    "is_jni": f.is_jni,
-                }))
+                .map(|f| {
+                    serde_json::json!({
+                        "func_name": f.func_name,
+                        "call_count": f.occurrences.len(),
+                        "is_jni": f.is_jni,
+                    })
+                })
                 .collect();
 
             Ok(json(&serde_json::json!({
@@ -993,7 +2119,10 @@ impl TraceToolHandler {
             Returns each detection with context instructions. \
             Use taint_analysis on detection points to trace key/data sources."
     )]
-    async fn analyze_crypto(&self, Parameters(req): Parameters<AnalyzeCryptoRequest>) -> Result<String, String> {
+    async fn analyze_crypto(
+        &self,
+        Parameters(req): Parameters<AnalyzeCryptoRequest>,
+    ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let engine = self.engine.clone();
         blocking(move || {
@@ -1010,9 +2139,9 @@ impl TraceToolHandler {
             // 2. 为每个匹配收集上下文行
             let mut matches_output: Vec<serde_json::Value> = Vec::new();
             for m in &scan_result.matches {
-                let start = m.seq.saturating_sub(ctx_count);
-                let end = m.seq.saturating_add(ctx_count);
-                let ctx_seqs: Vec<u32> = (start..=end).collect();
+                let start = m.seq.saturating_sub(ctx_count as u64);
+                let end = m.seq.saturating_add(ctx_count as u64);
+                let ctx_seqs: Vec<u64> = (start..=end).collect();
                 let ctx_lines = engine.get_lines(&sid, &ctx_seqs)
                     .unwrap_or_default();
 

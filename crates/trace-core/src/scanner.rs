@@ -12,24 +12,28 @@ use trace_parser::types::*;
 
 /// Flat array mapping RegId → last DEF line index.
 ///
-/// Uses `u32::MAX` as sentinel for "no definition seen". Provides the same
+/// Uses `u64::MAX` as sentinel for "no definition seen". Provides the same
 /// `.get()` / `.insert()` API as HashMap for drop-in replacement.
-/// 98 entries × 4 bytes = 392 bytes — fits in a few cache lines.
+/// 98 entries × 8 bytes = 784 bytes — still small enough for hot state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct RegLastDef(#[serde(with = "big_array")] [u32; RegId::COUNT]);
+pub struct RegLastDef(#[serde(with = "big_array")] [u64; RegId::COUNT]);
 
 mod big_array {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use trace_parser::types::RegId;
 
-    pub fn serialize<S: Serializer>(arr: &[u32; RegId::COUNT], s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(arr: &[u64; RegId::COUNT], s: S) -> Result<S::Ok, S::Error> {
         arr.as_slice().serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u32; RegId::COUNT], D::Error> {
-        let v = Vec::<u32>::deserialize(d)?;
-        v.try_into().map_err(|v: Vec<u32>| {
-            serde::de::Error::custom(format!("expected {} elements, got {}", RegId::COUNT, v.len()))
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u64; RegId::COUNT], D::Error> {
+        let v = Vec::<u64>::deserialize(d)?;
+        v.try_into().map_err(|v: Vec<u64>| {
+            serde::de::Error::custom(format!(
+                "expected {} elements, got {}",
+                RegId::COUNT,
+                v.len()
+            ))
         })
     }
 }
@@ -41,13 +45,13 @@ impl Default for RegLastDef {
 }
 
 impl RegLastDef {
-    const NO_DEF: u32 = u32::MAX;
+    const NO_DEF: u64 = u64::MAX;
 
     pub fn new() -> Self {
         Self([Self::NO_DEF; RegId::COUNT])
     }
 
-    pub fn get(&self, reg: &RegId) -> Option<&u32> {
+    pub fn get(&self, reg: &RegId) -> Option<&u64> {
         let val = &self.0[reg.0 as usize];
         if *val != Self::NO_DEF {
             Some(val)
@@ -56,19 +60,19 @@ impl RegLastDef {
         }
     }
 
-    pub fn insert(&mut self, reg: RegId, line: u32) {
+    pub fn insert(&mut self, reg: RegId, line: u64) {
         self.0[reg.0 as usize] = line;
     }
 
     /// Get raw inner array (for merge phase).
     #[allow(dead_code)]
-    pub fn inner(&self) -> &[u32; RegId::COUNT] {
+    pub fn inner(&self) -> &[u64; RegId::COUNT] {
         &self.0
     }
 
     /// Get mutable raw inner array (for merge phase).
     #[allow(dead_code)]
-    pub fn inner_mut(&mut self) -> &mut [u32; RegId::COUNT] {
+    pub fn inner_mut(&mut self) -> &mut [u64; RegId::COUNT] {
         &mut self.0
     }
 }
@@ -87,29 +91,29 @@ impl RegLastDef {
 /// - PAIR_HALF2_BIT (bit 31): 到达 pair 指令的第二半区（half2 数据）
 /// - PAIR_SHARED_BIT (bit 30): 到达 pair 指令的共享路径（writeback base）
 /// - 无标记: 到达 pair 指令的第一半区（half1 数据）
-pub const PAIR_HALF2_BIT: u32 = 0x80000000;
-pub const PAIR_SHARED_BIT: u32 = 0x40000000;
-pub const CONTROL_DEP_BIT: u32 = 0x20000000;
-pub const LINE_MASK: u32 = 0x1FFFFFFF;
+pub const PAIR_HALF2_BIT: u64 = 1 << 56;
+pub const PAIR_SHARED_BIT: u64 = 1 << 57;
+pub const CONTROL_DEP_BIT: u64 = 1 << 58;
+pub const LINE_MASK: u64 = (1 << 56) - 1;
 
 /// Pair 指令（ldp/stp）的分半依赖。
 /// 将内存依赖和源寄存器依赖按半区拆分，以提高切片精度。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PairSplitDeps {
     /// 共享依赖（base reg、control dep）
-    pub shared: SmallVec<[u32; 2]>,
+    pub shared: SmallVec<[u64; 2]>,
     /// 第一个寄存器的专属依赖（mem 半区1 或 source reg1）
-    pub half1_deps: SmallVec<[u32; 4]>,
+    pub half1_deps: SmallVec<[u64; 4]>,
     /// 第二个寄存器的专属依赖（mem 半区2 或 source reg2）
-    pub half2_deps: SmallVec<[u32; 4]>,
+    pub half2_deps: SmallVec<[u64; 4]>,
 }
 
 /// mem_last_def 的紧凑存储：扫描期间用 HashMap（快速插入），
 /// compact 后转为排序数组（节省内存，二分查找）。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum MemLastDef {
-    Map(FxHashMap<u64, (u32, u64)>),
-    Sorted(Vec<(u64, u32, u64)>),
+    Map(FxHashMap<u64, (u64, u64)>),
+    Sorted(Vec<(u64, u64, u64)>),
 }
 
 impl Default for MemLastDef {
@@ -120,21 +124,22 @@ impl Default for MemLastDef {
 
 impl MemLastDef {
     /// 查找地址对应的 (line, value)。返回拷贝。
-    pub fn get(&self, addr: &u64) -> Option<(u32, u64)> {
+    pub fn get(&self, addr: &u64) -> Option<(u64, u64)> {
         match self {
             Self::Map(m) => m.get(addr).copied(),
-            Self::Sorted(v) => {
-                v.binary_search_by_key(addr, |(a, _, _)| *a)
-                    .ok()
-                    .map(|i| (v[i].1, v[i].2))
-            }
+            Self::Sorted(v) => v
+                .binary_search_by_key(addr, |(a, _, _)| *a)
+                .ok()
+                .map(|i| (v[i].1, v[i].2)),
         }
     }
 
     /// 扫描期间插入（仅 Map 模式）
-    pub fn insert(&mut self, addr: u64, value: (u32, u64)) {
+    pub fn insert(&mut self, addr: u64, value: (u64, u64)) {
         match self {
-            Self::Map(m) => { m.insert(addr, value); },
+            Self::Map(m) => {
+                m.insert(addr, value);
+            }
             Self::Sorted(_) => panic!("cannot insert into compacted MemLastDef"),
         }
     }
@@ -150,7 +155,8 @@ impl MemLastDef {
     /// 压缩为排序数组，释放 HashMap 开销
     pub fn compact(&mut self) {
         if let Self::Map(m) = self {
-            let mut sorted: Vec<(u64, u32, u64)> = m.drain()
+            let mut sorted: Vec<(u64, u64, u64)> = m
+                .drain()
                 .map(|(addr, (line, val))| (addr, line, val))
                 .collect();
             sorted.sort_unstable_by_key(|(addr, _, _)| *addr);
@@ -169,8 +175,8 @@ impl MemLastDef {
 /// - `offsets` 长度 = 行数 + 1（末尾哨兵）
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactDeps {
-    pub offsets: Vec<u32>,
-    pub data: Vec<u32>,
+    pub offsets: Vec<u64>,
+    pub data: Vec<u64>,
 }
 
 impl CompactDeps {
@@ -192,12 +198,12 @@ impl CompactDeps {
     /// 开始新的一行。必须在 push_unique 之前调用。
     #[inline]
     pub fn start_row(&mut self) {
-        self.offsets.push(self.data.len() as u32);
+        self.offsets.push(self.data.len() as u64);
     }
 
     /// 向当前行添加依赖（去重）。
     #[inline]
-    pub fn push_unique(&mut self, val: u32) {
+    pub fn push_unique(&mut self, val: u64) {
         let start = *self.offsets.last().unwrap() as usize;
         if !self.data[start..].contains(&val) {
             self.data.push(val);
@@ -206,7 +212,7 @@ impl CompactDeps {
 
     /// 获取第 i 行的依赖切片。
     #[inline]
-    pub fn row(&self, i: usize) -> &[u32] {
+    pub fn row(&self, i: usize) -> &[u64] {
         let start = self.offsets[i] as usize;
         let end = if i + 1 < self.offsets.len() {
             self.offsets[i + 1] as usize
@@ -248,23 +254,23 @@ impl CompactDeps {
 
     /// 第 i 行是否包含某个依赖值。
     #[allow(dead_code)]
-    pub fn row_contains(&self, i: usize, val: &u32) -> bool {
+    pub fn row_contains(&self, i: usize, val: &u64) -> bool {
         self.row(i).contains(val)
     }
 
     /// Create from raw parts (for merge phase).
     #[allow(dead_code)]
-    pub fn from_raw(offsets: Vec<u32>, data: Vec<u32>) -> Self {
+    pub fn from_raw(offsets: Vec<u64>, data: Vec<u64>) -> Self {
         Self { offsets, data }
     }
 
     /// Accessor for offsets slice (for flat conversion).
-    pub fn offsets_slice(&self) -> &[u32] {
+    pub fn offsets_slice(&self) -> &[u64] {
         &self.offsets
     }
 
     /// Accessor for data slice (for flat conversion).
-    pub fn data_slice(&self) -> &[u32] {
+    pub fn data_slice(&self) -> &[u64] {
         &self.data
     }
 
@@ -291,26 +297,30 @@ pub enum DepsStorage {
     /// Chunked from parallel scan — keeps per-chunk CompactDeps as-is.
     Chunked {
         chunks: Vec<CompactDeps>,
-        chunk_start_lines: Vec<u32>,
+        chunk_start_lines: Vec<u64>,
         /// Cross-chunk patch deps grouped by source line, sorted by line number.
         /// Each entry is (global_line, deps_for_that_line).
-        patch_groups: Vec<(u32, Vec<u32>)>,
+        patch_groups: Vec<(u64, Vec<u64>)>,
     },
 }
 
 impl DepsStorage {
     /// Get the base (intra-chunk) deps for a line.
     #[inline]
-    pub fn row(&self, global_line: usize) -> &[u32] {
+    pub fn row(&self, global_line: u64) -> &[u64] {
         match self {
-            DepsStorage::Single(cd) => cd.row(global_line),
-            DepsStorage::Chunked { chunks, chunk_start_lines, .. } => {
-                let line = global_line as u32;
+            DepsStorage::Single(cd) => cd.row(global_line as usize),
+            DepsStorage::Chunked {
+                chunks,
+                chunk_start_lines,
+                ..
+            } => {
+                let line = global_line;
                 let chunk_idx = match chunk_start_lines.binary_search(&line) {
                     Ok(i) => i,
                     Err(i) => i.saturating_sub(1),
                 };
-                let local = global_line - chunk_start_lines[chunk_idx] as usize;
+                let local = (global_line - chunk_start_lines[chunk_idx]) as usize;
                 chunks[chunk_idx].row(local)
             }
         }
@@ -318,11 +328,11 @@ impl DepsStorage {
 
     /// Get cross-chunk patch deps for a line. Returns empty slice if none.
     #[inline]
-    pub fn patch_row(&self, global_line: usize) -> &[u32] {
+    pub fn patch_row(&self, global_line: u64) -> &[u64] {
         match self {
             DepsStorage::Single(_) => &[],
             DepsStorage::Chunked { patch_groups, .. } => {
-                let line = global_line as u32;
+                let line = global_line;
                 match patch_groups.binary_search_by_key(&line, |&(l, _)| l) {
                     Ok(idx) => &patch_groups[idx].1,
                     Err(_) => &[],
@@ -335,7 +345,11 @@ impl DepsStorage {
     pub fn total_deps(&self) -> usize {
         match self {
             DepsStorage::Single(cd) => cd.total_deps(),
-            DepsStorage::Chunked { chunks, patch_groups, .. } => {
+            DepsStorage::Chunked {
+                chunks,
+                patch_groups,
+                ..
+            } => {
                 let base: usize = chunks.iter().map(|c| c.total_deps()).sum();
                 let patches: usize = patch_groups.iter().map(|(_, v)| v.len()).sum();
                 base + patches
@@ -348,9 +362,7 @@ impl DepsStorage {
     pub fn num_rows(&self) -> usize {
         match self {
             DepsStorage::Single(cd) => cd.num_rows(),
-            DepsStorage::Chunked { chunks, .. } => {
-                chunks.iter().map(|c| c.num_rows()).sum()
-            }
+            DepsStorage::Chunked { chunks, .. } => chunks.iter().map(|c| c.num_rows()).sum(),
         }
     }
 
@@ -374,7 +386,7 @@ impl DepsStorage {
 
     /// Push a unique dep to the current row (only valid for Single variant, used during scan).
     #[inline]
-    pub fn push_unique(&mut self, val: u32) {
+    pub fn push_unique(&mut self, val: u64) {
         match self {
             DepsStorage::Single(cd) => cd.push_unique(val),
             DepsStorage::Chunked { .. } => panic!("cannot push_unique on Chunked DepsStorage"),
@@ -383,13 +395,13 @@ impl DepsStorage {
 
     /// Check if a row contains a specific dep value (base + patches).
     #[allow(dead_code)]
-    pub fn row_contains(&self, i: usize, val: &u32) -> bool {
+    pub fn row_contains(&self, i: u64, val: &u64) -> bool {
         self.row(i).contains(val) || self.patch_row(i).contains(val)
     }
 
     /// Check if a row has no deps (base + patches).
     #[allow(dead_code)]
-    pub fn row_is_empty(&self, i: usize) -> bool {
+    pub fn row_is_empty(&self, i: u64) -> bool {
         self.row(i).is_empty() && self.patch_row(i).is_empty()
     }
 
@@ -403,21 +415,21 @@ impl DepsStorage {
 pub struct ScanState {
     pub reg_last_def: RegLastDef,
     pub mem_last_def: MemLastDef,
-    pub last_cond_branch: Option<u32>,
+    pub last_cond_branch: Option<u64>,
     pub deps: DepsStorage,
-    pub line_count: u32,
+    pub line_count: u64,
     /// 成功解析的指令行数（parse_line 返回 Some 的次数）
-    pub parsed_count: u32,
+    pub parsed_count: u64,
     /// 包含 mem[WRITE]/mem[READ] + abs= 的行数
-    pub mem_op_count: u32,
+    pub mem_op_count: u64,
     /// Maps (@LINE, target) → resolved line index (may differ from original if fallback occurred).
-    pub resolved_targets: FxHashMap<(u32, LineTarget), u32>,
+    pub resolved_targets: FxHashMap<(u64, LineTarget), u64>,
     /// 未知助记符统计：助记符 → (首次出现行号 0-based, 出现次数)
-    pub unknown_mnemonics: FxHashMap<String, (u32, u32)>,
+    pub unknown_mnemonics: FxHashMap<String, (u64, u64)>,
     /// 标记从初始内存（trace 前状态）加载的行。
     pub init_mem_loads: bitvec::prelude::BitVec,
     /// Pair 指令的分半依赖（仅 LoadPair/StorePair 行有条目）。
-    pub pair_split: FxHashMap<u32, PairSplitDeps>,
+    pub pair_split: FxHashMap<u64, PairSplitDeps>,
 }
 
 impl ScanState {
@@ -431,7 +443,7 @@ impl ScanState {
 }
 
 /// Push `val` into a SmallVec only if not already present (dedup).
-pub fn push_unique<A: smallvec::Array<Item = u32>>(deps: &mut SmallVec<A>, val: u32) {
+pub fn push_unique<A: smallvec::Array<Item = u64>>(deps: &mut SmallVec<A>, val: u64) {
     if !deps.contains(&val) {
         deps.push(val);
     }
@@ -448,8 +460,8 @@ pub fn scan_from_string(trace: &str, data_only: bool) -> Result<ScanState> {
 pub fn scan_from_string_with_range(
     trace: &str,
     data_only: bool,
-    start_seq: u32,
-    end_seq: Option<u32>,
+    start_seq: u64,
+    end_seq: Option<u64>,
 ) -> Result<ScanState> {
     scan_from_string_with_targets(trace, data_only, start_seq, end_seq, &Default::default())
 }
@@ -459,9 +471,9 @@ pub fn scan_from_string_with_range(
 pub fn scan_from_string_with_targets(
     trace: &str,
     data_only: bool,
-    start_seq: u32,
-    end_seq: Option<u32>,
-    line_targets: &std::collections::HashMap<u32, Vec<LineTarget>>,
+    start_seq: u64,
+    end_seq: Option<u64>,
+    line_targets: &std::collections::HashMap<u64, Vec<LineTarget>>,
 ) -> Result<ScanState> {
     scan_pass1_bytes(
         trace.as_bytes(),
@@ -495,21 +507,30 @@ pub fn scan_from_string_with_targets(
 pub fn scan_pass1_bytes(
     data: &[u8],
     data_only: bool,
-    start_seq: u32,
-    end_seq: Option<u32>,
-    line_targets: &std::collections::HashMap<u32, Vec<LineTarget>>,
+    start_seq: u64,
+    end_seq: Option<u64>,
+    line_targets: &std::collections::HashMap<u64, Vec<LineTarget>>,
     profile: bool,
     no_prune: bool,
 ) -> Result<ScanState> {
-    scan_pass1_bytes_with_progress(data, data_only, start_seq, end_seq, line_targets, profile, no_prune, None)
+    scan_pass1_bytes_with_progress(
+        data,
+        data_only,
+        start_seq,
+        end_seq,
+        line_targets,
+        profile,
+        no_prune,
+        None,
+    )
 }
 
 pub fn scan_pass1_bytes_with_progress(
     data: &[u8],
     data_only: bool,
-    start_seq: u32,
-    end_seq: Option<u32>,
-    line_targets: &std::collections::HashMap<u32, Vec<LineTarget>>,
+    start_seq: u64,
+    end_seq: Option<u64>,
+    line_targets: &std::collections::HashMap<u64, Vec<LineTarget>>,
     profile: bool,
     no_prune: bool,
     progress_fn: Option<&dyn Fn(usize, usize)>,
@@ -529,7 +550,10 @@ pub fn scan_pass1_bytes_with_progress(
         reg_last_def: RegLastDef::new(),
         mem_last_def: MemLastDef::default(),
         last_cond_branch: None,
-        deps: DepsStorage::single(CompactDeps::with_capacity(line_count_est, line_count_est * 2)),
+        deps: DepsStorage::single(CompactDeps::with_capacity(
+            line_count_est,
+            line_count_est * 2,
+        )),
         line_count: 0,
         parsed_count: 0,
         mem_op_count: 0,
@@ -673,8 +697,7 @@ pub fn scan_pass1_bytes_with_progress(
 
         // For non-pair LOAD: do mem deps (3b) first to determine pass-through,
         // then conditionally skip register deps (3a).
-        let is_non_pair_load = !is_pair
-            && line.mem_op.as_ref().is_some_and(|m| !m.is_write);
+        let is_non_pair_load = !is_pair && line.mem_op.as_ref().is_some_and(|m| !m.is_write);
         let mut is_pass_through = false;
 
         if is_non_pair_load && !no_prune {
@@ -682,7 +705,7 @@ pub fn scan_pass1_bytes_with_progress(
             let width = mem_access_width(class, mem.elem_width, &line);
             let mut has_init_mem = false;
             let mut all_same_store = true;
-            let mut first_store_raw: Option<u32> = None;
+            let mut first_store_raw: Option<u64> = None;
             let mut store_val: Option<u64> = None;
 
             for offset in 0..width as u64 {
@@ -824,7 +847,11 @@ pub fn scan_pass1_bytes_with_progress(
             // After SIMD expansion, defs may be [rt1_lo, rt1_hi, rt2_lo, rt2_hi, base?]
             // or [rt1, rt2, base?] for scalar. Split data defs at midpoint.
             let has_base_wb = line.writeback && line.base_reg.is_some();
-            let data_defs = if has_base_wb { &defs[..defs.len() - 1] } else { &defs[..] };
+            let data_defs = if has_base_wb {
+                &defs[..defs.len() - 1]
+            } else {
+                &defs[..]
+            };
             let mid = data_defs.len() / 2;
 
             for r in &data_defs[..mid] {
@@ -834,7 +861,9 @@ pub fn scan_pass1_bytes_with_progress(
                 state.reg_last_def.insert(*r, i | PAIR_HALF2_BIT); // half2
             }
             if has_base_wb {
-                state.reg_last_def.insert(*defs.last().unwrap(), i | PAIR_SHARED_BIT);
+                state
+                    .reg_last_def
+                    .insert(*defs.last().unwrap(), i | PAIR_SHARED_BIT);
             }
         } else if class == InsnClass::StorePair {
             // StorePair: writeback base is the only DEF (if present)
@@ -932,10 +961,7 @@ pub fn scan_pass1_bytes_with_progress(
         eprintln!("[profile] 已解析行数       : {}", state.parsed_count);
         eprintln!("[profile] 总行数           : {}", state.line_count);
         eprintln!("[profile] mem_last_def 条目: {}", state.mem_last_def.len());
-        eprintln!(
-            "[profile] deps 总边数      : {}",
-            state.deps.total_deps()
-        );
+        eprintln!("[profile] deps 总边数      : {}", state.deps.total_deps());
         eprintln!("[profile] pass-through 剪枝: {} loads", pruned_count);
         eprintln!("[profile] ──────────────────────────────");
     }
@@ -970,7 +996,11 @@ pub fn scan_pass1_bytes_with_progress(
 /// - 配对指令 (ldp/stp): `elem_width * 2`
 /// - SIMD 多寄存器 (ld1 {v0,v1,...}): `elem_width * 数据寄存器数`
 /// - 其它: `elem_width`
-pub fn mem_access_width(class: InsnClass, elem_width: u8, line: &trace_parser::types::ParsedLine) -> u8 {
+pub fn mem_access_width(
+    class: InsnClass,
+    elem_width: u8,
+    line: &trace_parser::types::ParsedLine,
+) -> u8 {
     match class {
         InsnClass::LoadPair | InsnClass::StorePair => elem_width.saturating_mul(2),
         InsnClass::SimdLoad | InsnClass::SimdStore => {
@@ -1041,8 +1071,14 @@ mod tests {
         // add x0 should have last def at line 2
         assert_eq!(state.reg_last_def.get(&RegId::X0), Some(&2));
         // add x0, x8, x9 depends on mov x8 (line 0) and mov x9 (line 1)
-        assert!(state.deps.row(2).contains(&0), "add should depend on mov x8");
-        assert!(state.deps.row(2).contains(&1), "add should depend on mov x9");
+        assert!(
+            state.deps.row(2).contains(&0),
+            "add should depend on mov x8"
+        );
+        assert!(
+            state.deps.row(2).contains(&1),
+            "add should depend on mov x9"
+        );
     }
 
     // =========================================================================
@@ -1181,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_push_unique_dedup() {
-        let mut sv: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut sv: SmallVec<[u64; 4]> = SmallVec::new();
         push_unique(&mut sv, 5);
         push_unique(&mut sv, 5);
         push_unique(&mut sv, 3);
@@ -1278,13 +1314,13 @@ mod tests {
 
     #[test]
     fn test_scan_reg_at_line_valid() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         let lines = vec![mov_line("x8", 5)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(0u32, vec![LineTarget::Reg(RegId::X8)]);
+        targets.insert(0u64, vec![LineTarget::Reg(RegId::X8)]);
 
         let state = scan_from_string_with_targets(&trace, false, 0, None, &targets).unwrap();
         assert_eq!(
@@ -1300,13 +1336,13 @@ mod tests {
 
     #[test]
     fn test_scan_reg_at_line_invalid() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         let lines = vec![mov_line("x8", 5)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(0u32, vec![LineTarget::Reg(RegId::X0)]);
+        targets.insert(0u64, vec![LineTarget::Reg(RegId::X0)]);
 
         let result = scan_from_string_with_targets(&trace, false, 0, None, &targets);
         assert!(result.is_err(), "should fail: line 0 does not DEF x0");
@@ -1318,13 +1354,13 @@ mod tests {
 
     #[test]
     fn test_scan_mem_at_line_valid() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         let lines = vec![str_line("x8", "sp", 0xbffff010)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(0u32, vec![LineTarget::Mem(0xbffff010)]);
+        targets.insert(0u64, vec![LineTarget::Mem(0xbffff010)]);
 
         let state = scan_from_string_with_targets(&trace, false, 0, None, &targets).unwrap();
         assert_eq!(
@@ -1342,13 +1378,13 @@ mod tests {
 
     #[test]
     fn test_scan_mem_at_line_invalid() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         let lines = vec![str_line("x8", "sp", 0xbffff010)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(0u32, vec![LineTarget::Mem(0xdeadbeef)]);
+        targets.insert(0u64, vec![LineTarget::Mem(0xdeadbeef)]);
 
         let result = scan_from_string_with_targets(&trace, false, 0, None, &targets);
         assert!(
@@ -1363,13 +1399,13 @@ mod tests {
 
     #[test]
     fn test_scan_line_target_out_of_range() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         let lines = vec![mov_line("x8", 5)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(999u32, vec![LineTarget::Reg(RegId::X8)]);
+        targets.insert(999u64, vec![LineTarget::Reg(RegId::X8)]);
 
         let result = scan_from_string_with_targets(&trace, false, 0, None, &targets);
         assert!(result.is_err(), "should fail: line 999 out of range");
@@ -1381,14 +1417,14 @@ mod tests {
 
     #[test]
     fn test_scan_reg_at_line_fallback() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         // line 0: mov x8 (DEFs x8), line 1: str x8 (USEs x8)
         let lines = vec![mov_line("x8", 5), str_line("x8", "sp", 0x100)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(1u32, vec![LineTarget::Reg(RegId::X8)]);
+        targets.insert(1u64, vec![LineTarget::Reg(RegId::X8)]);
 
         let state = scan_from_string_with_targets(&trace, true, 0, None, &targets).unwrap();
         let resolved = state.resolved_targets.get(&(1, LineTarget::Reg(RegId::X8)));
@@ -1401,14 +1437,14 @@ mod tests {
 
     #[test]
     fn test_scan_mem_at_line_fallback() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         // line 0: str x8 to 0x100, line 1: mov x9 (no mem op)
         let lines = vec![str_line("x8", "sp", 0x100), mov_line("x9", 10)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(1u32, vec![LineTarget::Mem(0x100)]);
+        targets.insert(1u64, vec![LineTarget::Mem(0x100)]);
 
         let state = scan_from_string_with_targets(&trace, true, 0, None, &targets).unwrap();
         let resolved = state.resolved_targets.get(&(1, LineTarget::Mem(0x100)));
@@ -1421,13 +1457,13 @@ mod tests {
 
     #[test]
     fn test_scan_reg_at_line_no_prior_def() {
-        use trace_parser::types::LineTarget;
         use std::collections::HashMap;
+        use trace_parser::types::LineTarget;
 
         let lines = vec![mov_line("x9", 5)];
         let trace = lines.join("\n");
         let mut targets = HashMap::new();
-        targets.insert(0u32, vec![LineTarget::Reg(RegId::X8)]);
+        targets.insert(0u64, vec![LineTarget::Reg(RegId::X8)]);
 
         let result = scan_from_string_with_targets(&trace, true, 0, None, &targets);
         assert!(result.is_err());
@@ -1517,7 +1553,8 @@ mod tests {
 
     #[test]
     fn test_unknown_mnemonic_collected() {
-        let trace = r#"[00:00:00 001][lib.so 0x100] [d2800000] 0x40000100: "xyzzy v0, v1, v2" => v0=0x0"#;
+        let trace =
+            r#"[00:00:00 001][lib.so 0x100] [d2800000] 0x40000100: "xyzzy v0, v1, v2" => v0=0x0"#;
         let state = scan_from_string(trace, true).unwrap();
         assert_eq!(state.unknown_mnemonics.len(), 1);
         let (first_line, count) = state.unknown_mnemonics.get("xyzzy").unwrap();
@@ -1540,7 +1577,10 @@ mod tests {
     fn test_init_mem_load_marked() {
         let trace = r#"[00:00:00 001][lib.so 0x100] [f9400be0] 0x40000100: "ldr x0, [sp, #0x10]" ; mem[READ] abs=0xbffff010 sp=0xbffff000 => x0=0x2a"#;
         let state = scan_from_string(trace, true).unwrap();
-        assert!(state.init_mem_loads[0], "load from never-stored address should be marked");
+        assert!(
+            state.init_mem_loads[0],
+            "load from never-stored address should be marked"
+        );
     }
 
     // =========================================================================
@@ -1555,6 +1595,9 @@ mod tests {
             r#"[00:00:00 001][lib.so 0x108] [f9400be0] 0x40000108: "ldr x0, [sp, #0x10]" ; mem[READ] abs=0xbffff010 sp=0xbffff000 => x0=0x2a"#,
         ].join("\n");
         let state = scan_from_string(&trace, true).unwrap();
-        assert!(!state.init_mem_loads[2], "load from previously-stored address should NOT be marked");
+        assert!(
+            !state.init_mem_loads[2],
+            "load from previously-stored address should NOT be marked"
+        );
     }
 }

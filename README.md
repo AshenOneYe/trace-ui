@@ -13,6 +13,7 @@
 ## 特性亮点
 
 - **大规模 Trace 浏览** — 虚拟滚动 + mmap 零拷贝，千万行 trace 流畅浏览，内存占用恒定。索引构建完成后自动缓存，再次打开同一文件秒级加载
+- **超大规模索引** — Base、函数/内存、依赖、字符串和 VM 语义索引均可独立调度；全局行号使用 `u64`，Chunk 内依赖使用紧凑局部编号，支持检查点续建、覆盖率、指纹和原子提交
 - **反向污点追踪** — 从寄存器或内存地址反向切片追踪数据依赖，支持数据依赖/控制依赖独立开关，过滤和高亮两种查看模式，结果可导出为 JSON/TXT
 - **数据依赖 DAG 图** — 从指定寄存器/内存地址构建依赖关系有向无环图，支持 C 风格表达式重建，直观展现数据流传播路径
 - **密码算法识别** — 自动扫描 trace 中的密码算法常量模式，覆盖 AES、DES、SM3、MD5、SHA、CRC32、TEA、RC4 等 28 种魔数模式
@@ -20,7 +21,8 @@
 - **字符串提取** — 自动从内存写操作中提取运行时字符串，支持搜索、XRefs 交叉引用、Hex/Text 详情查看
 - **DEF/USE 箭头连线** — 点击寄存器名可视化数据定义与使用关系，快速追踪值在指令间的传播路径
 - **寄存器 & 内存面板** — 实时查看任意指令处的寄存器值和内存 Hex Dump，支持内存访问历史追溯
-- **AI 辅助分析（MCP）** — 内置 MCP Server，可与 Claude Code、Cursor 等 AI 工具集成，AI 可直接调用 10 个分析工具自动分析 trace
+- **VM-aware 分析与 Agent 工作区** — VM Region / Dispatcher / Handler 聚类、VM IR/CFG 候选、证据回溯、可锁定假设、Override 撤销/重做、持久化异步任务与服务端结果句柄
+- **AI 辅助分析（MCP）** — 内置 MCP Server，可与 Claude Code、Cursor 等 AI 工具集成，提供 43 个原生分析、VM、批量查询、任务、结果句柄、工作区与假设协作工具
 - **14 种编辑器主题** — 内置 Monokai、Dracula、Nord、Catppuccin、Gruvbox、Tokyo Night、Solarized、GitHub Light、High Contrast 等主题，一键切换
 - **沉浸式交互体验** — 双击文本全局高亮同名标记、搜索结果关键词高亮、Minimap 缩略导航
 - **多窗口浮动面板** — 搜索、内存、字符串、依赖树、密码学扫描等面板可独立浮出，支持多文件并行分析
@@ -82,8 +84,18 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 | 污点分析 | `taint_analysis`、`get_tainted_lines` |
 | 结构 | `get_call_tree`、`analyze_function`、`get_strings` |
 | 密码识别 | `analyze_crypto` |
+| 索引状态 | `get_index_status` |
+| 异步任务 | `start_analysis_job`、`get_job_status`、`list_analysis_jobs`、`cancel_analysis_job`、`resume_analysis_job`、`get_job_result` |
+| 结果句柄 | `get_result_page` |
+| 批量查询 | `batch_query` |
+| VM 分析 | `detect_vm_regions`、`get_vm_handlers`、`cluster_vm_handlers`、`get_vm_artifacts`、`compare_vm_traces` |
+| 假设修正 | `get_vm_hypotheses`、`validate_vm_hypothesis`、`set_vm_override`、`undo_vm_override`、`redo_vm_override`、`get_analysis_conflicts`、`reanalyze_affected` |
+| Agent 工作区 | `get_analysis_workspace`、`add_analysis_note`、`add_open_question`、`resolve_open_question`、`add_verified_conclusion` |
+| 资源预算 | `get_resource_budgets`、`set_resource_budgets` |
 
 > 详细的工具说明、实战场景和使用指南请参考 [MCP 使用指南](docs/mcp-guide.md)
+>
+> VM-aware 分析、工作区和持久化任务说明见 [VM Analysis Workspace](docs/vm-analysis.md)。
 
 ## 功能详解
 

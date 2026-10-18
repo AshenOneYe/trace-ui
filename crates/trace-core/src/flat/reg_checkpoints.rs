@@ -1,8 +1,8 @@
 pub const REG_COUNT: usize = 98; // = RegId::COUNT
 
 pub struct FlatRegCheckpoints {
-    pub interval: u32,
-    pub count: u32,
+    pub interval: u64,
+    pub count: u64,
     pub data: Vec<u64>, // flattened, each REG_COUNT u64s per snapshot
 }
 
@@ -17,25 +17,29 @@ impl FlatRegCheckpoints {
 }
 
 pub struct RegCheckpointsView<'a> {
-    pub interval: u32,
-    count: u32,
+    pub interval: u64,
+    count: u64,
     data: &'a [u64],
 }
 
 impl<'a> RegCheckpointsView<'a> {
-    pub fn from_raw(interval: u32, count: u32, data: &'a [u64]) -> Self {
-        Self { interval, count, data }
+    pub fn from_raw(interval: u64, count: u64, data: &'a [u64]) -> Self {
+        Self {
+            interval,
+            count,
+            data,
+        }
     }
 
     /// Returns (snapshot_seq, &[u64; REG_COUNT]) for the checkpoint at or before `seq`.
-    pub fn nearest_before(&self, seq: u32) -> Option<(u32, &'a [u64; REG_COUNT])> {
+    pub fn nearest_before(&self, seq: u64) -> Option<(u64, &'a [u64; REG_COUNT])> {
         if self.count == 0 {
             return None;
         }
         let idx = ((seq / self.interval) as usize).min(self.count as usize - 1);
         let start = idx * REG_COUNT;
         let arr: &[u64; REG_COUNT] = self.data[start..start + REG_COUNT].try_into().ok()?;
-        Some((idx as u32 * self.interval, arr))
+        Some((idx as u64 * self.interval, arr))
     }
 }
 
@@ -43,7 +47,7 @@ impl<'a> RegCheckpointsView<'a> {
 mod tests {
     use super::*;
 
-    fn make_checkpoints(count: u32, interval: u32) -> FlatRegCheckpoints {
+    fn make_checkpoints(count: u64, interval: u64) -> FlatRegCheckpoints {
         let mut data = Vec::with_capacity(count as usize * REG_COUNT);
         for snap in 0..count {
             for reg in 0..REG_COUNT {

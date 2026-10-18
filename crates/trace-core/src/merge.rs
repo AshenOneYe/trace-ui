@@ -9,15 +9,15 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::line_index::LineIndex;
-use crate::query::call_tree::{CallTree, CallTreeBuilder};
-use crate::query::mem_access::MemAccessIndex;
 use crate::parallel_types::{
     CallTreeEvent, GumtraceAnnotEvent, PartialUnresolvedLoad, PartialUnresolvedPairLoad,
     SpecialLineData, UnresolvedLoad, UnresolvedPairLoad, UnresolvedRegUse,
 };
+use crate::query::call_tree::{CallTree, CallTreeBuilder};
+use crate::query::mem_access::MemAccessIndex;
 use crate::query::registers::RegCheckpoints;
-use crate::scanner::{push_unique, CompactDeps, PairSplitDeps, RegLastDef, CONTROL_DEP_BIT};
 use crate::query::strings::StringIndex;
+use crate::scanner::{push_unique, CompactDeps, PairSplitDeps, RegLastDef, CONTROL_DEP_BIT};
 use trace_parser::gumtrace::CallAnnotation;
 use trace_parser::types::RegId;
 
@@ -25,13 +25,13 @@ use trace_parser::types::RegId;
 /// Determines pass-through exactly as single-threaded scan would.
 pub fn resolve_unresolved_load(
     load: &UnresolvedLoad,
-    global_mem_last_def: &FxHashMap<u64, (u32, u64)>,
+    global_mem_last_def: &FxHashMap<u64, (u64, u64)>,
     global_reg_last_def: &RegLastDef,
-    patch_edges: &mut Vec<(u32, u32)>,
-    init_corrections: &mut Vec<(u32, bool)>,
+    patch_edges: &mut Vec<(u64, u64)>,
+    init_corrections: &mut Vec<(u64, bool)>,
 ) {
     let mut all_same_store = true;
-    let mut first_store_raw: Option<u32> = None;
+    let mut first_store_raw: Option<u64> = None;
     let mut store_val: Option<u64> = None;
     let mut has_init_mem = false;
 
@@ -79,9 +79,9 @@ pub fn resolve_unresolved_load(
 /// Pass-through is already determined as false (mixed case). Reg deps already added.
 pub fn resolve_partial_unresolved_loads(
     partials: &[PartialUnresolvedLoad],
-    global_mem_last_def: &FxHashMap<u64, (u32, u64)>,
-    patch_edges: &mut Vec<(u32, u32)>,
-    init_corrections: &mut Vec<(u32, bool)>,
+    global_mem_last_def: &FxHashMap<u64, (u64, u64)>,
+    patch_edges: &mut Vec<(u64, u64)>,
+    init_corrections: &mut Vec<(u64, bool)>,
 ) {
     for partial in partials {
         let mut all_found = true;
@@ -101,11 +101,11 @@ pub fn resolve_partial_unresolved_loads(
 /// Resolve a fully unresolved pair load. Builds complete PairSplitDeps from global state.
 pub fn resolve_unresolved_pair_load(
     pair: &UnresolvedPairLoad,
-    global_mem_last_def: &FxHashMap<u64, (u32, u64)>,
+    global_mem_last_def: &FxHashMap<u64, (u64, u64)>,
     global_reg_last_def: &RegLastDef,
-    global_last_cond_branch: Option<u32>,
+    global_last_cond_branch: Option<u64>,
     data_only: bool,
-) -> (PairSplitDeps, Vec<(u32, u32)>) {
+) -> (PairSplitDeps, Vec<(u64, u64)>) {
     let mut split = PairSplitDeps::default();
     let mut patch_edges = Vec::new();
     let ew = pair.elem_width;
@@ -145,10 +145,10 @@ pub fn resolve_unresolved_pair_load(
 /// Resolve a partially unresolved pair load. Supplements missing half deps in existing PairSplitDeps.
 pub fn resolve_partial_pair_load(
     partial: &PartialUnresolvedPairLoad,
-    global_mem_last_def: &FxHashMap<u64, (u32, u64)>,
+    global_mem_last_def: &FxHashMap<u64, (u64, u64)>,
     global_reg_last_def: &RegLastDef,
-    pair_split: &mut FxHashMap<u32, PairSplitDeps>,
-    patch_edges: &mut Vec<(u32, u32)>,
+    pair_split: &mut FxHashMap<u64, PairSplitDeps>,
+    patch_edges: &mut Vec<(u64, u64)>,
 ) {
     let ew = partial.elem_width;
     let split = pair_split.entry(partial.line).or_default();
@@ -183,7 +183,7 @@ pub fn resolve_partial_pair_load(
 pub fn resolve_unresolved_reg_uses(
     uses: &[UnresolvedRegUse],
     global_reg_last_def: &RegLastDef,
-) -> Vec<(u32, u32)> {
+) -> Vec<(u64, u64)> {
     let mut patch_edges = Vec::new();
     for u in uses {
         if let Some(&def_line) = global_reg_last_def.get(&u.reg) {
@@ -196,13 +196,13 @@ pub fn resolve_unresolved_reg_uses(
 /// Add control deps for lines before the first local conditional branch.
 /// Only adds for lines where needs_control_dep is true (non-pair, parsed, !data_only).
 pub fn resolve_control_deps(
-    chunk_start: u32,
-    first_local_cond: Option<u32>,
-    prev_last_cond: Option<u32>,
-    chunk_end: u32,
+    chunk_start: u64,
+    first_local_cond: Option<u64>,
+    prev_last_cond: Option<u64>,
+    chunk_end: u64,
     needs_control_dep: &BitVec,
     data_only: bool,
-) -> Vec<(u32, u32)> {
+) -> Vec<(u64, u64)> {
     if data_only {
         return Vec::new();
     }
@@ -225,12 +225,12 @@ pub fn resolve_control_deps(
 /// Uses push_unique for deduplication within each row.
 pub fn rebuild_compact_deps(
     chunk_deps: &[CompactDeps],
-    chunk_start_lines: &[u32],
-    patch_edges: &[(u32, u32)],
+    chunk_start_lines: &[u64],
+    patch_edges: &[(u64, u64)],
     progress_fn: Option<&dyn Fn(f64)>,
 ) -> CompactDeps {
     // Group patch_edges by source line for efficient lookup
-    let mut patches: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut patches: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     for &(from, to) in patch_edges {
         patches.entry(from).or_default().push(to);
     }
@@ -248,7 +248,7 @@ pub fn rebuild_compact_deps(
     for (chunk_id, chunk) in chunk_deps.iter().enumerate() {
         let num_rows = chunk.offsets.len();
         for local_row in 0..num_rows {
-            let global_line = chunk_start_lines[chunk_id] + local_row as u32;
+            let global_line = chunk_start_lines[chunk_id] + local_row as u64;
             merged.start_row();
 
             // Add original deps from this chunk
@@ -277,7 +277,7 @@ pub fn rebuild_compact_deps(
 
 /// Replay CallTree events sequentially through a single CallTreeBuilder.
 /// This handles blr_pending_pc logic correctly across chunk boundaries.
-pub fn replay_call_tree_events(events: &[CallTreeEvent], total_lines: u32) -> CallTree {
+pub fn replay_call_tree_events(events: &[CallTreeEvent], total_lines: u64) -> CallTree {
     let mut builder = CallTreeBuilder::new();
     let mut blr_pending_pc: Option<u64> = None;
     let mut root_addr_set = false;
@@ -327,11 +327,11 @@ pub fn replay_call_tree_events(events: &[CallTreeEvent], total_lines: u32) -> Ca
 /// Produces exact call_annotations and extra consumed_seqs.
 pub fn replay_gumtrace_annotations(
     events: &[GumtraceAnnotEvent],
-) -> (HashMap<u32, CallAnnotation>, Vec<u32>) {
+) -> (HashMap<u64, CallAnnotation>, Vec<u64>) {
     let mut call_annotations = HashMap::new();
     let mut extra_consumed = Vec::new();
-    let mut pending_call_seq: Option<u32> = None;
-    let mut current_annotation: Option<(u32, CallAnnotation)> = None;
+    let mut pending_call_seq: Option<u64> = None;
+    let mut current_annotation: Option<(u64, CallAnnotation)> = None;
 
     for event in events {
         match event {
@@ -346,13 +346,16 @@ pub fn replay_gumtrace_annotations(
                             call_annotations.insert(bl_seq, ann);
                         }
                         if let Some(bl_seq) = pending_call_seq.take() {
-                            current_annotation = Some((bl_seq, CallAnnotation {
-                                func_name: name.clone(),
-                                is_jni: *is_jni,
-                                args: Vec::new(),
-                                ret_value: None,
-                                raw_lines: vec![raw.clone()],
-                            }));
+                            current_annotation = Some((
+                                bl_seq,
+                                CallAnnotation {
+                                    func_name: name.clone(),
+                                    is_jni: *is_jni,
+                                    args: Vec::new(),
+                                    ret_value: None,
+                                    raw_lines: vec![raw.clone()],
+                                },
+                            ));
                         }
                     }
                     SpecialLineData::Arg { index, value, raw } => {
@@ -425,10 +428,7 @@ pub fn merge_line_indices(indices: Vec<LineIndex>) -> LineIndex {
 }
 
 /// Merge init_mem_loads BitVecs and apply corrections.
-pub fn merge_init_mem_loads(
-    chunk_inits: Vec<BitVec>,
-    corrections: &[(u32, bool)],
-) -> BitVec {
+pub fn merge_init_mem_loads(chunk_inits: Vec<BitVec>, corrections: &[(u64, bool)]) -> BitVec {
     let total_bits: usize = chunk_inits.iter().map(|b| b.len()).sum();
     let mut merged = BitVec::with_capacity(total_bits);
     for chunk in chunk_inits {
@@ -444,9 +444,9 @@ pub fn merge_init_mem_loads(
 
 /// Merge pair_split HashMaps from chunks + fixup additions.
 pub fn merge_pair_splits(
-    chunk_splits: Vec<FxHashMap<u32, PairSplitDeps>>,
-    fixup_splits: Vec<(u32, PairSplitDeps)>,
-) -> FxHashMap<u32, PairSplitDeps> {
+    chunk_splits: Vec<FxHashMap<u64, PairSplitDeps>>,
+    fixup_splits: Vec<(u64, PairSplitDeps)>,
+) -> FxHashMap<u64, PairSplitDeps> {
     let mut merged = FxHashMap::default();
     for chunk in chunk_splits {
         merged.extend(chunk);
@@ -464,14 +464,16 @@ pub fn merge_string_indices(indices: Vec<StringIndex>) -> StringIndex {
         all_strings.extend(idx.strings);
     }
     all_strings.sort_by_key(|r| r.seq);
-    StringIndex { strings: all_strings }
+    StringIndex {
+        strings: all_strings,
+    }
 }
 
-use crate::scan_unified::ScanResult;
-use crate::scan_unified::Phase2State;
-use crate::scanner::{ScanState, MemLastDef};
-use trace_parser::types::TraceFormat;
 use crate::parallel_types::ChunkResult;
+use crate::scan_unified::Phase2State;
+use crate::scan_unified::ScanResult;
+use crate::scanner::{MemLastDef, ScanState};
+use trace_parser::types::TraceFormat;
 
 /// Phase 2 orchestrator: merge all chunk results into a single ScanResult.
 ///
@@ -486,24 +488,24 @@ pub fn merge_all_chunks(
     cancel_flag: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::result::Result<ScanResult, crate::error::TraceError> {
     let num_chunks = chunk_results.len();
-    let mut all_patch_edges: Vec<(u32, u32)> = Vec::new();
-    let mut all_pair_fixups: Vec<(u32, PairSplitDeps)> = Vec::new();
-    let mut init_corrections: Vec<(u32, bool)> = Vec::new();
+    let mut all_patch_edges: Vec<(u64, u64)> = Vec::new();
+    let mut all_pair_fixups: Vec<(u64, PairSplitDeps)> = Vec::new();
+    let mut init_corrections: Vec<(u64, bool)> = Vec::new();
     let mut all_call_events: Vec<CallTreeEvent> = Vec::new();
     let mut all_gumtrace_events: Vec<GumtraceAnnotEvent> = Vec::new();
 
     // Sequential forward propagation of global state
-    let mut global_mem_last_def: FxHashMap<u64, (u32, u64)> = FxHashMap::default();
+    let mut global_mem_last_def: FxHashMap<u64, (u64, u64)> = FxHashMap::default();
     let mut global_reg_last_def = RegLastDef::new();
-    let mut global_last_cond_branch: Option<u32> = None;
+    let mut global_last_cond_branch: Option<u64> = None;
 
     // Lightweight deferred pair deps — resolved inline from global state (no cloning)
     struct DeferredPairDep {
-        line: u32,
+        line: u64,
         chunk_idx: usize,
-        extra_half1: SmallVec<[u32; 4]>,
-        extra_half2: SmallVec<[u32; 4]>,
-        extra_shared: SmallVec<[u32; 2]>,
+        extra_half1: SmallVec<[u64; 4]>,
+        extra_half2: SmallVec<[u64; 4]>,
+        extra_shared: SmallVec<[u64; 2]>,
     }
     let mut deferred_pair_deps: Vec<DeferredPairDep> = Vec::new();
 
@@ -547,13 +549,15 @@ pub fn merge_all_chunks(
             // === Resolve partial pair loads inline (no snapshot cloning) ===
             if !chunk.partial_unresolved_pair_loads.is_empty() {
                 for partial in &chunk.partial_unresolved_pair_loads {
-                    let mut extra_half1 = SmallVec::<[u32; 4]>::new();
-                    let mut extra_half2 = SmallVec::<[u32; 4]>::new();
-                    let mut extra_shared = SmallVec::<[u32; 2]>::new();
+                    let mut extra_half1 = SmallVec::<[u64; 4]>::new();
+                    let mut extra_half2 = SmallVec::<[u64; 4]>::new();
+                    let mut extra_shared = SmallVec::<[u64; 2]>::new();
 
                     if partial.half1_unresolved {
                         for offset in 0..partial.elem_width as u64 {
-                            if let Some(&(raw, _)) = global_mem_last_def.get(&(partial.addr + offset)) {
+                            if let Some(&(raw, _)) =
+                                global_mem_last_def.get(&(partial.addr + offset))
+                            {
                                 push_unique(&mut extra_half1, raw);
                                 all_patch_edges.push((partial.line, raw));
                             }
@@ -561,7 +565,9 @@ pub fn merge_all_chunks(
                     }
                     if partial.half2_unresolved {
                         for offset in partial.elem_width as u64..2 * partial.elem_width as u64 {
-                            if let Some(&(raw, _)) = global_mem_last_def.get(&(partial.addr + offset)) {
+                            if let Some(&(raw, _)) =
+                                global_mem_last_def.get(&(partial.addr + offset))
+                            {
                                 push_unique(&mut extra_half2, raw);
                                 all_patch_edges.push((partial.line, raw));
                             }
@@ -576,7 +582,10 @@ pub fn merge_all_chunks(
                         }
                     }
 
-                    if !extra_half1.is_empty() || !extra_half2.is_empty() || !extra_shared.is_empty() {
+                    if !extra_half1.is_empty()
+                        || !extra_half2.is_empty()
+                        || !extra_shared.is_empty()
+                    {
                         deferred_pair_deps.push(DeferredPairDep {
                             line: partial.line,
                             chunk_idx: i,
@@ -589,10 +598,8 @@ pub fn merge_all_chunks(
             }
 
             // === Resolve unresolved register uses ===
-            let reg_patches = resolve_unresolved_reg_uses(
-                &chunk.unresolved_reg_uses,
-                &global_reg_last_def,
-            );
+            let reg_patches =
+                resolve_unresolved_reg_uses(&chunk.unresolved_reg_uses, &global_reg_last_def);
             all_patch_edges.extend(reg_patches);
 
             // === Resolve control deps ===
@@ -615,7 +622,7 @@ pub fn merge_all_chunks(
         let chunk_reg = chunk.boundary.final_reg_last_def.inner();
         let global_reg = global_reg_last_def.inner_mut();
         for idx in 0..RegId::COUNT {
-            if chunk_reg[idx] != u32::MAX {
+            if chunk_reg[idx] != u64::MAX {
                 global_reg[idx] = chunk_reg[idx];
             }
         }
@@ -633,18 +640,22 @@ pub fn merge_all_chunks(
     // HashMap 存储 200M+ 条目可达 10-16GB（桶数组 + entries）。
     // 立即转为 sorted Vec（~4GB）释放 HashMap 的巨大开销。
     // Pass 1 之后不再需要 HashMap 的查询能力。
-    let global_mem_sorted: Vec<(u64, u32, u64)> = {
-        let mut sorted: Vec<(u64, u32, u64)> = global_mem_last_def
+    let global_mem_sorted: Vec<(u64, u64, u64)> = {
+        let mut sorted: Vec<(u64, u64, u64)> = global_mem_last_def
             .drain()
             .map(|(addr, (line, val))| (addr, line, val))
             .collect();
         drop(global_mem_last_def); // 立即释放 HashMap 桶数组
-        if let Some(ref cb) = progress_fn { cb(0.12); }
+        if let Some(ref cb) = progress_fn {
+            cb(0.12);
+        }
         sorted.sort_unstable_by_key(|(addr, _, _)| *addr);
         sorted
     };
 
-    if let Some(ref cb) = progress_fn { cb(0.15); }
+    if let Some(ref cb) = progress_fn {
+        cb(0.15);
+    }
 
     // === Pass 2: Decompose chunk_results (move out data) ===
     let mut chunk_deps = Vec::with_capacity(num_chunks);
@@ -653,11 +664,12 @@ pub fn merge_all_chunks(
     let mut chunk_reg_ckpts = Vec::with_capacity(num_chunks);
     let mut chunk_line_indices = Vec::with_capacity(num_chunks);
     let mut chunk_mem_indices = Vec::with_capacity(num_chunks);
-    let mut chunk_string_accesses: Vec<Vec<(u64, u64, u8, u32, crate::query::strings::StringRw)>> = Vec::with_capacity(num_chunks);
+    let mut chunk_string_accesses: Vec<Vec<(u64, u64, u8, u64, crate::query::strings::StringRw)>> =
+        Vec::with_capacity(num_chunks);
     let mut all_consumed_seqs = Vec::new();
     let mut chunk_start_lines = Vec::with_capacity(num_chunks);
-    let mut total_parsed_count = 0u32;
-    let mut total_mem_op_count = 0u32;
+    let mut total_parsed_count = 0u64;
+    let mut total_mem_op_count = 0u64;
 
     let mut prev_final_reg_values = [u64::MAX; RegId::COUNT];
 
@@ -701,7 +713,9 @@ pub fn merge_all_chunks(
         }
     }
 
-    if let Some(ref cb) = progress_fn { cb(0.20); }
+    if let Some(ref cb) = progress_fn {
+        cb(0.20);
+    }
 
     let phase2_timer = std::time::Instant::now();
 
@@ -709,12 +723,15 @@ pub fn merge_all_chunks(
 
     // Total lines (compute before dropping chunk_deps)
     let total_lines = chunk_start_lines.last().copied().unwrap_or(0)
-        + chunk_deps.last().map(|d| d.offsets.len() as u32).unwrap_or(0);
+        + chunk_deps
+            .last()
+            .map(|d| d.offsets.len() as u64)
+            .unwrap_or(0);
 
     // Build DepsStorage::Chunked — avoids the expensive O(n) rebuild_compact_deps.
     // Group patch_edges by source line (sorted) for efficient binary-search lookup.
     use rustc_hash::FxHashMap as PatchMap;
-    let mut patch_map: PatchMap<u32, Vec<u32>> = PatchMap::default();
+    let mut patch_map: PatchMap<u64, Vec<u64>> = PatchMap::default();
     for &(from, to) in &all_patch_edges {
         patch_map.entry(from).or_default().push(to);
     }
@@ -723,7 +740,7 @@ pub fn merge_all_chunks(
         deps.sort_unstable();
         deps.dedup();
     }
-    let mut patch_groups: Vec<(u32, Vec<u32>)> = patch_map.into_iter().collect();
+    let mut patch_groups: Vec<(u64, Vec<u64>)> = patch_map.into_iter().collect();
     patch_groups.sort_unstable_by_key(|&(line, _)| line);
 
     let merged_deps = crate::scanner::DepsStorage::Chunked {
@@ -733,9 +750,14 @@ pub fn merge_all_chunks(
     };
     drop(all_patch_edges); // Free patch edges
 
-    eprintln!("[perf] DepsStorage::Chunked built (skipped rebuild_compact_deps): {:?}", phase2_timer.elapsed());
+    eprintln!(
+        "[perf] DepsStorage::Chunked built (skipped rebuild_compact_deps): {:?}",
+        phase2_timer.elapsed()
+    );
 
-    if let Some(ref cb) = progress_fn { cb(0.70); }
+    if let Some(ref cb) = progress_fn {
+        cb(0.70);
+    }
 
     let t = std::time::Instant::now();
     // CallTree
@@ -750,7 +772,9 @@ pub fn merge_all_chunks(
 
     eprintln!("[perf] CallTree + annotations: {:?}", t.elapsed());
 
-    if let Some(ref cb) = progress_fn { cb(0.73); }
+    if let Some(ref cb) = progress_fn {
+        cb(0.73);
+    }
 
     let t = std::time::Instant::now();
     // consumed_seqs
@@ -772,10 +796,16 @@ pub fn merge_all_chunks(
         merged
     };
 
-    eprintln!("[perf] MemAccessIndex merge: {:?} ({} addresses, {} records)",
-        t.elapsed(), mem_accesses.total_addresses(), mem_accesses.total_records());
+    eprintln!(
+        "[perf] MemAccessIndex merge: {:?} ({} addresses, {} records)",
+        t.elapsed(),
+        mem_accesses.total_addresses(),
+        mem_accesses.total_records()
+    );
 
-    if let Some(ref cb) = progress_fn { cb(0.85); }
+    if let Some(ref cb) = progress_fn {
+        cb(0.85);
+    }
 
     // RegCheckpoints: merge all snapshots
     let merged_ckpts = {
@@ -833,13 +863,22 @@ pub fn merge_all_chunks(
             }
         }
 
-        if let Some(ref cb) = progress_fn { cb(0.97); }
+        if let Some(ref cb) = progress_fn {
+            cb(0.97);
+        }
 
         let t2 = std::time::Instant::now();
         let si = sb.finish();
-        eprintln!("[perf] StringBuilder.finish(): {:?} ({} strings)", t2.elapsed(), si.strings.len());
+        eprintln!(
+            "[perf] StringBuilder.finish(): {:?} ({} strings)",
+            t2.elapsed(),
+            si.strings.len()
+        );
 
-        eprintln!("[perf] StringIndex total (build+finish, xref deferred): {:?}", t.elapsed());
+        eprintln!(
+            "[perf] StringIndex total (build+finish, xref deferred): {:?}",
+            t.elapsed()
+        );
         si
     } else {
         Default::default()
@@ -854,7 +893,9 @@ pub fn merge_all_chunks(
     // pair_split
     let pair_split = merge_pair_splits(chunk_pair_splits, all_pair_fixups);
 
-    if let Some(ref cb) = progress_fn { cb(0.98); }
+    if let Some(ref cb) = progress_fn {
+        cb(0.98);
+    }
 
     // Build ScanState — use pre-compacted sorted Vec (already freed HashMap in Pass 1)
     let mem_last_def_map = MemLastDef::Sorted(global_mem_sorted);
@@ -880,7 +921,9 @@ pub fn merge_all_chunks(
         string_index,
     };
 
-    if let Some(ref cb) = progress_fn { cb(1.0); }
+    if let Some(ref cb) = progress_fn {
+        cb(1.0);
+    }
 
     Ok(ScanResult {
         scan_state,
@@ -901,7 +944,7 @@ mod tests {
     fn test_resolve_load_passthrough() {
         let mut global_mem = FxHashMap::default();
         for i in 0..8u64 {
-            global_mem.insert(0x8000 + i, (10u32, 0x42u64));
+            global_mem.insert(0x8000 + i, (10u64, 0x42u64));
         }
         let load = UnresolvedLoad {
             line: 20,
@@ -936,7 +979,7 @@ mod tests {
     fn test_resolve_load_not_passthrough_different_value() {
         let mut global_mem = FxHashMap::default();
         for i in 0..8u64 {
-            global_mem.insert(0x8000 + i, (10u32, 0x99u64));
+            global_mem.insert(0x8000 + i, (10u64, 0x99u64));
         }
         let load = UnresolvedLoad {
             line: 20,
@@ -995,8 +1038,8 @@ mod tests {
     #[test]
     fn test_resolve_partial_loads() {
         let mut global_mem = FxHashMap::default();
-        global_mem.insert(0x8002u64, (15u32, 0u64));
-        global_mem.insert(0x8003u64, (15u32, 0u64));
+        global_mem.insert(0x8002u64, (15u64, 0u64));
+        global_mem.insert(0x8003u64, (15u64, 0u64));
 
         let partials = vec![PartialUnresolvedLoad {
             line: 25,
@@ -1035,13 +1078,8 @@ mod tests {
             base_reg: Some(RegId(3)),
             defs: smallvec![RegId(0), RegId(1), RegId(3)],
         };
-        let (split, _patches) = resolve_unresolved_pair_load(
-            &pair,
-            &global_mem,
-            &global_reg,
-            None,
-            false,
-        );
+        let (split, _patches) =
+            resolve_unresolved_pair_load(&pair, &global_mem, &global_reg, None, false);
         assert!(split.half1_deps.contains(&10));
         assert!(split.half2_deps.contains(&15));
         assert!(split.shared.contains(&7));
@@ -1052,8 +1090,14 @@ mod tests {
         let mut global_reg = RegLastDef::new();
         global_reg.insert(RegId(5), 42);
         let uses = vec![
-            UnresolvedRegUse { line: 100, reg: RegId(5) },
-            UnresolvedRegUse { line: 101, reg: RegId(6) }, // not defined
+            UnresolvedRegUse {
+                line: 100,
+                reg: RegId(5),
+            },
+            UnresolvedRegUse {
+                line: 101,
+                reg: RegId(6),
+            }, // not defined
         ];
         let patches = resolve_unresolved_reg_uses(&uses, &global_reg);
         assert_eq!(patches.len(), 1);
@@ -1095,7 +1139,7 @@ mod tests {
         c1.push_unique(3); // line 4 → line 3
 
         let patch_edges = vec![
-            (3u32, 2u32), // line 3 depends on line 2 (cross-chunk)
+            (3u64, 2u64), // line 3 depends on line 2 (cross-chunk)
         ];
 
         let merged = rebuild_compact_deps(&[c0, c1], &[0, 3], &patch_edges, None);
@@ -1105,7 +1149,7 @@ mod tests {
         assert_eq!(merged.row(1), &[0]); // line 1 → 0
         assert_eq!(merged.row(2), &[1]); // line 2 → 1
 
-        let mut line3: Vec<u32> = merged.row(3).to_vec();
+        let mut line3: Vec<u64> = merged.row(3).to_vec();
         line3.sort();
         assert_eq!(line3, vec![2]); // line 3 → 2 (from patch)
 
@@ -1120,7 +1164,7 @@ mod tests {
         c0.push_unique(0); // line 1 → 0
 
         // Patch also adds line 1 → 0 (duplicate)
-        let patch_edges = vec![(1u32, 0u32)];
+        let patch_edges = vec![(1u64, 0u64)];
 
         let merged = rebuild_compact_deps(&[c0], &[0], &patch_edges, None);
         assert_eq!(merged.row(1).len(), 1); // deduped to single entry
@@ -1130,10 +1174,19 @@ mod tests {
     #[test]
     fn test_replay_call_tree_basic() {
         let events = vec![
-            CallTreeEvent::Call { seq: 5, target: 0x2000 },
+            CallTreeEvent::Call {
+                seq: 5,
+                target: 0x2000,
+            },
             CallTreeEvent::Ret { seq: 10 },
-            CallTreeEvent::Call { seq: 15, target: 0x3000 },
-            CallTreeEvent::Call { seq: 20, target: 0x4000 },
+            CallTreeEvent::Call {
+                seq: 15,
+                target: 0x3000,
+            },
+            CallTreeEvent::Call {
+                seq: 20,
+                target: 0x4000,
+            },
             CallTreeEvent::Ret { seq: 25 },
             CallTreeEvent::Ret { seq: 30 },
         ];
@@ -1153,9 +1206,18 @@ mod tests {
     fn test_replay_call_tree_blr_intercept() {
         // BLR at seq 10 with PC 0x2010, next line addr = 0x2014 = PC+4 → intercepted
         let events = vec![
-            CallTreeEvent::Call { seq: 10, target: 0x3000 },
-            CallTreeEvent::BlrPending { seq: 10, pc: 0x2010 },
-            CallTreeEvent::LineAddr { seq: 11, addr: 0x2014 }, // PC+4 → intercepted
+            CallTreeEvent::Call {
+                seq: 10,
+                target: 0x3000,
+            },
+            CallTreeEvent::BlrPending {
+                seq: 10,
+                pc: 0x2010,
+            },
+            CallTreeEvent::LineAddr {
+                seq: 11,
+                addr: 0x2014,
+            }, // PC+4 → intercepted
         ];
         let tree = replay_call_tree_events(&events, 20);
         // Root + 1 call that was immediately returned
@@ -1167,8 +1229,14 @@ mod tests {
     #[test]
     fn test_replay_call_tree_func_name() {
         let events = vec![
-            CallTreeEvent::Call { seq: 5, target: 0x2000 },
-            CallTreeEvent::SetFuncName { entry_seq: 5, name: "malloc".to_string() },
+            CallTreeEvent::Call {
+                seq: 5,
+                target: 0x2000,
+            },
+            CallTreeEvent::SetFuncName {
+                entry_seq: 5,
+                name: "malloc".to_string(),
+            },
             CallTreeEvent::Ret { seq: 10 },
         ];
         let tree = replay_call_tree_events(&events, 15);
@@ -1246,9 +1314,9 @@ mod tests {
         use crate::query::registers::RegCheckpoints;
         let mut ckpts = RegCheckpoints::new(1000);
         let mut vals = [u64::MAX; RegId::COUNT];
-        ckpts.save_checkpoint(&vals);  // first checkpoint: all unknown
+        ckpts.save_checkpoint(&vals); // first checkpoint: all unknown
         vals[0] = 0x55;
-        ckpts.save_checkpoint(&vals);  // second: x0 = 0x55, rest unknown
+        ckpts.save_checkpoint(&vals); // second: x0 = 0x55, rest unknown
 
         let mut prev_final = [u64::MAX; RegId::COUNT];
         prev_final[0] = 0x42;
@@ -1266,17 +1334,20 @@ mod tests {
     fn test_merge_init_mem_loads() {
         use bitvec::prelude::*;
         let mut b1: BitVec = BitVec::new();
-        b1.push(true); b1.push(false); b1.push(true);
+        b1.push(true);
+        b1.push(false);
+        b1.push(true);
         let mut b2: BitVec = BitVec::new();
-        b2.push(false); b2.push(true);
+        b2.push(false);
+        b2.push(true);
 
-        let corrections = vec![(0u32, false), (4, false)]; // clear bits 0 and 4
+        let corrections = vec![(0u64, false), (4, false)]; // clear bits 0 and 4
 
         let merged = merge_init_mem_loads(vec![b1, b2], &corrections);
         assert_eq!(merged.len(), 5);
         assert_eq!(merged[0], false); // corrected from true
         assert_eq!(merged[1], false); // original
-        assert_eq!(merged[2], true);  // original
+        assert_eq!(merged[2], true); // original
         assert_eq!(merged[3], false); // original
         assert_eq!(merged[4], false); // corrected from true
     }
@@ -1285,10 +1356,40 @@ mod tests {
     fn test_merge_mem_access_indices() {
         use crate::query::mem_access::{MemAccessIndex, MemAccessRecord, MemRw};
         let mut idx1 = MemAccessIndex::new();
-        idx1.add(0x1000, MemAccessRecord { seq: 1, insn_addr: 0x100, rw: MemRw::Read, data: 0, size: 4, data_known: true });
+        idx1.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 1,
+                insn_addr: 0x100,
+                rw: MemRw::Read,
+                data: 0,
+                size: 4,
+                data_known: true,
+            },
+        );
         let mut idx2 = MemAccessIndex::new();
-        idx2.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x200, rw: MemRw::Write, data: 42, size: 4, data_known: true });
-        idx2.add(0x2000, MemAccessRecord { seq: 6, insn_addr: 0x204, rw: MemRw::Read, data: 0, size: 1, data_known: true });
+        idx2.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 5,
+                insn_addr: 0x200,
+                rw: MemRw::Write,
+                data: 42,
+                size: 4,
+                data_known: true,
+            },
+        );
+        idx2.add(
+            0x2000,
+            MemAccessRecord {
+                seq: 6,
+                insn_addr: 0x204,
+                rw: MemRw::Read,
+                data: 0,
+                size: 1,
+                data_known: true,
+            },
+        );
 
         let merged = merge_mem_access_indices(vec![idx1, idx2]);
         assert_eq!(merged.total_addresses(), 2);
@@ -1299,17 +1400,39 @@ mod tests {
 
     #[test]
     fn test_merge_string_indices() {
-        use crate::query::strings::{StringIndex, StringRecord, StringEncoding, StringRw};
+        use crate::query::strings::{StringEncoding, StringIndex, StringRecord, StringRw};
         let idx1 = StringIndex {
             strings: vec![
-                StringRecord { addr: 0x1000, content: "hello".to_string(), encoding: StringEncoding::Ascii, byte_len: 5, seq: 10, xref_count: 0, rw: StringRw::Write },
-                StringRecord { addr: 0x2000, content: "world".to_string(), encoding: StringEncoding::Ascii, byte_len: 5, seq: 30, xref_count: 0, rw: StringRw::Write },
+                StringRecord {
+                    addr: 0x1000,
+                    content: "hello".to_string(),
+                    encoding: StringEncoding::Ascii,
+                    byte_len: 5,
+                    seq: 10,
+                    xref_count: 0,
+                    rw: StringRw::Write,
+                },
+                StringRecord {
+                    addr: 0x2000,
+                    content: "world".to_string(),
+                    encoding: StringEncoding::Ascii,
+                    byte_len: 5,
+                    seq: 30,
+                    xref_count: 0,
+                    rw: StringRw::Write,
+                },
             ],
         };
         let idx2 = StringIndex {
-            strings: vec![
-                StringRecord { addr: 0x3000, content: "foo".to_string(), encoding: StringEncoding::Ascii, byte_len: 3, seq: 20, xref_count: 0, rw: StringRw::Write },
-            ],
+            strings: vec![StringRecord {
+                addr: 0x3000,
+                content: "foo".to_string(),
+                encoding: StringEncoding::Ascii,
+                byte_len: 3,
+                seq: 20,
+                xref_count: 0,
+                rw: StringRw::Write,
+            }],
         };
 
         let merged = merge_string_indices(vec![idx1, idx2]);
@@ -1322,12 +1445,12 @@ mod tests {
 
     #[test]
     fn test_merge_pair_splits() {
-        let mut c1: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
+        let mut c1: FxHashMap<u64, PairSplitDeps> = FxHashMap::default();
         c1.insert(10, PairSplitDeps::default());
-        let mut c2: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
+        let mut c2: FxHashMap<u64, PairSplitDeps> = FxHashMap::default();
         c2.insert(20, PairSplitDeps::default());
 
-        let fixups = vec![(30u32, PairSplitDeps::default())];
+        let fixups = vec![(30u64, PairSplitDeps::default())];
 
         let merged = merge_pair_splits(vec![c1, c2], fixups);
         assert_eq!(merged.len(), 3);

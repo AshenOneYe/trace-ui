@@ -1,31 +1,34 @@
 pub struct FlatBitVec {
     pub data: Vec<u8>,
-    pub len: u32,
+    pub len: u64,
 }
 
 impl FlatBitVec {
     pub fn view(&self) -> BitView<'_> {
         BitView {
             data: &self.data,
-            len: self.len as usize,
+            len: self.len,
         }
     }
 }
 
 pub struct BitView<'a> {
     data: &'a [u8],
-    len: usize,
+    len: u64,
 }
 
 impl<'a> BitView<'a> {
-    pub fn from_raw(data: &'a [u8], len: u32) -> Self {
-        Self { data, len: len as usize }
+    pub fn from_raw(data: &'a [u8], len: u64) -> Self {
+        Self { data, len }
     }
 
     /// Return the bit at position `idx` (little-endian bit order within each byte).
     #[inline]
-    pub fn get(&self, idx: usize) -> bool {
-        if idx >= self.len {
+    pub fn get(&self, idx: impl TryInto<usize>) -> bool {
+        let Ok(idx) = idx.try_into() else {
+            return false;
+        };
+        if idx as u64 >= self.len {
             return false;
         }
         let byte_idx = idx / 8;
@@ -35,7 +38,7 @@ impl<'a> BitView<'a> {
 
     /// Return the number of logical bits.
     #[inline]
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
@@ -52,7 +55,7 @@ mod tests {
     use super::*;
 
     fn make_bitvec(bits: &[bool]) -> FlatBitVec {
-        let len = bits.len() as u32;
+        let len = bits.len() as u64;
         let byte_count = (bits.len() + 7) / 8;
         let mut data = vec![0u8; byte_count];
         for (i, &b) in bits.iter().enumerate() {
@@ -66,7 +69,9 @@ mod tests {
     #[test]
     fn test_basic_get() {
         // bits: [1, 0, 1, 1, 0, 0, 0, 1, 0, 1]
-        let bits = [true, false, true, true, false, false, false, true, false, true];
+        let bits = [
+            true, false, true, true, false, false, false, true, false, true,
+        ];
         let flat = make_bitvec(&bits);
         let view = flat.view();
         assert_eq!(view.len(), 10);
@@ -87,7 +92,10 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let flat = FlatBitVec { data: vec![], len: 0 };
+        let flat = FlatBitVec {
+            data: vec![],
+            len: 0,
+        };
         let view = flat.view();
         assert!(view.is_empty());
         assert_eq!(view.len(), 0);

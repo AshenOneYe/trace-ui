@@ -1,4 +1,5 @@
-use serde::{Serialize, Deserialize};
+use crate::position::LineRange;
+use serde::{Deserialize, Serialize};
 use trace_parser::types::TraceFormat;
 
 // ── Progress ──
@@ -28,7 +29,7 @@ pub struct SessionInfo {
     pub session_id: String,
     pub file_path: String,
     pub file_size: u64,
-    pub total_lines: u32,
+    pub total_lines: u64,
     pub index_ready: bool,
     pub building: bool,
     pub has_slice_result: bool,
@@ -45,9 +46,33 @@ pub struct BuildOptions {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildResult {
-    pub total_lines: u32,
+    pub total_lines: u64,
     pub has_string_index: bool,
     pub from_cache: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexStageInfo {
+    pub stage: String,
+    pub state: String,
+    pub completed_chunks: u32,
+    pub total_chunks: u32,
+    pub coverage: Vec<LineRange>,
+    pub algorithm_version: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexStatus {
+    pub session_id: String,
+    pub schema_version: Option<u32>,
+    pub total_lines: u64,
+    pub manifest_present: bool,
+    pub complete: bool,
+    pub resume_cursor: Option<u32>,
+    pub stages: Vec<IndexStageInfo>,
 }
 
 // ── Browse ──
@@ -62,7 +87,7 @@ pub struct CallInfoDto {
 
 #[derive(Serialize, Clone)]
 pub struct TraceLine {
-    pub seq: u32,
+    pub seq: u64,
     pub address: String,
     pub so_offset: String,
     pub so_name: Option<String>,
@@ -88,9 +113,9 @@ pub struct SearchOptions {
 
 #[derive(Serialize)]
 pub struct SearchResultLite {
-    pub match_seqs: Vec<u32>,
-    pub total_scanned: u32,
-    pub total_matches: u32,
+    pub match_seqs: Vec<u64>,
+    pub total_scanned: u64,
+    pub total_matches: u64,
     pub truncated: bool,
 }
 
@@ -98,16 +123,16 @@ pub struct SearchResultLite {
 #[derive(Serialize)]
 pub struct RangeSearchOutcome {
     /// 当前页的匹配 seq 列表 [offset, offset+limit)
-    pub match_seqs: Vec<u32>,
+    pub match_seqs: Vec<u64>,
     /// 窗口内（含地址过滤后）的匹配总数
-    pub total_in_range: u32,
+    pub total_in_range: u64,
     /// 实际扫描的行数
-    pub total_scanned: u32,
+    pub total_scanned: u64,
 }
 
 #[derive(Serialize)]
 pub struct SearchMatch {
-    pub seq: u32,
+    pub seq: u64,
     pub address: String,
     pub so_offset: String,
     pub so_name: Option<String>,
@@ -122,16 +147,16 @@ pub struct SearchMatch {
 // ── Slice ──
 
 pub struct SliceOptions {
-    pub start_seq: Option<u32>,
-    pub end_seq: Option<u32>,
+    pub start_seq: Option<u64>,
+    pub end_seq: Option<u64>,
     pub data_only: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SliceResult {
-    pub marked_count: u32,
-    pub total_lines: u32,
+    pub marked_count: u64,
+    pub total_lines: u64,
     pub percentage: f64,
 }
 
@@ -139,8 +164,8 @@ pub struct SliceResult {
 #[serde(rename_all = "camelCase")]
 pub struct ExportConfig {
     pub from_specs: Vec<String>,
-    pub start_seq: Option<u32>,
-    pub end_seq: Option<u32>,
+    pub start_seq: Option<u64>,
+    pub end_seq: Option<u64>,
 }
 
 // ── Memory ──
@@ -161,7 +186,7 @@ pub struct MemorySnapshot {
 pub struct UnknownDataWrite {
     /// 写入的基地址（绝对）
     pub addr: String,
-    pub seq: u32,
+    pub seq: u64,
     /// 写入指令地址（绝对）
     pub insn_addr: String,
     pub size: u8,
@@ -169,7 +194,7 @@ pub struct UnknownDataWrite {
 
 #[derive(Serialize)]
 pub struct MemHistoryRecord {
-    pub seq: u32,
+    pub seq: u64,
     pub rw: String,
     pub data: String,
     pub size: u8,
@@ -199,7 +224,7 @@ pub struct MemHistoryPage {
 
 #[derive(Debug, Serialize)]
 pub struct MemoryWriteMatch {
-    pub seq: u32,
+    pub seq: u64,
     pub addr: String,
     pub rw: String,
     pub size: u8,
@@ -221,11 +246,11 @@ pub struct CallTreeNodeDto {
     pub id: u32,
     pub func_addr: String,
     pub func_name: Option<String>,
-    pub entry_seq: u32,
-    pub exit_seq: u32,
+    pub entry_seq: u64,
+    pub exit_seq: u64,
     pub parent_id: Option<u32>,
     pub children_ids: Vec<u32>,
-    pub line_count: u32,
+    pub line_count: u64,
 }
 
 // ── Strings ──
@@ -239,12 +264,12 @@ pub struct StringQueryOptions {
 
 #[derive(Serialize)]
 pub struct StringRecordDto {
-    pub idx: u32,
+    pub idx: u64,
     pub addr: String,
     pub content: String,
     pub encoding: String,
     pub byte_len: u32,
-    pub seq: u32,
+    pub seq: u64,
     pub xref_count: u32,
     pub rw: String,
 }
@@ -252,12 +277,12 @@ pub struct StringRecordDto {
 #[derive(Serialize)]
 pub struct StringsResult {
     pub strings: Vec<StringRecordDto>,
-    pub total: u32,
+    pub total: u64,
 }
 
 #[derive(Serialize)]
 pub struct StringXRef {
-    pub seq: u32,
+    pub seq: u64,
     pub rw: String,
     pub insn_addr: String,
     pub disasm: String,
@@ -275,16 +300,16 @@ pub struct DepTreeOptions {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DefUseChain {
-    pub def_seq: Option<u32>,
-    pub use_seqs: Vec<u32>,
-    pub redefined_seq: Option<u32>,
+    pub def_seq: Option<u64>,
+    pub use_seqs: Vec<u64>,
+    pub redefined_seq: Option<u64>,
 }
 
 // ── Functions ──
 
 #[derive(Serialize)]
 pub struct FunctionCallOccurrence {
-    pub seq: u32,
+    pub seq: u64,
     pub summary: String,
 }
 

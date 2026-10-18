@@ -160,3 +160,211 @@ export interface CryptoScanResult {
   total_lines_scanned: number;
   scan_duration_ms: number;
 }
+
+export interface LineRange {
+  start: number;
+  end: number;
+}
+
+export interface EvidenceRef {
+  trace_id: string;
+  lines: LineRange;
+  native_address: number | null;
+  kind: string;
+  detail: string | null;
+}
+
+export interface VmRegion {
+  id: string;
+  lines: LineRange;
+  address_start: number;
+  address_end: number;
+  score: number;
+  confidence: number;
+  repeated_instructions: number;
+  indirect_dispatches: number;
+  evidence: EvidenceRef[];
+  warnings: string[];
+}
+
+export interface DispatcherCandidate {
+  id: string;
+  region_id: string;
+  line: number;
+  address: number;
+  target_count: number;
+  execution_count: number;
+  confidence: number;
+  evidence: EvidenceRef[];
+}
+
+export interface VmStateCandidate {
+  role: string;
+  location: string;
+  lines: LineRange;
+  confidence: number;
+  evidence: EvidenceRef[];
+  alternatives: string[];
+}
+
+export interface HandlerSemantics {
+  operations: string[];
+  state_reads: string[];
+  state_writes: string[];
+  memory_effects: string[];
+  control_effect: string | null;
+  unknown_effects: string[];
+  confidence: number;
+}
+
+export interface HandlerCluster {
+  id: string;
+  region_id: string;
+  template_hash: string;
+  instance_count: number;
+  representative_lines: LineRange[];
+  confidence: number;
+  semantics: HandlerSemantics;
+  conflicts: string[];
+  evidence: EvidenceRef[];
+}
+
+export interface HandlerInstance {
+  id: string;
+  region_id: string;
+  entry_line: number;
+  end_line: number;
+  native_address: number;
+  dispatcher_line: number | null;
+  template_hash: string;
+  cluster_id: string | null;
+  unknown_effects: string[];
+  evidence: EvidenceRef[];
+}
+
+export interface VmInstruction {
+  id: string;
+  handler_instance_id: string;
+  operation: string;
+  operands: string[];
+  state_reads: string[];
+  state_writes: string[];
+  memory_effects: string[];
+  control_target: number | null;
+  native_lines: LineRange;
+  confidence: number;
+  unknown_effects: string[];
+  evidence: EvidenceRef[];
+}
+
+export interface VirtualCfgEdge {
+  from: string;
+  to: string | null;
+  kind: string;
+  conditional: boolean;
+  confidence: number;
+  reason: string;
+  evidence: EvidenceRef[];
+}
+
+export interface VmAnalysisResult {
+  trace_id: string;
+  regions: VmRegion[];
+  dispatchers: DispatcherCandidate[];
+  state_candidates: VmStateCandidate[];
+  handler_instances: HandlerInstance[];
+  handler_clusters: HandlerCluster[];
+  vm_instructions: VmInstruction[];
+  cfg_edges: VirtualCfgEdge[];
+  coverage: LineRange[];
+  warnings: string[];
+  algorithm_version: string;
+  experimental: boolean;
+}
+
+export interface Hypothesis {
+  id: string;
+  kind: string;
+  target: string;
+  inferred_value: unknown;
+  confidence: number;
+  evidence: EvidenceRef[];
+  algorithm_version: string;
+  source: string;
+  status: string;
+  revision: number;
+  dependencies: string[];
+  conflict: string | null;
+  updated_at_unix_ms: number;
+}
+
+export interface IndexStageInfo {
+  stage: string;
+  state: string;
+  completed_chunks: number;
+  total_chunks: number;
+  coverage: LineRange[];
+  algorithm_version: string | null;
+  message: string | null;
+}
+
+export interface IndexStatus {
+  session_id: string;
+  schema_version: number | null;
+  total_lines: number;
+  manifest_present: boolean;
+  complete: boolean;
+  resume_cursor: number | null;
+  stages: IndexStageInfo[];
+}
+
+export interface AlignmentSummary {
+  matched_clusters: number;
+  left_only_clusters: number;
+  right_only_clusters: number;
+  state_differences: string[];
+  semantic_differences: string[];
+  input_output_differences: string[];
+  dependency_differences: string[];
+  branch_divergences: number;
+  uncertain_points: number;
+}
+
+export interface AlignmentPoint {
+  left_lines: LineRange | null;
+  right_lines: LineRange | null;
+  handler_cluster_left: string | null;
+  handler_cluster_right: string | null;
+  feature_score: number;
+  evidence: EvidenceRef[];
+}
+
+export interface TraceAlignment {
+  id: string;
+  left_trace_id: string;
+  right_trace_id: string;
+  points: AlignmentPoint[];
+  confidence: number;
+  summary: AlignmentSummary;
+  warnings: string[];
+}
+
+export interface ResourceBudgets {
+  max_memory_bytes: number;
+  max_parallel_scans: number;
+  max_index_cache_bytes: number;
+  max_concurrent_queries: number;
+  background_priority: "low" | "normal" | "high";
+}
+
+export interface AnalysisJob {
+  id: string;
+  kind: string;
+  status: string;
+  progress: number;
+  message: string | null;
+  error: string | null;
+  created_at_unix_ms: number;
+  started_at_unix_ms: number | null;
+  finished_at_unix_ms: number | null;
+}

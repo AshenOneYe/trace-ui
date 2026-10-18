@@ -21,12 +21,12 @@ pub struct StringRecord {
     pub content: String,
     pub encoding: StringEncoding,
     pub byte_len: u32,
-    pub seq: u32,
+    pub seq: u64,
     pub xref_count: u32,
     pub rw: StringRw,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct StringIndex {
     pub strings: Vec<StringRecord>,
 }
@@ -99,7 +99,10 @@ impl PagedMemory {
     pub fn set_byte(&mut self, addr: u64, value: u8) {
         let page_addr = addr & PAGE_MASK;
         let offset = (addr & !PAGE_MASK) as usize;
-        let page = self.pages.entry(page_addr).or_insert_with(|| Box::new(Page::new()));
+        let page = self
+            .pages
+            .entry(page_addr)
+            .or_insert_with(|| Box::new(Page::new()));
         page.data[offset] = value;
         page.set_valid(offset);
     }
@@ -108,14 +111,19 @@ impl PagedMemory {
         let page_addr = addr & PAGE_MASK;
         let offset = (addr & !PAGE_MASK) as usize;
         self.pages.get(&page_addr).and_then(|page| {
-            if page.is_valid(offset) { Some(page.data[offset]) } else { None }
+            if page.is_valid(offset) {
+                Some(page.data[offset])
+            } else {
+                None
+            }
         })
     }
 
     pub fn get_owner(&self, addr: u64) -> u32 {
         let page_addr = addr & PAGE_MASK;
         let offset = (addr & !PAGE_MASK) as usize;
-        self.pages.get(&page_addr)
+        self.pages
+            .get(&page_addr)
             .map(|page| page.get_owner(offset))
             .unwrap_or(0)
     }
@@ -150,7 +158,7 @@ struct ActiveString {
     byte_len: u32,
     content: String,
     encoding: StringEncoding,
-    seq: u32,
+    seq: u64,
     rw: StringRw,
 }
 
@@ -186,7 +194,7 @@ impl StringBuilder {
     }
 
     /// 处理一条内存访问操作（READ 或 WRITE）
-    pub fn process_access(&mut self, addr: u64, data: u64, size: u8, seq: u32, rw: StringRw) {
+    pub fn process_access(&mut self, addr: u64, data: u64, size: u8, seq: u64, rw: StringRw) {
         // Fast path: skip if all bytes unchanged (avoids duplicate snapshots from repeated READs)
         // Note: is_valid returns false for unset bytes, so unset != val correctly proceeds
         let mut all_same = true;
@@ -219,7 +227,9 @@ impl StringBuilder {
                 }
             }
         }
-        if all_same { return; }
+        if all_same {
+            return;
+        }
 
         // 1. 展开 data 为字节（小端序），更新 byte_image
         for i in 0..size as u64 {
@@ -327,7 +337,7 @@ impl StringBuilder {
         cur
     }
 
-    fn extract_strings_in_range(&mut self, start: u64, end: u64, seq: u32, rw: StringRw) {
+    fn extract_strings_in_range(&mut self, start: u64, end: u64, seq: u64, rw: StringRw) {
         // 防止 end == u64::MAX 导致 pos 回绕造成无限循环
         let end = end.min(u64::MAX - 1);
         let mut pos = start;
@@ -335,7 +345,9 @@ impl StringBuilder {
             // Check current byte using page-level access
             let pg_addr = pos & PAGE_MASK;
             let off = (pos & !PAGE_MASK) as usize;
-            let is_printable = self.byte_image.get_page(pg_addr)
+            let is_printable = self
+                .byte_image
+                .get_page(pg_addr)
                 .map(|p| p.is_valid(off) && is_printable_or_utf8(p.data[off]))
                 .unwrap_or(false);
             if !is_printable {
@@ -383,10 +395,18 @@ impl StringBuilder {
             let (content, encoding) = match std::str::from_utf8(&bytes) {
                 Ok(s) => {
                     let has_multibyte = bytes.iter().any(|&b| b >= 0x80);
-                    (s.to_string(), if has_multibyte { StringEncoding::Utf8 } else { StringEncoding::Ascii })
+                    (
+                        s.to_string(),
+                        if has_multibyte {
+                            StringEncoding::Utf8
+                        } else {
+                            StringEncoding::Ascii
+                        },
+                    )
                 }
                 Err(_) => {
-                    let ascii_bytes: Vec<u8> = bytes.iter()
+                    let ascii_bytes: Vec<u8> = bytes
+                        .iter()
                         .copied()
                         .take_while(|&b| b >= 0x20 && b <= 0x7E)
                         .collect();
@@ -432,14 +452,17 @@ impl StringBuilder {
                     }
                 }
             }
-            self.active.insert(id, ActiveString {
-                addr: str_start,
-                byte_len,
-                content,
-                encoding,
-                seq,
-                rw,
-            });
+            self.active.insert(
+                id,
+                ActiveString {
+                    addr: str_start,
+                    byte_len,
+                    content,
+                    encoding,
+                    seq,
+                    rw,
+                },
+            );
         }
     }
 
@@ -459,16 +482,21 @@ impl StringBuilder {
         }
         use rayon::prelude::*;
         self.results.par_sort_unstable_by_key(|r| r.seq);
-        StringIndex { strings: self.results }
+        StringIndex {
+            strings: self.results,
+        }
     }
 
-    pub fn fill_xref_counts(index: &mut StringIndex, mem_idx: &crate::query::mem_access::MemAccessIndex) {
+    pub fn fill_xref_counts(
+        index: &mut StringIndex,
+        mem_idx: &crate::query::mem_access::MemAccessIndex,
+    ) {
         use crate::query::mem_access::MemRw;
         use rustc_hash::FxHashMap;
 
         // 预计算每个地址的 Read 次数（一次遍历所有记录，O(N)）
         // 避免对每个字符串的每个字节重复遍历热门地址的数百万条记录
-        let mut read_counts: FxHashMap<u64, u32> = FxHashMap::default();
+        let mut read_counts: FxHashMap<u64, u64> = FxHashMap::default();
         for (addr, records) in mem_idx.iter_all() {
             if records.rw == MemRw::Read {
                 *read_counts.entry(addr).or_insert(0) += 1;
@@ -479,40 +507,54 @@ impl StringBuilder {
         for record in &mut index.strings {
             let mut count = 0u32;
             for offset in 0..record.byte_len as u64 {
-                count += read_counts.get(&(record.addr + offset)).copied().unwrap_or(0);
+                count += read_counts
+                    .get(&(record.addr + offset))
+                    .copied()
+                    .unwrap_or(0) as u32;
             }
             record.xref_count = count;
         }
     }
 
-    pub fn fill_xref_counts_view(index: &mut StringIndex, mem_view: &crate::flat::mem_access::MemAccessView<'_>) {
+    pub fn fill_xref_counts_view(
+        index: &mut StringIndex,
+        mem_view: &crate::flat::mem_access::MemAccessView<'_>,
+    ) {
         use rayon::prelude::*;
         use rustc_hash::FxHashMap;
 
         let addr_count = mem_view.addr_count();
-        if addr_count == 0 || index.strings.is_empty() { return; }
+        if addr_count == 0 || index.strings.is_empty() {
+            return;
+        }
 
         // Parallel build of read_counts: partition by address index ranges
         let num_threads = rayon::current_num_threads().max(1);
         let chunk_size = (addr_count + num_threads - 1) / num_threads;
 
-        let partial_counts: Vec<FxHashMap<u64, u32>> = (0..num_threads).into_par_iter().map(|i| {
-            let start = i * chunk_size;
-            let end = (start + chunk_size).min(addr_count);
-            if start >= end { return FxHashMap::default(); }
-
-            let mut local: FxHashMap<u64, u32> = FxHashMap::default();
-            for (addr, recs) in mem_view.iter_addr_range(start, end) {
-                let read_count = recs.iter().filter(|r| r.is_read()).count() as u32;
-                if read_count > 0 {
-                    local.insert(addr, read_count);
+        let partial_counts: Vec<FxHashMap<u64, u64>> = (0..num_threads)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * chunk_size;
+                let end = (start + chunk_size).min(addr_count);
+                if start >= end {
+                    return FxHashMap::default();
                 }
-            }
-            local
-        }).collect();
+
+                let mut local: FxHashMap<u64, u64> = FxHashMap::default();
+                for (addr, recs) in mem_view.iter_addr_range(start, end) {
+                    let read_count = recs.iter().filter(|r| r.is_read()).count() as u64;
+                    if read_count > 0 {
+                        local.insert(addr, read_count);
+                    }
+                }
+                local
+            })
+            .collect();
 
         // Merge partial counts (no conflicts since address ranges don't overlap)
-        let read_counts: FxHashMap<u64, u32> = partial_counts.into_iter()
+        let read_counts: FxHashMap<u64, u64> = partial_counts
+            .into_iter()
             .flat_map(|m| m.into_iter())
             .collect();
 
@@ -520,7 +562,10 @@ impl StringBuilder {
         index.strings.par_iter_mut().for_each(|record| {
             let mut count = 0u32;
             for offset in 0..record.byte_len as u64 {
-                count += read_counts.get(&(record.addr + offset)).copied().unwrap_or(0);
+                count += read_counts
+                    .get(&(record.addr + offset))
+                    .copied()
+                    .unwrap_or(0) as u32;
             }
             record.xref_count = count;
         });
@@ -598,7 +643,10 @@ mod tests {
         sb.process_access(0x1002, 0x00, 1, 200, StringRw::Write);
         let index = sb.finish();
         let full = index.strings.iter().find(|s| s.content == "ABCD");
-        assert!(full.is_some(), "Original 'ABCD' should be recorded as snapshot");
+        assert!(
+            full.is_some(),
+            "Original 'ABCD' should be recorded as snapshot"
+        );
     }
 
     #[test]
@@ -669,15 +717,20 @@ mod tests {
     fn test_sequential_writes_no_orphan_leak() {
         let mut sb = StringBuilder::new();
         let mut max_active = 0usize;
-        for i in 0u32..1000 {
+        for i in 0u64..1000 {
             let addr = 0x1000 + i as u64 * 4;
             sb.process_access(addr, 0x41424344, 4, i, StringRw::Write);
             let ac = sb.active_count();
-            if ac > max_active { max_active = ac; }
+            if ac > max_active {
+                max_active = ac;
+            }
         }
         // active 中应始终只有少量活跃字符串，不应随写入次数线性增长
-        assert!(max_active < 10,
-            "active peaked at {} entries, expected < 10 (orphan leak?)", max_active);
+        assert!(
+            max_active < 10,
+            "active peaked at {} entries, expected < 10 (orphan leak?)",
+            max_active
+        );
     }
 
     #[test]
@@ -686,10 +739,14 @@ mod tests {
         sb.process_access(0x1000, 0x44434241, 4, 100, StringRw::Write);
         sb.process_access(0x1004, 0x48474645, 4, 200, StringRw::Write);
         let index = sb.finish();
-        assert!(index.strings.iter().any(|s| s.content == "ABCD"),
-            "Evicted 'ABCD' should be snapshotted");
-        assert!(index.strings.iter().any(|s| s.content == "ABCDEFGH"),
-            "Final 'ABCDEFGH' should exist");
+        assert!(
+            index.strings.iter().any(|s| s.content == "ABCD"),
+            "Evicted 'ABCD' should be snapshotted"
+        );
+        assert!(
+            index.strings.iter().any(|s| s.content == "ABCDEFGH"),
+            "Final 'ABCDEFGH' should exist"
+        );
     }
 
     #[test]
@@ -719,8 +776,12 @@ mod tests {
             mem.set_byte(base + off, off as u8);
         }
         for &off in &[0u64, 63, 64, 127, 4095] {
-            assert_eq!(mem.get_byte(base + off), Some(off as u8),
-                "offset {} should be valid", off);
+            assert_eq!(
+                mem.get_byte(base + off),
+                Some(off as u8),
+                "offset {} should be valid",
+                off
+            );
         }
         // 未设置的偏移仍为 None
         assert_eq!(mem.get_byte(base + 1), None);
@@ -734,27 +795,36 @@ mod tests {
         for i in 0..0x200u64 {
             let addr = 0x0F00 + i;
             let val = 0x41 + (i % 26) as u8; // 'A'-'Z' cycling
-            sb.process_access(addr, val as u64, 1, i as u32, StringRw::Write);
+            sb.process_access(addr, val as u64, 1, i as u64, StringRw::Write);
         }
         let index = sb.finish();
         let longest = index.strings.iter().max_by_key(|s| s.byte_len).unwrap();
-        assert!(longest.byte_len >= 100, "longest string should be >= 100 bytes, got {}", longest.byte_len);
+        assert!(
+            longest.byte_len >= 100,
+            "longest string should be >= 100 bytes, got {}",
+            longest.byte_len
+        );
     }
 
     #[test]
     fn test_sequential_writes_active_bounded_at_scale() {
         let mut sb = StringBuilder::new();
         let mut max_active = 0usize;
-        for i in 0u32..10_000 {
+        for i in 0u64..10_000 {
             let addr = 0x1000 + i as u64 * 4;
             sb.process_access(addr, 0x41424344, 4, i, StringRw::Write);
             if i % 1000 == 999 {
                 let ac = sb.active_count();
-                if ac > max_active { max_active = ac; }
+                if ac > max_active {
+                    max_active = ac;
+                }
             }
         }
         // 即使 10K 次写入，active 也应保持有界（不随写入次数线性增长）
-        assert!(max_active < 10,
-            "active peaked at {} after 10K writes, expected < 10 (orphan leak?)", max_active);
+        assert!(
+            max_active < 10,
+            "active peaked at {} after 10K writes, expected < 10 (orphan leak?)",
+            max_active
+        );
     }
 }

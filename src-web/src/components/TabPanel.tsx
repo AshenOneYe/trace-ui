@@ -12,9 +12,10 @@ import SearchResultList from "./SearchResultList";
 import SearchBar, { SearchOptions } from "./SearchBar";
 import StringsPanel from "./StringsPanel";
 import CryptoPanel from "./CryptoPanel";
+import VmAnalysisPanel from "./VmAnalysisPanel";
 import { useSelectedSeq } from "../stores/selectedSeqStore";
 
-const TABS = ["Memory", "Accesses", "Taint State", "Search", "Strings", "Crypto"] as const;
+const TABS = ["Memory", "Accesses", "Taint State", "Search", "Strings", "Crypto", "VM Analysis"] as const;
 type TabName = typeof TABS[number];
 
 function DepTreeFromSliceButton({ sessionId }: { sessionId: string | null }) {
@@ -50,6 +51,7 @@ const TAB_TO_PANEL: Record<string, string> = {
   "Search": "search",
   "Strings": "strings",
   "Crypto": "crypto",
+  "VM Analysis": "vm-analysis",
 };
 
 interface Props {
@@ -64,6 +66,7 @@ interface Props {
   floatedPanels: Set<string>;
   onFloat: (panel: string, position?: { x: number; y: number }) => void;
   sessionId: string | null;
+  sessions?: Array<{ sessionId: string; fileName: string }>;
   sliceActive: boolean;
   sliceInfo: SliceResult | null;
   sliceFromSpecs: string[];
@@ -83,6 +86,7 @@ export default function TabPanel({
   matchSeqs, searchQuery, isSearching, searchStatus, searchTotalMatches, onJumpToSeq, onJumpToSearchMatch,
   isPhase2Ready,
   floatedPanels, onFloat, sessionId,
+  sessions = [],
   sliceActive, sliceInfo, sliceFromSpecs,
   isSlicing, sliceDuration, sliceError,
   stringsScanning,
@@ -281,7 +285,11 @@ export default function TabPanel({
         {visibleTabs.map(tab => (
           <div key={tab} style={{ display: "flex", alignItems: "center" }}>
             <button
-              onMouseDown={(e) => startDrag(TAB_TO_PANEL[tab], tab === "Search" ? `Search${searchBadge}` : tab, e)}
+              onMouseDown={(e) => {
+                if (tab !== "VM Analysis") {
+                  startDrag(TAB_TO_PANEL[tab], tab === "Search" ? `Search${searchBadge}` : tab, e);
+                }
+              }}
               onDoubleClick={() => { if (tab === "Memory") setMemResetKey(k => k + 1); }}
               style={{
                 padding: "6px 14px", fontSize: "var(--font-size-sm)",
@@ -425,6 +433,15 @@ export default function TabPanel({
           cryptoResults={cryptoResults}
           cryptoScanning={cryptoScanning}
           onJumpToSeq={onJumpToSeq}
+        />
+      </div>
+
+      <div style={tabStyle("VM Analysis")}>
+        <VmAnalysisPanel
+          sessionId={sessionId}
+          isPhase2Ready={isPhase2Ready}
+          onJumpToSeq={onJumpToSeq}
+          sessions={sessions}
         />
       </div>
 

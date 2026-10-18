@@ -56,7 +56,7 @@ impl SectionWriter {
     pub fn finish(self) -> Vec<u8> {
         let num_sections = self.sections.len() as u32;
         let raw_table_size = 4 + self.sections.len() * 16; // u32 + N * (u64 offset, u64 length)
-        // Pad table to 8-byte alignment so section data stays aligned
+                                                           // Pad table to 8-byte alignment so section data stays aligned
         let table_size = (raw_table_size + 7) & !7;
 
         let mut result = Vec::with_capacity(table_size + self.buf.len());
@@ -176,13 +176,13 @@ mod tests {
     #[test]
     fn test_roundtrip_single_values() {
         let mut w = SectionWriter::new();
-        w.write_u32(42);
+        w.write_u64(42);
         w.write_u64(9999);
         let bytes = w.finish();
 
         let r = SectionReader::new(&bytes).unwrap();
         assert_eq!(r.num_sections(), 2);
-        assert_eq!(r.u32_val(0), 42);
+        assert_eq!(r.u64_val(0), 42);
         assert_eq!(r.u64_val(1), 9999);
     }
 
@@ -200,29 +200,29 @@ mod tests {
     #[test]
     fn test_multiple_sections() {
         let mut w = SectionWriter::new();
-        w.write_slice(&[1u32, 2, 3]); // 0
-        w.write_slice(&[10u64, 20]);   // 1
-        w.write_u32(99);               // 2
-        w.write_bytes(b"test");        // 3
+        w.write_slice(&[1u64, 2, 3]); // 0
+        w.write_slice(&[10u64, 20]); // 1
+        w.write_u64(99); // 2
+        w.write_bytes(b"test"); // 3
         let bytes = w.finish();
 
         let r = SectionReader::new(&bytes).unwrap();
         assert_eq!(r.num_sections(), 4);
-        assert_eq!(r.slice::<u32>(0), &[1, 2, 3]);
+        assert_eq!(r.slice::<u64>(0), &[1, 2, 3]);
         assert_eq!(r.slice::<u64>(1), &[10, 20]);
-        assert_eq!(r.u32_val(2), 99);
+        assert_eq!(r.u64_val(2), 99);
         assert_eq!(r.bytes(3), b"test");
     }
 
     #[test]
     fn test_empty_section() {
-        let empty: Vec<u32> = vec![];
+        let empty: Vec<u64> = vec![];
         let mut w = SectionWriter::new();
         w.write_slice(&empty);
         let bytes = w.finish();
 
         let r = SectionReader::new(&bytes).unwrap();
-        assert_eq!(r.slice::<u32>(0).len(), 0);
+        assert_eq!(r.slice::<u64>(0).len(), 0);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use memchr::memchr;
 
-const BLOCK_SIZE: u32 = 256;
+const BLOCK_SIZE: u64 = 256;
 
 pub struct LineIndexArchive {
     pub sampled_offsets: Vec<u64>,
-    pub total: u32,
+    pub total: u64,
 }
 
 impl LineIndexArchive {
@@ -18,21 +18,25 @@ impl LineIndexArchive {
 
 pub struct LineIndexView<'a> {
     sampled_offsets: &'a [u64],
-    total: u32,
+    total: u64,
 }
 
 impl<'a> LineIndexView<'a> {
-    pub fn from_raw(sampled_offsets: &'a [u64], total: u32) -> Self {
-        Self { sampled_offsets, total }
+    pub fn from_raw(sampled_offsets: &'a [u64], total: u64) -> Self {
+        Self {
+            sampled_offsets,
+            total,
+        }
     }
 
     /// Return the total number of lines.
-    pub fn total_lines(&self) -> u32 {
+    pub fn total_lines(&self) -> u64 {
         self.total
     }
 
     /// Return the byte offset of the given line in `data`, or None if out of range.
-    pub fn line_byte_offset(&self, data: &[u8], seq: u32) -> Option<u64> {
+    pub fn line_byte_offset(&self, data: &[u8], seq: impl Into<u64>) -> Option<u64> {
+        let seq = seq.into();
         if seq >= self.total {
             return None;
         }
@@ -49,7 +53,8 @@ impl<'a> LineIndexView<'a> {
     }
 
     /// Return the raw bytes for the given line in `data` (newline stripped), or None.
-    pub fn get_line<'d>(&self, data: &'d [u8], seq: u32) -> Option<&'d [u8]> {
+    pub fn get_line<'d>(&self, data: &'d [u8], seq: impl Into<u64>) -> Option<&'d [u8]> {
+        let seq = seq.into();
         if seq >= self.total {
             return None;
         }
@@ -83,18 +88,6 @@ impl<'a> LineIndexView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::line_index::LineIndex;
-
-    /// Build a LineIndexArchive from an existing LineIndex (for testing cross-compatibility).
-    fn from_line_index(idx: &LineIndex) -> LineIndexArchive {
-        // Access private fields via the public interface: re-build from data.
-        // Since we can't access private fields directly, build independently.
-        // Use the same algorithm as LineIndex::build.
-        LineIndexArchive {
-            sampled_offsets: extract_sampled_offsets(idx),
-            total: idx.total_lines(),
-        }
-    }
 
     /// Extract sampled_offsets from LineIndex by probing get_line offsets.
     /// We don't have direct field access, so we rebuild from scratch using the same data.
@@ -105,7 +98,7 @@ mod tests {
         sampled_offsets.push(0u64);
 
         let data_len = data.len();
-        let mut line_count: u32 = 1;
+        let mut line_count: u64 = 1;
 
         for pos in memchr_iter(b'\n', data) {
             if (pos + 1) < data_len {
@@ -122,21 +115,16 @@ mod tests {
         }
     }
 
-    // Placeholder to satisfy the from_line_index function signature (unused directly).
-    fn extract_sampled_offsets(_idx: &LineIndex) -> Vec<u64> {
-        vec![] // not used directly; we use build_archive instead
-    }
-
     #[test]
     fn test_basic() {
         let data = b"line0\nline1\nline2\n";
         let arch = build_archive(data);
         let view = arch.view();
         assert_eq!(view.total_lines(), 3);
-        assert_eq!(view.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(view.get_line(data, 1), Some(b"line1".as_slice()));
-        assert_eq!(view.get_line(data, 2), Some(b"line2".as_slice()));
-        assert_eq!(view.get_line(data, 3), None);
+        assert_eq!(view.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(view.get_line(data, 1u64), Some(b"line1".as_slice()));
+        assert_eq!(view.get_line(data, 2u64), Some(b"line2".as_slice()));
+        assert_eq!(view.get_line(data, 3u64), None);
     }
 
     #[test]
@@ -145,7 +133,7 @@ mod tests {
         let arch = build_archive(data);
         let view = arch.view();
         assert_eq!(view.total_lines(), 2);
-        assert_eq!(view.get_line(data, 1), Some(b"line1".as_slice()));
+        assert_eq!(view.get_line(data, 1u64), Some(b"line1".as_slice()));
     }
 
     #[test]
@@ -154,8 +142,8 @@ mod tests {
         let arch = build_archive(data);
         let view = arch.view();
         assert_eq!(view.total_lines(), 2);
-        assert_eq!(view.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(view.get_line(data, 1), Some(b"line1".as_slice()));
+        assert_eq!(view.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(view.get_line(data, 1u64), Some(b"line1".as_slice()));
     }
 
     #[test]
@@ -164,8 +152,8 @@ mod tests {
         let arch = build_archive(data);
         let view = arch.view();
         assert_eq!(view.total_lines(), 1);
-        assert_eq!(view.get_line(data, 0), Some(b"only one line".as_slice()));
-        assert_eq!(view.get_line(data, 1), None);
+        assert_eq!(view.get_line(data, 0u64), Some(b"only one line".as_slice()));
+        assert_eq!(view.get_line(data, 1u64), None);
     }
 
     #[test]
@@ -173,10 +161,10 @@ mod tests {
         let data = b"abc\ndef\nghi\n";
         let arch = build_archive(data);
         let view = arch.view();
-        assert_eq!(view.line_byte_offset(data, 0), Some(0));
-        assert_eq!(view.line_byte_offset(data, 1), Some(4));
-        assert_eq!(view.line_byte_offset(data, 2), Some(8));
-        assert_eq!(view.line_byte_offset(data, 3), None);
+        assert_eq!(view.line_byte_offset(data, 0u64), Some(0));
+        assert_eq!(view.line_byte_offset(data, 1u64), Some(4));
+        assert_eq!(view.line_byte_offset(data, 2u64), Some(8));
+        assert_eq!(view.line_byte_offset(data, 3u64), None);
     }
 
     #[test]
@@ -189,11 +177,11 @@ mod tests {
         let arch = build_archive(data);
         let view = arch.view();
         assert_eq!(view.total_lines(), 300);
-        assert_eq!(view.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(view.get_line(data, 255), Some(b"line255".as_slice()));
-        assert_eq!(view.get_line(data, 256), Some(b"line256".as_slice()));
-        assert_eq!(view.get_line(data, 299), Some(b"line299".as_slice()));
-        assert_eq!(view.get_line(data, 300), None);
+        assert_eq!(view.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(view.get_line(data, 255u64), Some(b"line255".as_slice()));
+        assert_eq!(view.get_line(data, 256u64), Some(b"line256".as_slice()));
+        assert_eq!(view.get_line(data, 299u64), Some(b"line299".as_slice()));
+        assert_eq!(view.get_line(data, 300u64), None);
     }
 
     #[test]

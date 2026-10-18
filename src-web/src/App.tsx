@@ -65,6 +65,24 @@ function App() {
   const { preferences, updatePreferences } = usePreferences();
   const { mcpStatus, startMcp, stopMcp } = useMcpStatus();
 
+  useEffect(() => {
+    invoke("set_resource_budgets", {
+      budgets: {
+        max_memory_bytes: Math.max(0, preferences.maxMemoryMB) * 1024 * 1024,
+        max_index_cache_bytes: Math.max(0, preferences.maxIndexCacheMB) * 1024 * 1024,
+        max_parallel_scans: Math.max(1, preferences.maxParallelScans),
+        max_concurrent_queries: Math.max(0, preferences.maxConcurrentQueries),
+        background_priority: preferences.backgroundPriority,
+      },
+    }).catch(console.error);
+  }, [
+    preferences.maxMemoryMB,
+    preferences.maxIndexCacheMB,
+    preferences.maxParallelScans,
+    preferences.maxConcurrentQueries,
+    preferences.backgroundPriority,
+  ]);
+
   const {
     totalLines,
     isLoaded,
@@ -1181,6 +1199,10 @@ function App() {
                 floatedPanels={floatedPanels}
                 onFloat={handleFloat}
                 sessionId={activeSessionId}
+                sessions={Array.from(sessions.values()).map(session => ({
+                  sessionId: session.sessionId,
+                  fileName: session.fileName,
+                }))}
                 sliceActive={slice.sliceActive}
                 sliceInfo={slice.sliceInfo}
                 sliceFromSpecs={slice.sliceFromSpecs}

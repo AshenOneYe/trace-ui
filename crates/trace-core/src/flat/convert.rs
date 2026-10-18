@@ -1,24 +1,26 @@
 use rustc_hash::FxHashMap;
 
+use crate::line_index::LineIndex;
 use crate::query::mem_access::{MemAccessIndex, MemRw};
 use crate::query::registers::RegCheckpoints;
 use crate::scanner::{DepsStorage, MemLastDef, PairSplitDeps};
-use crate::line_index::LineIndex;
 
-use super::mem_access::{FlatMemAccess, FlatMemAccessRecord, MEM_RW_READ, MEM_RW_WRITE};
-use super::reg_checkpoints::{FlatRegCheckpoints, REG_COUNT};
+use super::bitvec::FlatBitVec;
 use super::deps::FlatDeps;
+use super::line_index::LineIndexArchive;
+use super::mem_access::{FlatMemAccess, FlatMemAccessRecord, MEM_RW_READ, MEM_RW_WRITE};
 use super::mem_last_def::FlatMemLastDef;
 use super::pair_split::FlatPairSplit;
-use super::bitvec::FlatBitVec;
-use super::line_index::LineIndexArchive;
+use super::reg_checkpoints::{FlatRegCheckpoints, REG_COUNT};
 
 /// Convert a `MemAccessIndex` (HashMap-backed) to `FlatMemAccess` (sorted CSR format).
 pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
     // Collect all (addr, record) pairs from iter_all, group by addr
     let mut grouped: Vec<(u64, Vec<&crate::query::mem_access::MemAccessRecord>)> = {
-        let mut map: std::collections::BTreeMap<u64, Vec<&crate::query::mem_access::MemAccessRecord>> =
-            std::collections::BTreeMap::new();
+        let mut map: std::collections::BTreeMap<
+            u64,
+            Vec<&crate::query::mem_access::MemAccessRecord>,
+        > = std::collections::BTreeMap::new();
         for (addr, rec) in idx.iter_all() {
             map.entry(addr).or_default().push(rec);
         }
@@ -37,7 +39,7 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
     let mut offsets = Vec::with_capacity(total_addrs + 1);
     let mut records = Vec::with_capacity(total_records);
 
-    offsets.push(0u32);
+    offsets.push(0u64);
 
     for (addr, recs) in &grouped {
         addrs.push(*addr);
@@ -51,19 +53,27 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
                     MemRw::Read => MEM_RW_READ,
                     MemRw::Write => MEM_RW_WRITE,
                 },
-                flags: if rec.data_known { 0 } else { crate::flat::mem_access::FLAG_DATA_UNKNOWN },
-                _pad: [0; 1],
+                flags: if rec.data_known {
+                    0
+                } else {
+                    crate::flat::mem_access::FLAG_DATA_UNKNOWN
+                },
+                _pad: [0; 5],
             });
         }
-        offsets.push(records.len() as u32);
+        offsets.push(records.len() as u64);
     }
 
-    FlatMemAccess { addrs, offsets, records }
+    FlatMemAccess {
+        addrs,
+        offsets,
+        records,
+    }
 }
 
 /// Convert `RegCheckpoints` to `FlatRegCheckpoints` (flattened u64 array).
 pub fn reg_checkpoints_to_flat(ckpts: &RegCheckpoints) -> FlatRegCheckpoints {
-    let count = ckpts.snapshots.len() as u32;
+    let count = ckpts.snapshots.len() as u64;
     let mut data = Vec::with_capacity(ckpts.snapshots.len() * REG_COUNT);
     for snap in &ckpts.snapshots {
         data.extend_from_slice(&snap.0);
@@ -76,55 +86,78 @@ pub fn reg_checkpoints_to_flat(ckpts: &RegCheckpoints) -> FlatRegCheckpoints {
 }
 
 /// Convert `DepsStorage` to `FlatDeps` (CSR format with optional patches).
-pub fn deps_to_flat(deps: &DepsStorage) -> FlatDeps {
+pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceError> {
     match deps {
         DepsStorage::Single(cd) => {
             // Single chunk: trivial — chunk starts at line 0, offsets_start=0, data_start=0
             // CompactDeps has N offsets for N rows; DepsView needs N+1 (CSR with sentinel).
             let mut all_offsets = cd.offsets_slice().to_vec();
-            let all_data = cd.data_slice().to_vec();
+            let all_data: Vec<u32> = cd
+                .data_slice()
+                .iter()
+                .map(|&dep| {
+                    super::deps::encode_compact_dep(dep, 0).ok_or_else(|| {
+                        crate::error::TraceError::CacheError(
+                            "dependency line exceeds chunk-local compact range".to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
             // Add sentinel pointing past the last element
-            all_offsets.push(all_data.len() as u32);
-            FlatDeps {
-                chunk_start_lines: vec![0u32],
-                chunk_offsets_start: vec![0u32],
-                chunk_data_start: vec![0u32],
+            all_offsets.push(all_data.len() as u64);
+            Ok(FlatDeps {
+                chunk_start_lines: vec![0u64],
+                chunk_offsets_start: vec![0u64],
+                chunk_data_start: vec![0u64],
                 all_offsets,
                 all_data,
                 patch_lines: vec![],
                 patch_offsets: vec![],
                 patch_data: vec![],
-            }
+            })
         }
-        DepsStorage::Chunked { chunks, chunk_start_lines, patch_groups } => {
+        DepsStorage::Chunked {
+            chunks,
+            chunk_start_lines,
+            patch_groups,
+        } => {
             let num_chunks = chunks.len();
             let mut chunk_offsets_start = Vec::with_capacity(num_chunks);
             let mut chunk_data_start = Vec::with_capacity(num_chunks);
             let mut all_offsets = Vec::new();
             let mut all_data = Vec::new();
 
-            for chunk in chunks {
-                chunk_offsets_start.push(all_offsets.len() as u32);
-                chunk_data_start.push(all_data.len() as u32);
+            for (chunk_id, chunk) in chunks.iter().enumerate() {
+                chunk_offsets_start.push(all_offsets.len() as u64);
+                chunk_data_start.push(all_data.len() as u64);
                 all_offsets.extend_from_slice(chunk.offsets_slice());
                 // Add sentinel pointing past the last element (relative to chunk data start)
-                all_offsets.push(chunk.data_slice().len() as u32);
-                all_data.extend_from_slice(chunk.data_slice());
+                all_offsets.push(chunk.data_slice().len() as u64);
+                let chunk_start = chunk_start_lines[chunk_id];
+                for &dep in chunk.data_slice() {
+                    all_data.push(
+                        super::deps::encode_compact_dep(dep, chunk_start).ok_or_else(|| {
+                            crate::error::TraceError::CacheError(format!(
+                                "chunk {chunk_id} contains a dependency outside the compact local range"
+                            ))
+                        })?,
+                    );
+                }
             }
 
             // Build patch CSR: patch_groups is Vec<(u32, Vec<u32>)> sorted by line
             let mut patch_lines = Vec::with_capacity(patch_groups.len());
             let mut patch_offsets = Vec::with_capacity(patch_groups.len() + 1);
-            let mut patch_data: Vec<u32> = Vec::new();
+            let mut patch_data: Vec<u64> = Vec::new();
 
-            patch_offsets.push(0u32);
+            patch_offsets.push(0u64);
             for (line, deps_vec) in patch_groups {
                 patch_lines.push(*line);
                 patch_data.extend_from_slice(deps_vec);
-                patch_offsets.push(patch_data.len() as u32);
+                patch_offsets.push(patch_data.len() as u64);
             }
 
-            FlatDeps {
+            Ok(FlatDeps {
                 chunk_start_lines: chunk_start_lines.clone(),
                 chunk_offsets_start,
                 chunk_data_start,
@@ -133,7 +166,7 @@ pub fn deps_to_flat(deps: &DepsStorage) -> FlatDeps {
                 patch_lines,
                 patch_offsets,
                 patch_data,
-            }
+            })
         }
     }
 }
@@ -152,7 +185,11 @@ pub fn mem_last_def_to_flat(mld: &MemLastDef) -> FlatMemLastDef {
                 lines.push(*line);
                 values.push(*val);
             }
-            FlatMemLastDef { addrs, lines, values }
+            FlatMemLastDef {
+                addrs,
+                lines,
+                values,
+            }
         }
         MemLastDef::Map(_) => {
             panic!("mem_last_def_to_flat: MemLastDef must be compacted (Sorted) before caching. Call compact() first.");
@@ -161,16 +198,16 @@ pub fn mem_last_def_to_flat(mld: &MemLastDef) -> FlatMemLastDef {
 }
 
 /// Convert `FxHashMap<u32, PairSplitDeps>` to `FlatPairSplit` (sorted CSR).
-pub fn pair_split_to_flat(ps: &FxHashMap<u32, PairSplitDeps>) -> FlatPairSplit {
+pub fn pair_split_to_flat(ps: &FxHashMap<u64, PairSplitDeps>) -> FlatPairSplit {
     // Sort entries by key
-    let mut sorted: Vec<(u32, &PairSplitDeps)> = ps.iter().map(|(&k, v)| (k, v)).collect();
+    let mut sorted: Vec<(u64, &PairSplitDeps)> = ps.iter().map(|(&k, v)| (k, v)).collect();
     sorted.sort_unstable_by_key(|(k, _)| *k);
 
     let n = sorted.len();
     let mut keys = Vec::with_capacity(n);
     // seg_offsets: n*3 + 1 entries
     let mut seg_offsets = Vec::with_capacity(n * 3 + 1);
-    let mut data: Vec<u32> = Vec::new();
+    let mut data: Vec<u64> = Vec::new();
 
     for (key, entry) in &sorted {
         keys.push(*key);
@@ -184,22 +221,26 @@ pub fn pair_split_to_flat(ps: &FxHashMap<u32, PairSplitDeps>) -> FlatPairSplit {
         //   half2    = data[seg_offsets[base+2]  .. seg_offsets[base+3]]
         // So we push 3 offsets per entry (start of shared, start of half1, start of half2)
         // and a final sentinel at the end.
-        seg_offsets.push(data.len() as u32);          // shared start
+        seg_offsets.push(data.len() as u64); // shared start
         data.extend_from_slice(entry.shared.as_slice());
-        seg_offsets.push(data.len() as u32);          // half1 start
+        seg_offsets.push(data.len() as u64); // half1 start
         data.extend_from_slice(entry.half1_deps.as_slice());
-        seg_offsets.push(data.len() as u32);          // half2 start
+        seg_offsets.push(data.len() as u64); // half2 start
         data.extend_from_slice(entry.half2_deps.as_slice());
     }
     // Final sentinel = total data length (the "end" of the last entry's half2)
-    seg_offsets.push(data.len() as u32);
+    seg_offsets.push(data.len() as u64);
 
-    FlatPairSplit { keys, seg_offsets, data }
+    FlatPairSplit {
+        keys,
+        seg_offsets,
+        data,
+    }
 }
 
 /// Convert a `bitvec::BitVec` (Lsb0 order) to `FlatBitVec`.
 pub fn bitvec_to_flat(bv: &bitvec::prelude::BitVec) -> FlatBitVec {
-    let len = bv.len() as u32;
+    let len = bv.len() as u64;
     // as_raw_slice() returns &[usize]; reinterpret as bytes
     let raw: &[usize] = bv.as_raw_slice();
     // SAFETY: usize is valid to reinterpret as bytes; all bits are initialised.
@@ -248,9 +289,39 @@ mod tests {
     #[test]
     fn test_mem_access_round_trip() {
         let mut idx = MemAccessIndex::new();
-        idx.add(0x1000, MemAccessRecord { seq: 0, insn_addr: 0x100, rw: MemRw::Write, data: 0x42, size: 4, data_known: true });
-        idx.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x104, rw: MemRw::Read,  data: 0x43, size: 4, data_known: true });
-        idx.add(0x2000, MemAccessRecord { seq: 10, insn_addr: 0x200, rw: MemRw::Write, data: 0xFF, size: 1, data_known: true });
+        idx.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 0,
+                insn_addr: 0x100,
+                rw: MemRw::Write,
+                data: 0x42,
+                size: 4,
+                data_known: true,
+            },
+        );
+        idx.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 5,
+                insn_addr: 0x104,
+                rw: MemRw::Read,
+                data: 0x43,
+                size: 4,
+                data_known: true,
+            },
+        );
+        idx.add(
+            0x2000,
+            MemAccessRecord {
+                seq: 10,
+                insn_addr: 0x200,
+                rw: MemRw::Write,
+                data: 0xFF,
+                size: 1,
+                data_known: true,
+            },
+        );
 
         let flat = mem_access_to_flat(&idx);
         let view = flat.view();
@@ -280,9 +351,39 @@ mod tests {
     fn test_mem_access_sorted_addrs() {
         let mut idx = MemAccessIndex::new();
         // Insert in non-sorted order
-        idx.add(0x3000, MemAccessRecord { seq: 1, insn_addr: 0x300, rw: MemRw::Read, data: 1, size: 1, data_known: true });
-        idx.add(0x1000, MemAccessRecord { seq: 2, insn_addr: 0x100, rw: MemRw::Read, data: 2, size: 1, data_known: true });
-        idx.add(0x2000, MemAccessRecord { seq: 3, insn_addr: 0x200, rw: MemRw::Read, data: 3, size: 1, data_known: true });
+        idx.add(
+            0x3000,
+            MemAccessRecord {
+                seq: 1,
+                insn_addr: 0x300,
+                rw: MemRw::Read,
+                data: 1,
+                size: 1,
+                data_known: true,
+            },
+        );
+        idx.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 2,
+                insn_addr: 0x100,
+                rw: MemRw::Read,
+                data: 2,
+                size: 1,
+                data_known: true,
+            },
+        );
+        idx.add(
+            0x2000,
+            MemAccessRecord {
+                seq: 3,
+                insn_addr: 0x200,
+                rw: MemRw::Read,
+                data: 3,
+                size: 1,
+                data_known: true,
+            },
+        );
 
         let flat = mem_access_to_flat(&idx);
         // addrs must be sorted for binary search
@@ -310,11 +411,15 @@ mod tests {
         let mut ckpts = RegCheckpoints::new(100);
 
         let mut vals0 = [0u64; RegId::COUNT];
-        for i in 0..RegId::COUNT { vals0[i] = i as u64 * 10; }
+        for i in 0..RegId::COUNT {
+            vals0[i] = i as u64 * 10;
+        }
         ckpts.save_checkpoint(&vals0);
 
         let mut vals1 = [0u64; RegId::COUNT];
-        for i in 0..RegId::COUNT { vals1[i] = i as u64 * 20; }
+        for i in 0..RegId::COUNT {
+            vals1[i] = i as u64 * 20;
+        }
         ckpts.save_checkpoint(&vals1);
 
         let flat = reg_checkpoints_to_flat(&ckpts);
@@ -341,8 +446,11 @@ mod tests {
         // Build a Single DepsStorage with 3 lines
         // Line 0 → [10, 20], Line 1 → [30], Line 2 → []
         let mut cd = CompactDeps::with_capacity(3, 3);
-        cd.start_row(); cd.push_unique(10); cd.push_unique(20);
-        cd.start_row(); cd.push_unique(30);
+        cd.start_row();
+        cd.push_unique(10);
+        cd.push_unique(20);
+        cd.start_row();
+        cd.push_unique(30);
         cd.start_row();
         // finalize sentinel
         // CompactDeps doesn't auto-add sentinel; offsets has 3 entries, data is addressed via row()
@@ -355,15 +463,15 @@ mod tests {
         // So for FlatDeps to work, we need an extra sentinel in all_offsets.
         // Let's add it explicitly.
         let cd_final = CompactDeps::from_raw(
-            vec![0u32, 2, 3, 3], // offsets with sentinel
-            vec![10u32, 20, 30],
+            vec![0u64, 2, 3, 3], // offsets with sentinel
+            vec![10u64, 20, 30],
         );
         let ds = DepsStorage::single(cd_final);
-        let flat = deps_to_flat(&ds);
+        let flat = deps_to_flat(&ds).unwrap();
         let view = flat.view();
-        assert_eq!(view.row(0), &[10u32, 20]);
-        assert_eq!(view.row(1), &[30u32]);
-        assert_eq!(view.row(2), &[] as &[u32]);
+        assert_eq!(view.row(0).as_slice(), &[10u64, 20]);
+        assert_eq!(view.row(1).as_slice(), &[30u64]);
+        assert_eq!(view.row(2).as_slice(), &[] as &[u64]);
     }
 
     #[test]
@@ -371,26 +479,26 @@ mod tests {
         // Chunk 0: lines [0, 1] → offsets [0,3,4], data [1,2,3,4]
         // Chunk 1: lines [5, 6] → offsets [0,2,3], data [7,8,9]
         // patch: line 1 → [100], line 5 → [200, 201]
-        let cd0 = CompactDeps::from_raw(vec![0u32, 3, 4], vec![1u32, 2, 3, 4]);
-        let cd1 = CompactDeps::from_raw(vec![0u32, 2, 3], vec![7u32, 8, 9]);
+        let cd0 = CompactDeps::from_raw(vec![0u64, 3, 4], vec![1u64, 2, 3, 4]);
+        let cd1 = CompactDeps::from_raw(vec![0u64, 2, 3], vec![7u64, 8, 9]);
 
         let ds = DepsStorage::Chunked {
             chunks: vec![cd0, cd1],
-            chunk_start_lines: vec![0u32, 5],
-            patch_groups: vec![(1u32, vec![100u32]), (5u32, vec![200u32, 201])],
+            chunk_start_lines: vec![0u64, 5],
+            patch_groups: vec![(1u64, vec![100u64]), (5u64, vec![200u64, 201])],
         };
 
-        let flat = deps_to_flat(&ds);
+        let flat = deps_to_flat(&ds).unwrap();
         let view = flat.view();
 
-        assert_eq!(view.row(0), &[1u32, 2, 3]);
-        assert_eq!(view.row(1), &[4u32]);
-        assert_eq!(view.row(5), &[7u32, 8]);
-        assert_eq!(view.row(6), &[9u32]);
+        assert_eq!(view.row(0).as_slice(), &[1u64, 2, 3]);
+        assert_eq!(view.row(1).as_slice(), &[4u64]);
+        assert_eq!(view.row(5).as_slice(), &[7u64, 8]);
+        assert_eq!(view.row(6).as_slice(), &[9u64]);
 
-        assert_eq!(view.patch_row(1), &[100u32]);
-        assert_eq!(view.patch_row(5), &[200u32, 201]);
-        assert_eq!(view.patch_row(0), &[] as &[u32]);
+        assert_eq!(view.patch_row(1), &[100u64]);
+        assert_eq!(view.patch_row(5), &[200u64, 201]);
+        assert_eq!(view.patch_row(0), &[] as &[u64]);
     }
 
     // ── mem_last_def ─────────────────────────────────────────────────────────
@@ -428,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_pair_split_empty() {
-        let ps: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
+        let ps: FxHashMap<u64, PairSplitDeps> = FxHashMap::default();
         let flat = pair_split_to_flat(&ps);
         let view = flat.view();
         assert!(!view.contains_key(&0));
@@ -438,30 +546,36 @@ mod tests {
     #[test]
     fn test_pair_split_round_trip() {
         use smallvec::smallvec;
-        let mut ps: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
-        ps.insert(10, PairSplitDeps {
-            shared: smallvec![1, 2],
-            half1_deps: smallvec![3],
-            half2_deps: smallvec![4, 5],
-        });
-        ps.insert(20, PairSplitDeps {
-            shared: smallvec![],
-            half1_deps: smallvec![6],
-            half2_deps: smallvec![],
-        });
+        let mut ps: FxHashMap<u64, PairSplitDeps> = FxHashMap::default();
+        ps.insert(
+            10,
+            PairSplitDeps {
+                shared: smallvec![1, 2],
+                half1_deps: smallvec![3],
+                half2_deps: smallvec![4, 5],
+            },
+        );
+        ps.insert(
+            20,
+            PairSplitDeps {
+                shared: smallvec![],
+                half1_deps: smallvec![6],
+                half2_deps: smallvec![],
+            },
+        );
 
         let flat = pair_split_to_flat(&ps);
         let view = flat.view();
 
         let e10 = view.get(&10).unwrap();
-        assert_eq!(e10.shared, &[1u32, 2]);
-        assert_eq!(e10.half1_deps, &[3u32]);
-        assert_eq!(e10.half2_deps, &[4u32, 5]);
+        assert_eq!(e10.shared, &[1u64, 2]);
+        assert_eq!(e10.half1_deps, &[3u64]);
+        assert_eq!(e10.half2_deps, &[4u64, 5]);
 
         let e20 = view.get(&20).unwrap();
-        assert_eq!(e20.shared, &[] as &[u32]);
-        assert_eq!(e20.half1_deps, &[6u32]);
-        assert_eq!(e20.half2_deps, &[] as &[u32]);
+        assert_eq!(e20.shared, &[] as &[u64]);
+        assert_eq!(e20.half1_deps, &[6u64]);
+        assert_eq!(e20.half2_deps, &[] as &[u64]);
 
         assert!(!view.contains_key(&99));
         assert!(view.get(&99).is_none());
@@ -481,15 +595,17 @@ mod tests {
 
     #[test]
     fn test_bitvec_round_trip() {
-        let bits = [true, false, true, true, false, false, false, true, false, true];
+        let bits = [
+            true, false, true, true, false, false, false, true, false, true,
+        ];
         let mut bv: BitVec = BitVec::new();
         for &b in &bits {
             bv.push(b);
         }
         let flat = bitvec_to_flat(&bv);
-        assert_eq!(flat.len, bits.len() as u32);
+        assert_eq!(flat.len, bits.len() as u64);
         let view = flat.view();
-        assert_eq!(view.len(), bits.len());
+        assert_eq!(view.len(), bits.len() as u64);
         for (i, &expected) in bits.iter().enumerate() {
             assert_eq!(view.get(i), expected, "mismatch at bit {}", i);
         }
@@ -533,10 +649,10 @@ mod tests {
 
         let view = archive.view();
         assert_eq!(view.total_lines(), 3);
-        assert_eq!(view.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(view.get_line(data, 1), Some(b"line1".as_slice()));
-        assert_eq!(view.get_line(data, 2), Some(b"line2".as_slice()));
-        assert_eq!(view.get_line(data, 3), None);
+        assert_eq!(view.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(view.get_line(data, 1u64), Some(b"line1".as_slice()));
+        assert_eq!(view.get_line(data, 2u64), Some(b"line2".as_slice()));
+        assert_eq!(view.get_line(data, 3u64), None);
     }
 
     #[test]
@@ -550,9 +666,9 @@ mod tests {
         let archive = line_index_to_archive(&li);
         let view = archive.view();
         assert_eq!(view.total_lines(), 600);
-        assert_eq!(view.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(view.get_line(data, 255), Some(b"line255".as_slice()));
-        assert_eq!(view.get_line(data, 256), Some(b"line256".as_slice()));
-        assert_eq!(view.get_line(data, 599), Some(b"line599".as_slice()));
+        assert_eq!(view.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(view.get_line(data, 255u64), Some(b"line255".as_slice()));
+        assert_eq!(view.get_line(data, 256u64), Some(b"line256".as_slice()));
+        assert_eq!(view.get_line(data, 599u64), Some(b"line599".as_slice()));
     }
 }

@@ -59,9 +59,7 @@ pub fn determine_def_use(
         // =====================================================================
         // SIMD pure-write: DEF=lo+hi of ops[0], USE=lo+hi of ops[1..]
         // =====================================================================
-        InsnClass::SimdArith
-        | InsnClass::SimdMisc
-        | InsnClass::SimdMove => {
+        InsnClass::SimdArith | InsnClass::SimdMisc | InsnClass::SimdMove => {
             if let Some(rd) = first_reg_non_zero(ops) {
                 expand_simd_full(&mut defs, rd);
             }
@@ -1165,10 +1163,7 @@ mod tests {
         let line = make_line(&[Operand::Reg(RegId::V0), Operand::Reg(RegId::X8)]);
         let (defs, uses) = determine_def_use(InsnClass::SimdLaneLoad, &line);
         assert_eq!(defs.as_slice(), &[RegId::V0, RegId::V0_HI]);
-        assert_eq!(
-            uses.as_slice(),
-            &[RegId::V0, RegId::V0_HI, RegId::X8]
-        ); // V0 lo+hi old + X8 base
+        assert_eq!(uses.as_slice(), &[RegId::V0, RegId::V0_HI, RegId::X8]); // V0 lo+hi old + X8 base
     }
 
     #[test]
@@ -1178,14 +1173,8 @@ mod tests {
             RegId::X9,
         );
         let (defs, uses) = determine_def_use(InsnClass::SimdLaneLoad, &line);
-        assert_eq!(
-            defs.as_slice(),
-            &[RegId::V0, RegId::V0_HI, RegId::X9]
-        ); // V0 lo+hi + writeback
-        assert_eq!(
-            uses.as_slice(),
-            &[RegId::V0, RegId::V0_HI, RegId::X9]
-        ); // V0 lo+hi old + X9 base
+        assert_eq!(defs.as_slice(), &[RegId::V0, RegId::V0_HI, RegId::X9]); // V0 lo+hi + writeback
+        assert_eq!(uses.as_slice(), &[RegId::V0, RegId::V0_HI, RegId::X9]); // V0 lo+hi old + X9 base
     }
 
     #[test]

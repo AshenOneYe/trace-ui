@@ -1,6 +1,6 @@
 use memchr::{memchr, memchr_iter};
 
-const BLOCK_SIZE: u32 = 256;
+const BLOCK_SIZE: u64 = 256;
 
 /// 采样行偏移索引：每 256 行记录一个字节偏移，查找时从最近采样点向前扫描。
 /// 内存占用从 O(n) 降至 O(n/256)。
@@ -9,7 +9,7 @@ pub struct LineIndex {
     /// sampled_offsets[i] = 第 i * BLOCK_SIZE 行的起始字节偏移
     sampled_offsets: Vec<u64>,
     /// 总行数
-    total: u32,
+    total: u64,
 }
 
 /// 增量式行索引构建器。
@@ -18,7 +18,7 @@ pub struct LineIndex {
 /// 最终 `finish()` 生成 LineIndex。
 pub struct LineIndexBuilder {
     sampled_offsets: Vec<u64>,
-    line_count: u32,
+    line_count: u64,
 }
 
 impl LineIndexBuilder {
@@ -51,7 +51,8 @@ impl LineIndexBuilder {
     ///
     /// `start_line` 是全局行号，确保 BLOCK_SIZE (256) 对齐在全局一致。
     /// 仅当 `start_line % BLOCK_SIZE == 0` 时第一次 `add_line` 会记录采样点。
-    pub fn with_start_line(start_line: u32, capacity_hint: usize) -> Self {
+    pub fn with_start_line(start_line: impl Into<u64>, capacity_hint: usize) -> Self {
+        let start_line = start_line.into();
         Self {
             sampled_offsets: Vec::with_capacity(capacity_hint / BLOCK_SIZE as usize + 1),
             line_count: start_line,
@@ -84,7 +85,7 @@ impl LineIndex {
         let data_len = data.len();
         let report_interval = data_len / 100 + 1;
         let mut last_report = 0usize;
-        let mut line_count: u32 = 1; // 从 1 开始，因为第 0 行已经存在
+        let mut line_count: u64 = 1; // 从 1 开始，因为第 0 行已经存在
 
         for pos in memchr_iter(b'\n', data) {
             if (pos + 1) < data_len {
@@ -108,7 +109,7 @@ impl LineIndex {
         }
     }
 
-    pub fn total_lines(&self) -> u32 {
+    pub fn total_lines(&self) -> u64 {
         self.total
     }
 
@@ -120,7 +121,8 @@ impl LineIndex {
     /// 返回指定行号的起始字节偏移（通过采样点 + 向前扫描换行符定位）。
     /// 用于并行搜索时的分块定位。
     #[allow(dead_code)]
-    pub fn line_byte_offset(&self, data: &[u8], seq: u32) -> Option<u64> {
+    pub fn line_byte_offset(&self, data: &[u8], seq: impl Into<u64>) -> Option<u64> {
+        let seq = seq.into();
         if seq >= self.total {
             return None;
         }
@@ -155,7 +157,8 @@ impl LineIndex {
 
     /// 获取指定行的原始字节切片
     #[allow(dead_code)]
-    pub fn get_line<'a>(&self, data: &'a [u8], seq: u32) -> Option<&'a [u8]> {
+    pub fn get_line<'a>(&self, data: &'a [u8], seq: impl Into<u64>) -> Option<&'a [u8]> {
+        let seq = seq.into();
         if seq >= self.total {
             return None;
         }
@@ -195,10 +198,10 @@ mod tests {
         let data = b"line0\nline1\nline2\n";
         let idx = LineIndex::build(data);
         assert_eq!(idx.total_lines(), 3);
-        assert_eq!(idx.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(idx.get_line(data, 1), Some(b"line1".as_slice()));
-        assert_eq!(idx.get_line(data, 2), Some(b"line2".as_slice()));
-        assert_eq!(idx.get_line(data, 3), None);
+        assert_eq!(idx.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(idx.get_line(data, 1u64), Some(b"line1".as_slice()));
+        assert_eq!(idx.get_line(data, 2u64), Some(b"line2".as_slice()));
+        assert_eq!(idx.get_line(data, 3u64), None);
     }
 
     #[test]
@@ -206,7 +209,7 @@ mod tests {
         let data = b"line0\nline1";
         let idx = LineIndex::build(data);
         assert_eq!(idx.total_lines(), 2);
-        assert_eq!(idx.get_line(data, 1), Some(b"line1".as_slice()));
+        assert_eq!(idx.get_line(data, 1u64), Some(b"line1".as_slice()));
     }
 
     #[test]
@@ -215,7 +218,7 @@ mod tests {
         let idx = LineIndex::build(data);
         // 空数据也有 1 行（偏移 0 开始，但内容为空）
         assert_eq!(idx.total_lines(), 1);
-        assert_eq!(idx.get_line(data, 0), Some(b"".as_slice()));
+        assert_eq!(idx.get_line(data, 0u64), Some(b"".as_slice()));
     }
 
     #[test]
@@ -223,7 +226,7 @@ mod tests {
         let data = b"hello world";
         let idx = LineIndex::build(data);
         assert_eq!(idx.total_lines(), 1);
-        assert_eq!(idx.get_line(data, 0), Some(b"hello world".as_slice()));
+        assert_eq!(idx.get_line(data, 0u64), Some(b"hello world".as_slice()));
     }
 
     #[test]
@@ -231,8 +234,8 @@ mod tests {
         let data = b"line0\r\nline1\r\n";
         let idx = LineIndex::build(data);
         assert_eq!(idx.total_lines(), 2);
-        assert_eq!(idx.get_line(data, 0), Some(b"line0".as_slice()));
-        assert_eq!(idx.get_line(data, 1), Some(b"line1".as_slice()));
+        assert_eq!(idx.get_line(data, 0u64), Some(b"line0".as_slice()));
+        assert_eq!(idx.get_line(data, 1u64), Some(b"line1".as_slice()));
     }
 
     #[test]
@@ -247,17 +250,17 @@ mod tests {
         assert_eq!(idx.total_lines(), 300);
 
         // 验证第一个块的首行
-        assert_eq!(idx.get_line(data, 0), Some(b"line0".as_slice()));
+        assert_eq!(idx.get_line(data, 0u64), Some(b"line0".as_slice()));
         // 块边界前一行 (line 255)
-        assert_eq!(idx.get_line(data, 255), Some(b"line255".as_slice()));
+        assert_eq!(idx.get_line(data, 255u64), Some(b"line255".as_slice()));
         // 第二个块的首行 (line 256)
-        assert_eq!(idx.get_line(data, 256), Some(b"line256".as_slice()));
+        assert_eq!(idx.get_line(data, 256u64), Some(b"line256".as_slice()));
         // 第二个块中的行
-        assert_eq!(idx.get_line(data, 257), Some(b"line257".as_slice()));
+        assert_eq!(idx.get_line(data, 257u64), Some(b"line257".as_slice()));
         // 最后一行
-        assert_eq!(idx.get_line(data, 299), Some(b"line299".as_slice()));
+        assert_eq!(idx.get_line(data, 299u64), Some(b"line299".as_slice()));
         // 越界
-        assert_eq!(idx.get_line(data, 300), None);
+        assert_eq!(idx.get_line(data, 300u64), None);
 
         // 验证 sampled_offsets 数量：块 0 和块 1，共 2 个采样点
         assert_eq!(idx.sampled_offsets.len(), 2);
@@ -299,12 +302,12 @@ mod tests {
         }
 
         // 验证一些块内的行
-        assert_eq!(idx.get_line(data, 0), Some(b"L00000".as_slice()));
-        assert_eq!(idx.get_line(data, 128), Some(b"L00128".as_slice()));
-        assert_eq!(idx.get_line(data, 255), Some(b"L00255".as_slice()));
-        assert_eq!(idx.get_line(data, 256), Some(b"L00256".as_slice()));
-        assert_eq!(idx.get_line(data, 9999), Some(b"L09999".as_slice()));
-        assert_eq!(idx.get_line(data, 10000), None);
+        assert_eq!(idx.get_line(data, 0u64), Some(b"L00000".as_slice()));
+        assert_eq!(idx.get_line(data, 128u64), Some(b"L00128".as_slice()));
+        assert_eq!(idx.get_line(data, 255u64), Some(b"L00255".as_slice()));
+        assert_eq!(idx.get_line(data, 256u64), Some(b"L00256".as_slice()));
+        assert_eq!(idx.get_line(data, 9999u64), Some(b"L09999".as_slice()));
+        assert_eq!(idx.get_line(data, 10000u64), None);
     }
 
     #[test]
@@ -326,7 +329,11 @@ mod tests {
                 .map(|p| pos + p)
                 .unwrap_or(data.len());
             builder.add_line(pos as u64);
-            pos = if line_end < data.len() { line_end + 1 } else { data.len() };
+            pos = if line_end < data.len() {
+                line_end + 1
+            } else {
+                data.len()
+            };
         }
         let built = builder.finish();
 

@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use super::TraceEngine;
 use crate::api_types::{ExportConfig, SliceOptions, SliceResult};
 use crate::error::{Result, TraceError};
 use crate::flat::line_index::LineIndexView;
@@ -7,13 +8,12 @@ use crate::flat::mem_last_def::MemLastDefView;
 use crate::query::slice::{bfs_slice, bfs_slice_with_options};
 use crate::scanner::{RegLastDef, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
 use crate::session::SliceOrigin;
-use super::TraceEngine;
-use trace_parser::types::{parse_reg, RegId, TraceFormat};
-use trace_parser::insn_class::InsnClass;
-use trace_parser::{parser, insn_class, def_use};
 use trace_parser::gumtrace as gumtrace_parser;
+use trace_parser::insn_class::InsnClass;
+use trace_parser::types::{parse_reg, RegId, TraceFormat};
+use trace_parser::{def_use, insn_class, parser};
 
-const MAX_RESOLVE_SCAN: u32 = 50000;
+const MAX_RESOLVE_SCAN: u64 = 50_000;
 
 /// 解析 from_spec 字符串并找到 BFS 起点行号
 pub(crate) fn resolve_start_index(
@@ -23,26 +23,29 @@ pub(crate) fn resolve_start_index(
     mmap: &[u8],
     line_index: &LineIndexView<'_>,
     format: TraceFormat,
-) -> std::result::Result<u32, String> {
+) -> std::result::Result<u64, String> {
     if let Some(rest) = spec.strip_prefix("reg:") {
-        let (name, suffix) = rest.rsplit_once('@')
+        let (name, suffix) = rest
+            .rsplit_once('@')
             .ok_or_else(|| format!("缺少 @ 分隔符: {}", spec))?;
-        let reg = parse_reg(&name.to_lowercase())
-            .ok_or_else(|| format!("未知寄存器: {}", name))?;
+        let reg = parse_reg(&name.to_lowercase()).ok_or_else(|| format!("未知寄存器: {}", name))?;
 
         if suffix == "last" {
-            reg_last_def.get(&reg)
+            reg_last_def
+                .get(&reg)
                 .copied()
                 .ok_or_else(|| format!("寄存器 {} 在 trace 中从未被定义", name))
         } else {
-            let line: u32 = suffix.parse::<u32>()
+            let line: u64 = suffix
+                .parse::<u64>()
                 .map_err(|_| format!("无效行号: {}", suffix))?
                 .checked_sub(1)
                 .ok_or("行号必须 >= 1".to_string())?;
             resolve_reg_def(reg, line, mmap, line_index, format)
         }
     } else if let Some(rest) = spec.strip_prefix("mem:") {
-        let (addr_str, suffix) = rest.rsplit_once('@')
+        let (addr_str, suffix) = rest
+            .rsplit_once('@')
             .ok_or_else(|| format!("缺少 @ 分隔符: {}", spec))?;
         let addr_hex = addr_str.strip_prefix("0x").unwrap_or(addr_str);
         // Strip optional ":SIZE" suffix (e.g. "bffff010:4" -> "bffff010")
@@ -51,28 +54,33 @@ pub(crate) fn resolve_start_index(
             .map_err(|_| format!("无效十六进制地址: {}", addr_str))?;
 
         if suffix == "last" {
-            mem_last_def.get(&addr)
+            mem_last_def
+                .get(&addr)
                 .map(|(line, _)| line)
                 .ok_or_else(|| format!("地址 0x{:x} 在 trace 中从未被写入", addr))
         } else {
-            let line: u32 = suffix.parse::<u32>()
+            let line: u64 = suffix
+                .parse::<u64>()
                 .map_err(|_| format!("无效行号: {}", suffix))?
                 .checked_sub(1)
                 .ok_or("行号必须 >= 1".to_string())?;
             resolve_mem_store(addr, line, mmap, line_index, format)
         }
     } else {
-        Err(format!("不支持的 spec 格式: {} (需要 reg:NAME@... 或 mem:ADDR@...)", spec))
+        Err(format!(
+            "不支持的 spec 格式: {} (需要 reg:NAME@... 或 mem:ADDR@...)",
+            spec
+        ))
     }
 }
 
 fn resolve_reg_def(
     target_reg: RegId,
-    from_line: u32,
+    from_line: u64,
     mmap: &[u8],
     line_index: &LineIndexView<'_>,
     format: TraceFormat,
-) -> std::result::Result<u32, String> {
+) -> std::result::Result<u64, String> {
     let scan_start = from_line.saturating_sub(MAX_RESOLVE_SCAN);
     for s in (scan_start..=from_line).rev() {
         if let Some(raw) = line_index.get_line(mmap, s) {
@@ -90,7 +98,11 @@ fn resolve_reg_def(
                         // This mirrors the logic in scanner.rs Step 4.
                         if cls == InsnClass::LoadPair {
                             let has_base_wb = parsed.writeback && parsed.base_reg.is_some();
-                            let data_defs = if has_base_wb { &defs[..defs.len() - 1] } else { &defs[..] };
+                            let data_defs = if has_base_wb {
+                                &defs[..defs.len() - 1]
+                            } else {
+                                &defs[..]
+                            };
                             let mid = data_defs.len() / 2;
                             if data_defs[mid..].iter().any(|r| *r == target_reg) {
                                 return Ok(s | PAIR_HALF2_BIT);
@@ -107,16 +119,19 @@ fn resolve_reg_def(
             }
         }
     }
-    Err(format!("在 {} 行范围内未找到寄存器 {:?} 的 DEF", MAX_RESOLVE_SCAN, target_reg))
+    Err(format!(
+        "在 {} 行范围内未找到寄存器 {:?} 的 DEF",
+        MAX_RESOLVE_SCAN, target_reg
+    ))
 }
 
 fn resolve_mem_store(
     target_addr: u64,
-    from_line: u32,
+    from_line: u64,
     mmap: &[u8],
     line_index: &LineIndexView<'_>,
     format: TraceFormat,
-) -> std::result::Result<u32, String> {
+) -> std::result::Result<u64, String> {
     let scan_start = from_line.saturating_sub(MAX_RESOLVE_SCAN);
     for s in (scan_start..=from_line).rev() {
         if let Some(raw) = line_index.get_line(mmap, s) {
@@ -138,7 +153,10 @@ fn resolve_mem_store(
             }
         }
     }
-    Err(format!("在 {} 行范围内未找到地址 0x{:x} 的 STORE", MAX_RESOLVE_SCAN, target_addr))
+    Err(format!(
+        "在 {} 行范围内未找到地址 0x{:x} 的 STORE",
+        MAX_RESOLVE_SCAN, target_addr
+    ))
 }
 
 impl TraceEngine {
@@ -148,24 +166,26 @@ impl TraceEngine {
         from_specs: &[String],
         options: SliceOptions,
     ) -> Result<SliceResult> {
+        let _query_lease = self.acquire_query_lease()?;
         // Phase 1: read lock — resolve specs, run BFS, apply range filter
         let marked = {
             let handle = self.get_handle(session_id)?;
-            let state = handle.state.read()
+            let state = handle
+                .state
+                .read()
                 .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-            let reg_last_def = state.reg_last_def.as_ref()
+            let reg_last_def = state
+                .reg_last_def
+                .as_ref()
                 .ok_or(TraceError::IndexNotReady)?;
-            let mem_last_def = state.mem_last_def_view()
-                .ok_or(TraceError::IndexNotReady)?;
-            let scan_view = state.scan_view()
-                .ok_or(TraceError::IndexNotReady)?;
+            let mem_last_def = state.mem_last_def_view().ok_or(TraceError::IndexNotReady)?;
+            let scan_view = state.scan_view().ok_or(TraceError::IndexNotReady)?;
             let format = state.trace_format;
 
             let mut start_indices = Vec::new();
             for spec in from_specs {
-                let lidx_view = state.line_index_view()
-                    .ok_or(TraceError::IndexNotReady)?;
+                let lidx_view = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
                 let idx = resolve_start_index(
                     spec,
                     reg_last_def,
@@ -173,7 +193,8 @@ impl TraceEngine {
                     &state.mmap,
                     &lidx_view,
                     format,
-                ).map_err(|e| TraceError::InvalidArgument(e))?;
+                )
+                .map_err(|e| TraceError::InvalidArgument(e))?;
                 start_indices.push(idx);
             }
 
@@ -196,8 +217,8 @@ impl TraceEngine {
             marked
         };
 
-        let marked_count = marked.count_ones() as u32;
-        let total_lines = marked.len() as u32;
+        let marked_count = marked.count_ones() as u64;
+        let total_lines = marked.len() as u64;
         let percentage = if total_lines > 0 {
             marked_count as f64 / total_lines as f64 * 100.0
         } else {
@@ -207,7 +228,9 @@ impl TraceEngine {
         // Phase 2: write lock — store result + slice_origin
         {
             let handle = self.get_handle(session_id)?;
-            let mut state = handle.state.write()
+            let mut state = handle
+                .state
+                .write()
                 .map_err(|e| TraceError::Internal(e.to_string()))?;
             state.slice_result = Some(marked);
             state.slice_origin = Some(SliceOrigin {
@@ -218,12 +241,18 @@ impl TraceEngine {
             });
         }
 
-        Ok(SliceResult { marked_count, total_lines, percentage })
+        Ok(SliceResult {
+            marked_count,
+            total_lines,
+            percentage,
+        })
     }
 
     pub fn clear_slice(&self, session_id: &str) -> Result<()> {
         let handle = self.get_handle(session_id)?;
-        let mut state = handle.state.write()
+        let mut state = handle
+            .state
+            .write()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
         state.slice_result = None;
         state.slice_origin = None;
@@ -232,18 +261,22 @@ impl TraceEngine {
 
     pub fn get_slice_origin(&self, session_id: &str) -> Result<Option<SliceOrigin>> {
         let handle = self.get_handle(session_id)?;
-        let state = handle.state.read()
+        let state = handle
+            .state
+            .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
         Ok(state.slice_origin.clone())
     }
 
-    pub fn get_tainted_seqs(&self, session_id: &str) -> Result<Vec<u32>> {
+    pub fn get_tainted_seqs(&self, session_id: &str) -> Result<Vec<u64>> {
         let handle = self.get_handle(session_id)?;
-        let state = handle.state.read()
+        let state = handle
+            .state
+            .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
         match &state.slice_result {
-            Some(marked) => Ok(marked.iter_ones().map(|i| i as u32).collect()),
+            Some(marked) => Ok(marked.iter_ones().map(|i| i as u64).collect()),
             None => Ok(vec![]),
         }
     }
@@ -251,16 +284,18 @@ impl TraceEngine {
     pub fn get_slice_status(
         &self,
         session_id: &str,
-        start_seq: u32,
-        count: u32,
+        start_seq: u64,
+        count: u64,
     ) -> Result<Vec<bool>> {
         let handle = self.get_handle(session_id)?;
-        let state = handle.state.read()
+        let state = handle
+            .state
+            .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
         match &state.slice_result {
             Some(marked) => {
-                let total = marked.len() as u32;
+                let total = marked.len() as u64;
                 let end = (start_seq + count).min(total);
                 Ok((start_seq..end).map(|i| marked[i as usize]).collect())
             }
@@ -276,35 +311,39 @@ impl TraceEngine {
         config: ExportConfig,
     ) -> Result<()> {
         let handle = self.get_handle(session_id)?;
-        let state = handle.state.read()
+        let state = handle
+            .state
+            .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let marked = state.slice_result.as_ref()
+        let marked = state
+            .slice_result
+            .as_ref()
             .ok_or_else(|| TraceError::InvalidArgument("没有活跃的污点分析结果".to_string()))?;
-        let line_index = state.line_index_view()
-            .ok_or(TraceError::IndexNotReady)?;
+        let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
 
         // Fallback: if from_specs is empty, use stored slice_origin
         let actual_from_specs = if config.from_specs.is_empty() {
-            state.slice_origin.as_ref()
+            state
+                .slice_origin
+                .as_ref()
                 .map(|o| o.from_specs.clone())
                 .unwrap_or_default()
         } else {
             config.from_specs
         };
 
-        let marked_count = marked.count_ones() as u32;
-        let total_lines = marked.len() as u32;
+        let marked_count = marked.count_ones() as u64;
+        let total_lines = marked.len() as u64;
 
-        let file = std::fs::File::create(output_path)
-            .map_err(|e| TraceError::Io(e))?;
+        let file = std::fs::File::create(output_path).map_err(|e| TraceError::Io(e))?;
         let mut writer = std::io::BufWriter::new(file);
 
         if format == "json" {
             // 收集污点行
             let mut tainted_lines = Vec::with_capacity(marked_count as usize);
             for seq in marked.iter_ones() {
-                if let Some(raw) = line_index.get_line(&state.mmap, seq as u32) {
+                if let Some(raw) = line_index.get_line(&state.mmap, seq as u64) {
                     let text = String::from_utf8_lossy(raw);
                     tainted_lines.push(serde_json::json!({
                         "seq": seq + 1,
@@ -341,11 +380,9 @@ impl TraceEngine {
         } else {
             // TXT: 纯污点行原文
             for seq in marked.iter_ones() {
-                if let Some(raw) = line_index.get_line(&state.mmap, seq as u32) {
-                    writer.write_all(raw)
-                        .map_err(|e| TraceError::Io(e))?;
-                    writer.write_all(b"\n")
-                        .map_err(|e| TraceError::Io(e))?;
+                if let Some(raw) = line_index.get_line(&state.mmap, seq as u64) {
+                    writer.write_all(raw).map_err(|e| TraceError::Io(e))?;
+                    writer.write_all(b"\n").map_err(|e| TraceError::Io(e))?;
                 }
             }
         }

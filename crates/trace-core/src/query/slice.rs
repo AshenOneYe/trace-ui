@@ -5,10 +5,10 @@ use anyhow::Result;
 use bitvec::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::scanner::{PAIR_HALF2_BIT, PAIR_SHARED_BIT, CONTROL_DEP_BIT, LINE_MASK};
-use crate::flat::scan_view::ScanView;
-use crate::flat::pair_split::PairSplitView;
 use crate::flat::bitvec::BitView;
+use crate::flat::pair_split::PairSplitView;
+use crate::flat::scan_view::ScanView;
+use crate::scanner::{CONTROL_DEP_BIT, LINE_MASK, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
 
 /// BFS backward slice: given starting line indices, mark all transitively
 /// reachable lines in the dependency graph.
@@ -19,22 +19,29 @@ use crate::flat::bitvec::BitView;
 /// - no tag: arrive via first half of pair instruction
 ///
 /// Returns a bitvec where `marked[i] == true` means line `i` is in the slice.
-pub fn bfs_slice(view: &ScanView, start_indices: &[u32]) -> BitVec {
+pub fn bfs_slice(view: &ScanView, start_indices: &[u64]) -> BitVec {
     bfs_slice_with_options(view, start_indices, false)
 }
 
 /// BFS backward slice with options.
 /// When `data_only` is true, control dependency edges (tagged with CONTROL_DEP_BIT) are skipped.
-pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u32], data_only: bool) -> BitVec {
+pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u64], data_only: bool) -> BitVec {
     let n = view.line_count as usize;
     let mut marked = bitvec![0; n];
-    let mut queue: VecDeque<u32> = VecDeque::new();
+    let mut queue: VecDeque<u64> = VecDeque::new();
     // For pair lines: bit 0 = half1 visited, bit 1 = half2 visited, bit 2 = shared visited
-    let mut pair_visited: FxHashMap<u32, u8> = FxHashMap::default();
+    let mut pair_visited: FxHashMap<u64, u8> = FxHashMap::default();
 
     // Seed the BFS (start_indices may carry tag bits)
     for &raw in start_indices {
-        enqueue_dep(raw, n, &mut queue, &mut marked, &mut pair_visited, &view.pair_split);
+        enqueue_dep(
+            raw,
+            n,
+            &mut queue,
+            &mut marked,
+            &mut pair_visited,
+            &view.pair_split,
+        );
     }
 
     // BFS: follow dependency edges backward
@@ -46,14 +53,32 @@ pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u32], data_only:
             if (raw & PAIR_SHARED_BIT) != 0 {
                 // Shared arrival (via writeback base): follow only shared deps
                 for &dep in split.shared {
-                    if data_only && (dep & CONTROL_DEP_BIT) != 0 { continue; }
-                    enqueue_dep(dep, n, &mut queue, &mut marked, &mut pair_visited, &view.pair_split);
+                    if data_only && (dep & CONTROL_DEP_BIT) != 0 {
+                        continue;
+                    }
+                    enqueue_dep(
+                        dep,
+                        n,
+                        &mut queue,
+                        &mut marked,
+                        &mut pair_visited,
+                        &view.pair_split,
+                    );
                 }
             } else {
                 // Data arrival: follow shared + relevant half deps
                 for &dep in split.shared {
-                    if data_only && (dep & CONTROL_DEP_BIT) != 0 { continue; }
-                    enqueue_dep(dep, n, &mut queue, &mut marked, &mut pair_visited, &view.pair_split);
+                    if data_only && (dep & CONTROL_DEP_BIT) != 0 {
+                        continue;
+                    }
+                    enqueue_dep(
+                        dep,
+                        n,
+                        &mut queue,
+                        &mut marked,
+                        &mut pair_visited,
+                        &view.pair_split,
+                    );
                 }
                 let half_deps = if (raw & PAIR_HALF2_BIT) != 0 {
                     split.half2_deps
@@ -61,14 +86,35 @@ pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u32], data_only:
                     split.half1_deps
                 };
                 for &dep in half_deps {
-                    enqueue_dep(dep, n, &mut queue, &mut marked, &mut pair_visited, &view.pair_split);
+                    enqueue_dep(
+                        dep,
+                        n,
+                        &mut queue,
+                        &mut marked,
+                        &mut pair_visited,
+                        &view.pair_split,
+                    );
                 }
             }
         } else {
             // Non-pair instruction: follow all deps (deps may carry tags)
-            for &dep in view.deps.row(line as usize).iter().chain(view.deps.patch_row(line as usize).iter()) {
-                if data_only && (dep & CONTROL_DEP_BIT) != 0 { continue; }
-                enqueue_dep(dep, n, &mut queue, &mut marked, &mut pair_visited, &view.pair_split);
+            for &dep in view
+                .deps
+                .row(line)
+                .iter()
+                .chain(view.deps.patch_row(line).iter())
+            {
+                if data_only && (dep & CONTROL_DEP_BIT) != 0 {
+                    continue;
+                }
+                enqueue_dep(
+                    dep,
+                    n,
+                    &mut queue,
+                    &mut marked,
+                    &mut pair_visited,
+                    &view.pair_split,
+                );
             }
         }
     }
@@ -81,11 +127,11 @@ pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u32], data_only:
 /// For pair lines, tracks half1/half2/shared visits separately via `pair_visited`.
 /// For non-pair lines, uses the `marked` bitvec to prevent re-visits.
 fn enqueue_dep(
-    raw: u32,
+    raw: u64,
     n: usize,
-    queue: &mut VecDeque<u32>,
+    queue: &mut VecDeque<u64>,
     marked: &mut BitVec,
-    pair_visited: &mut FxHashMap<u32, u8>,
+    pair_visited: &mut FxHashMap<u64, u8>,
     pair_split: &PairSplitView,
 ) {
     let line = raw & LINE_MASK;
@@ -146,7 +192,7 @@ pub fn write_sliced_bytes<W: Write>(
 
         if line_idx < marked.len() && marked[line_idx] {
             writer.write_all(&data[pos..end])?;
-            if line_idx < init_mem_loads.len() && init_mem_loads.get(line_idx) {
+            if (line_idx as u64) < init_mem_loads.len() && init_mem_loads.get(line_idx) {
                 writer.write_all(b" ; [INIT_MEM]")?;
             }
             writer.write_all(b"\n")?;
@@ -172,13 +218,15 @@ pub fn write_sliced_from_string<W: Write>(
 }
 
 #[cfg(test)]
-fn state_to_scan_view(state: &crate::scanner::ScanState) -> (
+fn state_to_scan_view(
+    state: &crate::scanner::ScanState,
+) -> (
     crate::flat::deps::FlatDeps,
     crate::flat::pair_split::FlatPairSplit,
     crate::flat::bitvec::FlatBitVec,
 ) {
     use crate::flat::convert;
-    let deps = convert::deps_to_flat(&state.deps);
+    let deps = convert::deps_to_flat(&state.deps).expect("deps should fit compact cache format");
     let pair_split = convert::pair_split_to_flat(&state.pair_split);
     let init_mem_loads = convert::bitvec_to_flat(&state.init_mem_loads);
     (deps, pair_split, init_mem_loads)
@@ -204,11 +252,11 @@ mod tests {
         .join("\n");
 
         let state = scanner::scan_from_string(&trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
-            
+
             line_count: state.line_count,
         };
         let start = vec![*state.reg_last_def.get(&RegId::X0).unwrap()];
@@ -233,7 +281,7 @@ mod tests {
         .join("\n");
 
         let state = scanner::scan_from_string(&trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
@@ -261,7 +309,7 @@ mod tests {
         .join("\n");
 
         let state = scanner::scan_from_string(&trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
@@ -290,7 +338,7 @@ mod tests {
         .join("\n");
 
         let state = scanner::scan_from_string(&trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
@@ -318,13 +366,13 @@ mod tests {
         let trace = r#"[00:00:00 001][lib.so 0x100] [d2800108] 0x40000100: "mov x0, #5" => x0=0x5"#;
 
         let state = scanner::scan_from_string(trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
             line_count: state.line_count,
         };
-        let start = vec![0u32];
+        let start = vec![0u64];
         let marked = bfs_slice(&view, &start);
 
         assert_eq!(marked.len(), 1);
@@ -340,7 +388,7 @@ mod tests {
         let trace = r#"[00:00:00 001][lib.so 0x100] [d2800108] 0x40000100: "mov x0, #5" => x0=0x5"#;
 
         let state = scanner::scan_from_string(trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
@@ -375,7 +423,8 @@ mod tests {
         let marked = bfs_slice(&view, &start);
 
         let mut output = Vec::new();
-        let count = write_sliced_from_string(&trace, &marked, &init_mem_loads.view(), &mut output).unwrap();
+        let count =
+            write_sliced_from_string(&trace, &marked, &init_mem_loads.view(), &mut output).unwrap();
 
         assert_eq!(count, 2); // mov x8 + mov x0 (x15 excluded)
         let output_str = String::from_utf8(output).unwrap();
@@ -403,7 +452,7 @@ mod tests {
         .join("\n");
 
         let state = scanner::scan_from_string(&trace, false).unwrap();
-        let (deps, pair_split, init_mem_loads) = state_to_scan_view(&state);
+        let (deps, pair_split, _init_mem_loads) = state_to_scan_view(&state);
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
@@ -433,13 +482,16 @@ mod tests {
             pair_split: pair_split.view(),
             line_count: state.line_count,
         };
-        let start = vec![0u32];
+        let start = vec![0u64];
         let marked = bfs_slice(&view, &start);
 
         let mut output = Vec::new();
         write_sliced_from_string(trace, &marked, &init_mem_loads.view(), &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
-        assert!(output_str.contains("; [INIT_MEM]"), "should have INIT_MEM annotation");
+        assert!(
+            output_str.contains("; [INIT_MEM]"),
+            "should have INIT_MEM annotation"
+        );
     }
 
     // =========================================================================
@@ -466,6 +518,9 @@ mod tests {
         let mut output = Vec::new();
         write_sliced_from_string(&trace, &marked, &init_mem_loads.view(), &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
-        assert!(!output_str.contains("; [INIT_MEM]"), "should NOT have INIT_MEM annotation for stored memory");
+        assert!(
+            !output_str.contains("; [INIT_MEM]"),
+            "should NOT have INIT_MEM annotation for stored memory"
+        );
     }
 }

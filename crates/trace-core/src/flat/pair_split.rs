@@ -1,7 +1,7 @@
 pub struct FlatPairSplit {
-    pub keys: Vec<u32>,        // sorted line numbers
-    pub seg_offsets: Vec<u32>, // len = keys.len() * 3 + 1 (sentinel)
-    pub data: Vec<u32>,
+    pub keys: Vec<u64>,        // sorted line numbers
+    pub seg_offsets: Vec<u64>, // len = keys.len() * 3 + 1 (sentinel)
+    pub data: Vec<u64>,
 }
 
 impl FlatPairSplit {
@@ -15,24 +15,28 @@ impl FlatPairSplit {
 }
 
 pub struct PairSplitView<'a> {
-    keys: &'a [u32],
-    seg_offsets: &'a [u32],
-    data: &'a [u32],
+    keys: &'a [u64],
+    seg_offsets: &'a [u64],
+    data: &'a [u64],
 }
 
 pub struct PairSplitEntry<'a> {
-    pub shared: &'a [u32],
-    pub half1_deps: &'a [u32],
-    pub half2_deps: &'a [u32],
+    pub shared: &'a [u64],
+    pub half1_deps: &'a [u64],
+    pub half2_deps: &'a [u64],
 }
 
 impl<'a> PairSplitView<'a> {
-    pub fn from_raw(keys: &'a [u32], seg_offsets: &'a [u32], data: &'a [u32]) -> Self {
-        Self { keys, seg_offsets, data }
+    pub fn from_raw(keys: &'a [u64], seg_offsets: &'a [u64], data: &'a [u64]) -> Self {
+        Self {
+            keys,
+            seg_offsets,
+            data,
+        }
     }
 
     /// Binary search keys, return entry with 3 slices if found.
-    pub fn get(&self, key: &u32) -> Option<PairSplitEntry<'a>> {
+    pub fn get(&self, key: &u64) -> Option<PairSplitEntry<'a>> {
         let idx = self.keys.binary_search(key).ok()?;
         // seg_offsets layout: [shared_start, half1_start, half2_start, sentinel] per entry
         // base = idx * 3
@@ -49,7 +53,7 @@ impl<'a> PairSplitView<'a> {
     }
 
     /// Return true if the key exists.
-    pub fn contains_key(&self, key: &u32) -> bool {
+    pub fn contains_key(&self, key: &u64) -> bool {
         self.keys.binary_search(key).is_ok()
     }
 }
@@ -92,9 +96,9 @@ mod tests {
         let view = flat.view();
 
         let e = view.get(&10).unwrap();
-        assert_eq!(e.shared, &[1u32, 2]);
-        assert_eq!(e.half1_deps, &[3u32]);
-        assert_eq!(e.half2_deps, &[4u32, 5]);
+        assert_eq!(e.shared, &[1u64, 2]);
+        assert_eq!(e.half1_deps, &[3u64]);
+        assert_eq!(e.half2_deps, &[4u64, 5]);
     }
 
     #[test]
@@ -103,9 +107,9 @@ mod tests {
         let view = flat.view();
 
         let e = view.get(&20).unwrap();
-        assert_eq!(e.shared, &[] as &[u32]);
-        assert_eq!(e.half1_deps, &[6u32]);
-        assert_eq!(e.half2_deps, &[] as &[u32]);
+        assert_eq!(e.shared, &[] as &[u64]);
+        assert_eq!(e.half1_deps, &[6u64]);
+        assert_eq!(e.half2_deps, &[] as &[u64]);
     }
 
     #[test]

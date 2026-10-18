@@ -1,16 +1,17 @@
-use crate::error::{TraceError, Result};
-use crate::api_types::{TraceLine, CallInfoDto};
+use crate::api_types::{CallInfoDto, TraceLine};
+use crate::error::{Result, TraceError};
 use crate::scan_unified::bytes_to_hex_escaped;
 use trace_parser::types::TraceFormat;
 
 impl super::TraceEngine {
-    pub fn get_lines(&self, session_id: &str, seqs: &[u32]) -> Result<Vec<TraceLine>> {
+    pub fn get_lines(&self, session_id: &str, seqs: &[u64]) -> Result<Vec<TraceLine>> {
         let handle = self.get_handle(session_id)?;
-        let state = handle.state.read()
+        let state = handle
+            .state
+            .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let line_index = state.line_index_view()
-            .ok_or(TraceError::IndexNotReady)?;
+        let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
         let format = state.trace_format;
 
         let mut results = Vec::with_capacity(seqs.len());
@@ -71,9 +72,11 @@ impl super::TraceEngine {
         Ok(results)
     }
 
-    pub fn get_consumed_seqs(&self, session_id: &str) -> Result<Vec<u32>> {
+    pub fn get_consumed_seqs(&self, session_id: &str) -> Result<Vec<u64>> {
         let handle = self.get_handle(session_id)?;
-        let state = handle.state.read()
+        let state = handle
+            .state
+            .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
         Ok(state.consumed_seqs.clone())
     }

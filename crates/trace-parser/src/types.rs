@@ -139,13 +139,19 @@ impl RegId {
     }
 
     /// True if this is a SIMD lo-lane (v0..v31, IDs 33-64).
-    pub fn is_simd_lo(self) -> bool { self.0 >= 33 && self.0 <= 64 }
+    pub fn is_simd_lo(self) -> bool {
+        self.0 >= 33 && self.0 <= 64
+    }
 
     /// True if this is a SIMD hi-lane (v0_hi..v31_hi, IDs 66-97).
-    pub fn is_simd_hi(self) -> bool { self.0 >= 66 && self.0 <= 97 }
+    pub fn is_simd_hi(self) -> bool {
+        self.0 >= 66 && self.0 <= 97
+    }
 
     /// True if this is any SIMD register (lo or hi lane).
-    pub fn is_simd(self) -> bool { self.is_simd_lo() || self.is_simd_hi() }
+    pub fn is_simd(self) -> bool {
+        self.is_simd_lo() || self.is_simd_hi()
+    }
 }
 
 impl fmt::Debug for RegId {

@@ -1,17 +1,17 @@
 use crate::query::call_tree::CallTree;
 use crate::scanner::RegLastDef;
-use trace_parser::types::RegId;
-use std::sync::Arc;
 use memmap2::Mmap;
+use std::sync::Arc;
+use trace_parser::types::RegId;
 
-use super::cache_format::{SectionWriter, SectionReader};
+use super::bitvec::{BitView, FlatBitVec};
+use super::cache_format::{SectionReader, SectionWriter};
+use super::deps::{DepsView, FlatDeps};
+use super::line_index::{LineIndexArchive, LineIndexView};
 use super::mem_access::{FlatMemAccess, MemAccessView};
-use super::reg_checkpoints::{FlatRegCheckpoints, RegCheckpointsView};
-use super::deps::{FlatDeps, DepsView};
 use super::mem_last_def::{FlatMemLastDef, MemLastDefView};
 use super::pair_split::{FlatPairSplit, PairSplitView};
-use super::bitvec::{FlatBitVec, BitView};
-use super::line_index::{LineIndexArchive, LineIndexView};
+use super::reg_checkpoints::{FlatRegCheckpoints, RegCheckpointsView};
 use super::scan_view::ScanView;
 
 pub const HEADER_LEN: usize = 64;
@@ -29,16 +29,16 @@ impl Phase2Archive {
     pub fn to_sections(&self) -> Vec<u8> {
         let mut w = SectionWriter::new();
         // MemAccess: sections 0-2
-        w.write_slice(&self.mem_accesses.addrs);      // 0
-        w.write_slice(&self.mem_accesses.offsets);     // 1
-        w.write_slice(&self.mem_accesses.records);     // 2
-        // RegCheckpoints: sections 3-5
-        w.write_u32(self.reg_checkpoints.interval);    // 3
-        w.write_u32(self.reg_checkpoints.count);       // 4
-        w.write_slice(&self.reg_checkpoints.data);     // 5
-        // CallTree: section 6 (bincode, eagerly deserialized on load)
+        w.write_slice(&self.mem_accesses.addrs); // 0
+        w.write_slice(&self.mem_accesses.offsets); // 1
+        w.write_slice(&self.mem_accesses.records); // 2
+                                                   // RegCheckpoints: sections 3-5
+        w.write_u64(self.reg_checkpoints.interval); // 3
+        w.write_u64(self.reg_checkpoints.count); // 4
+        w.write_slice(&self.reg_checkpoints.data); // 5
+                                                   // CallTree: section 6 (bincode, eagerly deserialized on load)
         let ct_bytes = bincode::serialize(&self.call_tree).unwrap();
-        w.write_bytes(&ct_bytes);                      // 6
+        w.write_bytes(&ct_bytes); // 6
         w.finish()
     }
 
@@ -46,14 +46,12 @@ impl Phase2Archive {
     /// `data` = &mmap[HEADER_LEN..] (after 64-byte cache header)
     pub fn views_from_sections(data: &[u8]) -> Option<Phase2Views<'_>> {
         let r = SectionReader::new(data)?;
-        if r.num_sections() < 7 { return None; }
+        if r.num_sections() < 7 {
+            return None;
+        }
         Some(Phase2Views {
-            mem_accesses: MemAccessView::from_raw(
-                r.slice(0), r.slice(1), r.slice(2),
-            ),
-            reg_checkpoints: RegCheckpointsView::from_raw(
-                r.u32_val(3), r.u32_val(4), r.slice(5),
-            ),
+            mem_accesses: MemAccessView::from_raw(r.slice(0), r.slice(1), r.slice(2)),
+            reg_checkpoints: RegCheckpointsView::from_raw(r.u64_val(3), r.u64_val(4), r.slice(5)),
             call_tree_bytes: r.bytes(6),
         })
     }
@@ -72,65 +70,66 @@ pub struct ScanArchive {
     pub mem_last_def: FlatMemLastDef,
     pub pair_split: FlatPairSplit,
     pub init_mem_loads: FlatBitVec,
-    pub reg_last_def_inner: Vec<u32>, // [u32; 98] serialized as Vec
-    pub line_count: u32,
-    pub parsed_count: u32,
-    pub mem_op_count: u32,
+    pub reg_last_def_inner: Vec<u64>, // [u64; 98] serialized as Vec
+    pub line_count: u64,
+    pub parsed_count: u64,
+    pub mem_op_count: u64,
 }
 
 impl ScanArchive {
     pub fn to_sections(&self) -> Vec<u8> {
         let mut w = SectionWriter::new();
         // FlatDeps: sections 0-7
-        w.write_slice(&self.deps.chunk_start_lines);     // 0
-        w.write_slice(&self.deps.chunk_offsets_start);    // 1
-        w.write_slice(&self.deps.chunk_data_start);       // 2
-        w.write_slice(&self.deps.all_offsets);             // 3
-        w.write_slice(&self.deps.all_data);                // 4
-        w.write_slice(&self.deps.patch_lines);             // 5
-        w.write_slice(&self.deps.patch_offsets);            // 6
-        w.write_slice(&self.deps.patch_data);               // 7
-        // FlatMemLastDef: sections 8-10
-        w.write_slice(&self.mem_last_def.addrs);           // 8
-        w.write_slice(&self.mem_last_def.lines);           // 9
-        w.write_slice(&self.mem_last_def.values);          // 10
-        // FlatPairSplit: sections 11-13
-        w.write_slice(&self.pair_split.keys);              // 11
-        w.write_slice(&self.pair_split.seg_offsets);       // 12
-        w.write_slice(&self.pair_split.data);              // 13
-        // FlatBitVec: sections 14-15
-        w.write_slice(&self.init_mem_loads.data);          // 14
-        w.write_u32(self.init_mem_loads.len);              // 15
-        // Metadata: sections 16-19
-        w.write_slice(&self.reg_last_def_inner);           // 16
-        w.write_u32(self.line_count);                      // 17
-        w.write_u32(self.parsed_count);                    // 18
-        w.write_u32(self.mem_op_count);                    // 19
+        w.write_slice(&self.deps.chunk_start_lines); // 0
+        w.write_slice(&self.deps.chunk_offsets_start); // 1
+        w.write_slice(&self.deps.chunk_data_start); // 2
+        w.write_slice(&self.deps.all_offsets); // 3
+        w.write_slice(&self.deps.all_data); // 4
+        w.write_slice(&self.deps.patch_lines); // 5
+        w.write_slice(&self.deps.patch_offsets); // 6
+        w.write_slice(&self.deps.patch_data); // 7
+                                              // FlatMemLastDef: sections 8-10
+        w.write_slice(&self.mem_last_def.addrs); // 8
+        w.write_slice(&self.mem_last_def.lines); // 9
+        w.write_slice(&self.mem_last_def.values); // 10
+                                                  // FlatPairSplit: sections 11-13
+        w.write_slice(&self.pair_split.keys); // 11
+        w.write_slice(&self.pair_split.seg_offsets); // 12
+        w.write_slice(&self.pair_split.data); // 13
+                                              // FlatBitVec: sections 14-15
+        w.write_slice(&self.init_mem_loads.data); // 14
+        w.write_u64(self.init_mem_loads.len); // 15
+                                              // Metadata: sections 16-19
+        w.write_slice(&self.reg_last_def_inner); // 16
+        w.write_u64(self.line_count); // 17
+        w.write_u64(self.parsed_count); // 18
+        w.write_u64(self.mem_op_count); // 19
         w.finish()
     }
 
     pub fn views_from_sections(data: &[u8]) -> Option<ScanViews<'_>> {
         let r = SectionReader::new(data)?;
-        if r.num_sections() < 20 { return None; }
+        if r.num_sections() < 20 {
+            return None;
+        }
         Some(ScanViews {
             deps: DepsView::from_raw(
-                r.slice(0), r.slice(1), r.slice(2),
-                r.slice(3), r.slice(4),
-                r.slice(5), r.slice(6), r.slice(7),
+                r.slice(0),
+                r.slice(1),
+                r.slice(2),
+                r.slice(3),
+                r.slice(4),
+                r.slice(5),
+                r.slice(6),
+                r.slice(7),
             ),
-            mem_last_def: MemLastDefView::from_raw(
-                r.slice(8), r.slice(9), r.slice(10),
-            ),
-            pair_split: PairSplitView::from_raw(
-                r.slice(11), r.slice(12), r.slice(13),
-            ),
-            init_mem_loads: BitView::from_raw(
-                r.slice(14), r.u32_val(15),
-            ),
+            mem_last_def: MemLastDefView::from_raw(r.slice(8), r.slice(9), r.slice(10)),
+            pair_split: PairSplitView::from_raw(r.slice(11), r.slice(12), r.slice(13)),
+            init_mem_loads: BitView::from_raw(r.slice(14), r.u64_val(15)),
             reg_last_def_inner: r.slice(16),
-            line_count: r.u32_val(17),
-            parsed_count: r.u32_val(18),
-            mem_op_count: r.u32_val(19),
+            line_count: r.u64_val(17),
+            parsed_count: r.u64_val(18),
+            mem_op_count: r.u64_val(19),
         })
     }
 }
@@ -141,10 +140,10 @@ pub struct ScanViews<'a> {
     pub mem_last_def: MemLastDefView<'a>,
     pub pair_split: PairSplitView<'a>,
     pub init_mem_loads: BitView<'a>,
-    pub reg_last_def_inner: &'a [u32],
-    pub line_count: u32,
-    pub parsed_count: u32,
-    pub mem_op_count: u32,
+    pub reg_last_def_inner: &'a [u64],
+    pub line_count: u64,
+    pub parsed_count: u64,
+    pub mem_op_count: u64,
 }
 
 // ── LineIndexArchive sections ────────────────────────────────────────────────
@@ -152,17 +151,17 @@ pub struct ScanViews<'a> {
 impl LineIndexArchive {
     pub fn to_sections(&self) -> Vec<u8> {
         let mut w = SectionWriter::new();
-        w.write_slice(&self.sampled_offsets);  // 0
-        w.write_u32(self.total);               // 1
+        w.write_slice(&self.sampled_offsets); // 0
+        w.write_u64(self.total); // 1
         w.finish()
     }
 
     pub fn views_from_sections(data: &[u8]) -> Option<LineIndexView<'_>> {
         let r = SectionReader::new(data)?;
-        if r.num_sections() < 2 { return None; }
-        Some(LineIndexView::from_raw(
-            r.slice(0), r.u32_val(1),
-        ))
+        if r.num_sections() < 2 {
+            return None;
+        }
+        Some(LineIndexView::from_raw(r.slice(0), r.u64_val(1)))
     }
 }
 
@@ -251,7 +250,7 @@ impl CachedStore<ScanArchive> {
         }
     }
 
-    pub fn line_count(&self) -> u32 {
+    pub fn line_count(&self) -> u64 {
         match self {
             Self::Owned(a) => a.line_count,
             Self::Mapped(mmap) => {
@@ -261,7 +260,7 @@ impl CachedStore<ScanArchive> {
         }
     }
 
-    pub fn reg_last_def_inner(&self) -> &[u32] {
+    pub fn reg_last_def_inner(&self) -> &[u64] {
         match self {
             Self::Owned(a) => &a.reg_last_def_inner,
             Self::Mapped(mmap) => {
@@ -275,7 +274,7 @@ impl CachedStore<ScanArchive> {
         let inner = self.reg_last_def_inner();
         let mut rld = RegLastDef::new();
         for (i, &v) in inner.iter().enumerate().take(RegId::COUNT) {
-            if v != u32::MAX {
+            if v != u64::MAX {
                 rld.insert(RegId(i as u8), v);
             }
         }
@@ -294,7 +293,7 @@ impl CachedStore<ScanArchive> {
 // ── CachedStore<LineIndexArchive> ────────────────────────────────────────────
 
 impl CachedStore<LineIndexArchive> {
-    pub fn total_lines(&self) -> u32 {
+    pub fn total_lines(&self) -> u64 {
         self.view().total_lines()
     }
 

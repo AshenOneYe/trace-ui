@@ -42,7 +42,11 @@ impl McpStatus {
             McpStatus::Running { port } => McpStatusInfo {
                 status: "running".into(),
                 port: Some(*port),
-                url: Some(format!("http://127.0.0.1:{}{}", port, trace_mcp::MCP_ENDPOINT)),
+                url: Some(format!(
+                    "http://127.0.0.1:{}{}",
+                    port,
+                    trace_mcp::MCP_ENDPOINT
+                )),
                 error: None,
             },
             McpStatus::Error { message } => McpStatusInfo {
@@ -121,7 +125,9 @@ impl McpController {
                     if ct_for_check.is_cancelled() {
                         McpStatus::Stopped
                     } else {
-                        McpStatus::Error { message: e.to_string() }
+                        McpStatus::Error {
+                            message: e.to_string(),
+                        }
                     }
                 }
             };

@@ -26,6 +26,9 @@ pub enum TraceError {
     #[error("operation cancelled")]
     Cancelled,
 
+    #[error("resource budget exceeded: {0}")]
+    ResourceBudgetExceeded(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }

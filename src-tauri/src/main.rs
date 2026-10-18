@@ -4,8 +4,8 @@ mod commands;
 mod mcp;
 
 use std::sync::Arc;
-use trace_core::TraceEngine;
 use tauri::Manager;
+use trace_core::TraceEngine;
 
 #[tauri::command]
 fn toggle_devtools(window: tauri::WebviewWindow) {
@@ -44,9 +44,13 @@ fn main() {
             commands::delete_file_cache,
             commands::get_lines,
             commands::build_index,
+            commands::build_base_index,
+            commands::build_phase2_index,
+            commands::build_dependency_index,
             commands::get_registers_at,
             commands::get_call_tree,
             commands::get_call_tree_node_count,
+            commands::get_index_status,
             commands::get_call_tree_children,
             commands::search_trace,
             commands::fetch_search_page,
@@ -61,6 +65,9 @@ fn main() {
             commands::get_tainted_seqs,
             commands::export_taint_results,
             commands::get_cache_dir,
+            commands::get_resource_budgets,
+            commands::set_resource_budgets,
+            commands::list_persisted_analysis_jobs,
             commands::set_cache_dir,
             commands::clear_all_cache,
             commands::get_strings,
@@ -73,6 +80,15 @@ fn main() {
             commands::build_dependency_tree_from_slice,
             commands::get_line_def_registers,
             commands::scan_crypto,
+            commands::analyze_vm,
+            commands::compare_vm_traces,
+            commands::cluster_vm_handlers,
+            commands::get_vm_hypotheses,
+            commands::validate_vm_hypothesis,
+            commands::set_vm_override,
+            commands::undo_vm_override,
+            commands::redo_vm_override,
+            commands::dry_run_vm_impact,
             commands::load_crypto_cache,
             commands::start_mcp,
             commands::stop_mcp,

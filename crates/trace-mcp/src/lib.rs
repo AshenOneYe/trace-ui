@@ -1,15 +1,16 @@
+pub mod jobs;
+pub mod results;
 pub mod tools;
 mod types;
 
 use std::sync::Arc;
-use trace_core::TraceEngine;
 use tools::TraceToolHandler;
+use trace_core::TraceEngine;
 
-use rmcp::ServiceExt;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use rmcp::ServiceExt;
 
 /// MCP 服务器默认监听端口
 pub const DEFAULT_MCP_PORT: u16 = 19821;
@@ -51,10 +52,18 @@ pub async fn start_sse(
                 break;
             }
             Err(e) if offset < 9 => {
-                eprintln!("[mcp] port {} unavailable ({}), trying {}...", actual_port, e, actual_port + 1);
+                eprintln!(
+                    "[mcp] port {} unavailable ({}), trying {}...",
+                    actual_port,
+                    e,
+                    actual_port + 1
+                );
             }
             Err(e) => {
-                let msg = format!("Failed to bind MCP server after trying ports {}-{}: {}", port, actual_port, e);
+                let msg = format!(
+                    "Failed to bind MCP server after trying ports {}-{}: {}",
+                    port, actual_port, e
+                );
                 let _ = ready_tx.send(Err(msg.clone()));
                 return Err(anyhow::anyhow!(msg));
             }
@@ -62,11 +71,15 @@ pub async fn start_sse(
     }
 
     let listener = tcp_listener.unwrap();
-    let actual_port = listener.local_addr()
+    let actual_port = listener
+        .local_addr()
         .map(|a| a.port())
         .unwrap_or(actual_port);
     let _ = ready_tx.send(Ok(actual_port));
-    eprintln!("[mcp] server listening on http://127.0.0.1:{}{}", actual_port, MCP_ENDPOINT);
+    eprintln!(
+        "[mcp] server listening on http://127.0.0.1:{}{}",
+        actual_port, MCP_ENDPOINT
+    );
 
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {

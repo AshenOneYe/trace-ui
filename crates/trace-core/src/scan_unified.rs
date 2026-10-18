@@ -12,14 +12,15 @@ use crate::scanner::{
     PAIR_HALF2_BIT, PAIR_SHARED_BIT,
 };
 use trace_parser::{
-    def_use, gumtrace as gumtrace_parser, insn_class, parser,
-    types::{self as types, RegId},
+    def_use, gumtrace as gumtrace_parser, insn_class,
     insn_class::InsnClass,
+    parser,
+    types::{self as types, RegId},
 };
 
 pub type ProgressFn = Box<dyn Fn(usize, usize) + Send + Sync>;
 
-const CHECKPOINT_INTERVAL: u32 = 1000;
+const CHECKPOINT_INTERVAL: u64 = 1000;
 
 /// Phase 2 索引数据（CallTree + MemAccessIndex + RegCheckpoints + StringIndex）
 pub struct Phase2State {
@@ -35,8 +36,8 @@ pub struct ScanResult {
     pub phase2: Phase2State,
     pub line_index: crate::line_index::LineIndex,
     pub format: trace_parser::types::TraceFormat,
-    pub call_annotations: std::collections::HashMap<u32, trace_parser::gumtrace::CallAnnotation>,
-    pub consumed_seqs: Vec<u32>,
+    pub call_annotations: std::collections::HashMap<u64, trace_parser::gumtrace::CallAnnotation>,
+    pub consumed_seqs: Vec<u64>,
 }
 
 /// 将字节序列转为字符串：有效 UTF-8 部分正常解码，无效字节显示为 `\xNN` 形式。
@@ -52,7 +53,8 @@ pub fn bytes_to_hex_escaped(bytes: &[u8]) -> String {
             Err(e) => {
                 let valid_up_to = e.valid_up_to();
                 // SAFETY: from_utf8 已验证 bytes[i..i+valid_up_to] 是有效 UTF-8
-                result.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid_up_to]) });
+                result
+                    .push_str(unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid_up_to]) });
                 use std::fmt::Write;
                 let _ = write!(result, "\\x{:02x}", bytes[i + valid_up_to]);
                 i += valid_up_to + 1;
@@ -85,7 +87,10 @@ pub fn scan_unified(
         reg_last_def: RegLastDef::new(),
         mem_last_def: scanner::MemLastDef::default(),
         last_cond_branch: None,
-        deps: scanner::DepsStorage::single(scanner::CompactDeps::with_capacity(line_count_est, line_count_est * 2)),
+        deps: scanner::DepsStorage::single(scanner::CompactDeps::with_capacity(
+            line_count_est,
+            line_count_est * 2,
+        )),
         line_count: 0,
         parsed_count: 0,
         mem_op_count: 0,
@@ -98,7 +103,11 @@ pub fn scan_unified(
     // ── Phase2 初始化（来自 phase2.rs） ──
     let mut ct_builder = CallTreeBuilder::new();
     let mut mem_idx = MemAccessIndex::new();
-    let mut string_builder = if skip_strings { None } else { Some(StringBuilder::new()) };
+    let mut string_builder = if skip_strings {
+        None
+    } else {
+        Some(StringBuilder::new())
+    };
     let mut reg_ckpts = RegCheckpoints::new(CHECKPOINT_INTERVAL);
     let mut reg_values = [u64::MAX; RegId::COUNT];
 
@@ -106,10 +115,11 @@ pub fn scan_unified(
     reg_ckpts.save_checkpoint(&reg_values);
 
     // ── Gumtrace 状态变量 ──
-    let mut call_annotations: std::collections::HashMap<u32, gumtrace_parser::CallAnnotation> = std::collections::HashMap::new();
-    let mut consumed_seqs: Vec<u32> = Vec::new();
-    let mut pending_call_seq: Option<u32> = None;
-    let mut current_annotation: Option<(u32, gumtrace_parser::CallAnnotation)> = None;
+    let mut call_annotations: std::collections::HashMap<u64, gumtrace_parser::CallAnnotation> =
+        std::collections::HashMap::new();
+    let mut consumed_seqs: Vec<u64> = Vec::new();
+    let mut pending_call_seq: Option<u64> = None;
+    let mut current_annotation: Option<(u64, gumtrace_parser::CallAnnotation)> = None;
 
     // BLR 后需要检测：如果下一行地址 = BLR的PC+4，说明是 unidbg 拦截调用（无函数体）
     let mut blr_pending_pc: Option<u64> = None;
@@ -169,13 +179,16 @@ pub fn scan_unified(
                             call_annotations.insert(bl_seq, ann);
                         }
                         if let Some(bl_seq) = pending_call_seq.take() {
-                            current_annotation = Some((bl_seq, gumtrace_parser::CallAnnotation {
-                                func_name: name.to_string(),
-                                is_jni,
-                                args: Vec::new(),
-                                ret_value: None,
-                                raw_lines: vec![raw_line.to_string()],
-                            }));
+                            current_annotation = Some((
+                                bl_seq,
+                                gumtrace_parser::CallAnnotation {
+                                    func_name: name.to_string(),
+                                    is_jni,
+                                    args: Vec::new(),
+                                    ret_value: None,
+                                    raw_lines: vec![raw_line.to_string()],
+                                },
+                            ));
                         }
                     }
                     gumtrace_parser::SpecialLine::Arg { index, value } => {
@@ -277,8 +290,7 @@ pub fn scan_unified(
 
         // For non-pair LOAD: do mem deps (3b) first to determine pass-through,
         // then conditionally skip register deps (3a).
-        let is_non_pair_load = !is_pair
-            && line.mem_op.as_ref().is_some_and(|m| !m.is_write);
+        let is_non_pair_load = !is_pair && line.mem_op.as_ref().is_some_and(|m| !m.is_write);
         let mut is_pass_through = false;
 
         if is_non_pair_load && !no_prune {
@@ -286,7 +298,7 @@ pub fn scan_unified(
             let width = mem_access_width(class, mem.elem_width, &line);
             let mut has_init_mem = false;
             let mut all_same_store = true;
-            let mut first_store_raw: Option<u32> = None;
+            let mut first_store_raw: Option<u64> = None;
             let mut store_val: Option<u64> = None;
 
             for offset in 0..width as u64 {
@@ -422,7 +434,11 @@ pub fn scan_unified(
             // After SIMD expansion, defs may be [rt1_lo, rt1_hi, rt2_lo, rt2_hi, base?]
             // or [rt1, rt2, base?] for scalar. Split data defs at midpoint.
             let has_base_wb = line.writeback && line.base_reg.is_some();
-            let data_defs = if has_base_wb { &defs[..defs.len() - 1] } else { &defs[..] };
+            let data_defs = if has_base_wb {
+                &defs[..defs.len() - 1]
+            } else {
+                &defs[..]
+            };
             let mid = data_defs.len() / 2;
 
             for r in &data_defs[..mid] {
@@ -432,7 +448,9 @@ pub fn scan_unified(
                 state.reg_last_def.insert(*r, i | PAIR_HALF2_BIT); // half2
             }
             if has_base_wb {
-                state.reg_last_def.insert(*defs.last().unwrap(), i | PAIR_SHARED_BIT);
+                state
+                    .reg_last_def
+                    .insert(*defs.last().unwrap(), i | PAIR_SHARED_BIT);
             }
         } else if class == InsnClass::StorePair {
             // StorePair: writeback base is the only DEF (if present)
@@ -564,32 +582,60 @@ pub fn scan_unified(
                 // NEON/SIMD 行常不打印 q 寄存器值 → data_known=false，但写入仍需归因
                 let lo_known = mem_op.value_lo.is_some();
                 if lo_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value_lo.unwrap_or(0), size: 8,
-                        data_known: lo_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value_lo.unwrap_or(0),
+                            size: 8,
+                            data_known: lo_known,
+                        },
+                    );
                 }
                 let hi_known = mem_op.value_hi.is_some();
                 if hi_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs + 8, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value_hi.unwrap_or(0), size: 8,
-                        data_known: hi_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs + 8,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value_hi.unwrap_or(0),
+                            size: 8,
+                            data_known: hi_known,
+                        },
+                    );
                 }
                 // Pair 128-bit: 第二个寄存器
                 let lo2_known = mem_op.value2_lo.is_some();
                 if lo2_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs + 16, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value2_lo.unwrap_or(0), size: 8,
-                        data_known: lo2_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs + 16,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value2_lo.unwrap_or(0),
+                            size: 8,
+                            data_known: lo2_known,
+                        },
+                    );
                 }
                 let hi2_known = mem_op.value2_hi.is_some();
                 if hi2_known || mem_op.is_write {
-                    mem_idx.add(mem_op.abs + 24, MemAccessRecord {
-                        seq: i, insn_addr, rw, data: mem_op.value2_hi.unwrap_or(0), size: 8,
-                        data_known: hi2_known,
-                    });
+                    mem_idx.add(
+                        mem_op.abs + 24,
+                        MemAccessRecord {
+                            seq: i,
+                            insn_addr,
+                            rw,
+                            data: mem_op.value2_hi.unwrap_or(0),
+                            size: 8,
+                            data_known: hi2_known,
+                        },
+                    );
                 }
             }
 
@@ -597,7 +643,13 @@ pub fn scan_unified(
             if let Some(ref mut sb) = string_builder {
                 if mem_op.is_write && mem_op.elem_width <= 8 {
                     if let Some(value) = mem_op.value {
-                        sb.process_access(mem_op.abs, value, mem_op.elem_width, i, crate::query::strings::StringRw::Write);
+                        sb.process_access(
+                            mem_op.abs,
+                            value,
+                            mem_op.elem_width,
+                            i,
+                            crate::query::strings::StringRw::Write,
+                        );
                     }
                 }
             }
