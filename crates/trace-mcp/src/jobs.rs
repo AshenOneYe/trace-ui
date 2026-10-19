@@ -6,11 +6,28 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
-use trace_core::{BuildOptions, GlobalLine, TraceEngine, VmAnalysisConfig};
+use trace_core::{
+    BuildOptions, GlobalLine, SearchOptions, SliceOptions, TraceEngine, VmAnalysisConfig,
+};
 
 const JOB_SCHEMA_VERSION: u32 = 1;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn parse_addr_range(range: &str) -> Result<(u64, u64), String> {
+    let parts: Vec<&str> = range.split('-').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "invalid addr_range '{range}', expected 0xSTART-0xEND"
+        ));
+    }
+    let start = trace_core::parse_hex_addr(parts[0].trim())?;
+    let end = trace_core::parse_hex_addr(parts[1].trim())?;
+    if start > end {
+        return Err(format!("addr_range start 0x{start:x} > end 0x{end:x}"));
+    }
+    Ok((start, end))
+}
 
 #[derive(Clone)]
 struct JobCancellation {
@@ -27,6 +44,9 @@ pub enum JobKind {
     StringIndex,
     BuildIndex,
     VmAnalysis,
+    Taint,
+    Crypto,
+    Search,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +73,18 @@ pub struct AnalysisJobInput {
     #[serde(default)]
     pub ranges: Vec<trace_core::LineRange>,
     pub vm_config: Option<VmAnalysisConfig>,
+    #[serde(default)]
+    pub from_specs: Vec<String>,
+    #[serde(default)]
+    pub data_only: bool,
+    pub include_lines: Option<u32>,
+    pub addr_range: Option<String>,
+    pub ignore_regs: Option<String>,
+    pub context_lines: Option<u32>,
+    pub search_query: Option<String>,
+    pub use_regex: Option<bool>,
+    pub case_sensitive: Option<bool>,
+    pub max_results: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,7 +446,11 @@ fn execute_job(
                 .scan_strings(&session_id)
                 .map_err(|e| e.to_string())?;
         }
-        JobKind::BuildIndex | JobKind::VmAnalysis
+        JobKind::BuildIndex
+        | JobKind::VmAnalysis
+        | JobKind::Taint
+        | JobKind::Crypto
+        | JobKind::Search
             if created_session || input.force_rebuild || !index_complete =>
         {
             engine
@@ -428,7 +464,11 @@ fn execute_job(
                 )
                 .map_err(|e| e.to_string())?;
         }
-        JobKind::BuildIndex | JobKind::VmAnalysis => {}
+        JobKind::BuildIndex
+        | JobKind::VmAnalysis
+        | JobKind::Taint
+        | JobKind::Crypto
+        | JobKind::Search => {}
     }
     if token.is_cancelled() || cancellation_flag.load(Ordering::Relaxed) {
         engine.cancel_build(&session_id);
@@ -548,6 +588,106 @@ fn execute_job(
                 "analysis": result,
             }))
         }
+        JobKind::Taint => {
+            if input.from_specs.is_empty() {
+                return Err("taint job requires from_specs".to_string());
+            }
+            let slice = engine
+                .run_slice(
+                    &session_id,
+                    &input.from_specs,
+                    SliceOptions {
+                        start_seq: input.start_line,
+                        end_seq: input.end_line,
+                        data_only: input.data_only,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let seqs = engine
+                .get_tainted_seqs(&session_id)
+                .map_err(|e| e.to_string())?;
+            let include = input.include_lines.unwrap_or(30).min(200) as usize;
+            let preview_seqs: Vec<u64> = seqs.iter().take(include).copied().collect();
+            let preview_lines = engine
+                .get_lines(&session_id, &preview_seqs)
+                .unwrap_or_default()
+                .iter()
+                .map(|line| serde_json::to_value(line).unwrap_or(Value::Null))
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "job_id": job_id,
+                "session_id": session_id,
+                "slice": slice,
+                "total_marked": seqs.len(),
+                "preview_seqs": preview_seqs,
+                "preview_lines": preview_lines,
+                "truncated": seqs.len() > include,
+                "addr_range": input.addr_range,
+                "ignore_regs": input.ignore_regs,
+            }))
+        }
+        JobKind::Crypto => {
+            let result = engine.scan_crypto(&session_id).map_err(|e| e.to_string())?;
+            let limit = input.max_results.unwrap_or(50).min(200) as usize;
+            let preview =
+                serde_json::to_value(result.matches.iter().take(limit).collect::<Vec<_>>())
+                    .unwrap_or(Value::Null);
+            Ok(json!({
+                "job_id": job_id,
+                "session_id": session_id,
+                "algorithms_found": result.algorithms_found,
+                "match_count": result.matches.len(),
+                "total_lines_scanned": result.total_lines_scanned,
+                "matches": preview,
+                "truncated": result.matches.len() > limit,
+            }))
+        }
+        JobKind::Search => {
+            let query = input
+                .search_query
+                .as_deref()
+                .ok_or_else(|| "search job requires search_query".to_string())?;
+            if query.is_empty() {
+                return Err("search_query must not be empty".to_string());
+            }
+            let info = engine
+                .get_session_info(&session_id)
+                .map_err(|e| e.to_string())?;
+            let start_seq = input.start_line.unwrap_or(0);
+            let end_seq = input.end_line.unwrap_or(info.total_lines);
+            let addr_filter = input
+                .addr_range
+                .as_deref()
+                .map(parse_addr_range)
+                .transpose()?;
+            let limit = input.max_results.unwrap_or(200).clamp(1, 500) as u64;
+            let outcome = engine
+                .search_in_range(
+                    &session_id,
+                    query,
+                    SearchOptions {
+                        case_sensitive: input.case_sensitive.unwrap_or(false),
+                        use_regex: input.use_regex.unwrap_or(false),
+                        fuzzy: false,
+                        max_results: Some(limit as u32),
+                    },
+                    start_seq,
+                    end_seq,
+                    addr_filter,
+                    0,
+                    limit,
+                )
+                .map_err(|e| e.to_string())?;
+            Ok(json!({
+                "job_id": job_id,
+                "session_id": session_id,
+                "query": query,
+                "match_seqs": outcome.match_seqs,
+                "total_in_range": outcome.total_in_range,
+                "total_scanned": outcome.total_scanned,
+                "truncated": outcome.total_in_range > limit,
+            }))
+        }
     }
 }
 
@@ -614,6 +754,16 @@ mod tests {
                     end_line: None,
                     ranges: Vec::new(),
                     vm_config: None,
+                    from_specs: Vec::new(),
+                    data_only: false,
+                    include_lines: None,
+                    addr_range: None,
+                    ignore_regs: None,
+                    context_lines: None,
+                    search_query: None,
+                    use_regex: None,
+                    case_sensitive: None,
+                    max_results: None,
                 },
                 progress: 0.5,
                 message: None,
@@ -652,6 +802,16 @@ mod tests {
                     end_line: None,
                     ranges: Vec::new(),
                     vm_config: None,
+                    from_specs: Vec::new(),
+                    data_only: false,
+                    include_lines: None,
+                    addr_range: None,
+                    ignore_regs: None,
+                    context_lines: None,
+                    search_query: None,
+                    use_regex: None,
+                    case_sensitive: None,
+                    max_results: None,
                 },
             )
             .unwrap();
@@ -671,6 +831,101 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(finished, "job did not complete in time");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn wait_for_completion(manager: &JobManager, id: &str) -> Value {
+        for _ in 0..600 {
+            let current = manager.get(id).unwrap();
+            match current.status {
+                JobStatus::Completed => return manager.result(id).unwrap(),
+                JobStatus::Failed => panic!("job failed: {:?}", current.error),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        panic!("job {id} did not complete in time");
+    }
+
+    #[tokio::test]
+    async fn search_and_taint_jobs_complete_with_bounded_results() {
+        let dir = std::env::temp_dir().join(format!(
+            "trace-ui-jobs-query-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = JobManager::with_path(Arc::new(TraceEngine::new()), dir.join("jobs.json"));
+        let trace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example-trace-gumtrace.txt");
+        let input = AnalysisJobInput {
+            file_path: trace.to_string_lossy().to_string(),
+            session_id: None,
+            force_rebuild: false,
+            skip_strings: true,
+            start_line: None,
+            end_line: None,
+            ranges: Vec::new(),
+            vm_config: None,
+            from_specs: Vec::new(),
+            data_only: false,
+            include_lines: None,
+            addr_range: None,
+            ignore_regs: None,
+            context_lines: None,
+            search_query: Some("mov".to_string()),
+            use_regex: None,
+            case_sensitive: None,
+            max_results: Some(5),
+        };
+        let search = manager.start(JobKind::Search, input).unwrap();
+        let search_result = wait_for_completion(&manager, &search.id).await;
+        let session_id = search_result["result"]["session_id"]
+            .as_str()
+            .expect("search result session id")
+            .to_string();
+        assert!(search_result["result"]["match_seqs"].is_array());
+        assert!(
+            search_result["result"]["match_seqs"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 5
+        );
+
+        let taint = manager
+            .start(
+                JobKind::Taint,
+                AnalysisJobInput {
+                    file_path: trace.to_string_lossy().to_string(),
+                    session_id: Some(session_id),
+                    force_rebuild: false,
+                    skip_strings: true,
+                    start_line: None,
+                    end_line: None,
+                    ranges: Vec::new(),
+                    vm_config: None,
+                    from_specs: vec!["reg:x0@last".to_string()],
+                    data_only: true,
+                    include_lines: Some(3),
+                    addr_range: None,
+                    ignore_regs: None,
+                    context_lines: None,
+                    search_query: None,
+                    use_regex: None,
+                    case_sensitive: None,
+                    max_results: None,
+                },
+            )
+            .unwrap();
+        let taint_result = wait_for_completion(&manager, &taint.id).await;
+        assert!(taint_result["result"]["slice"].is_object());
+        assert!(taint_result["result"]["preview_seqs"].is_array());
+        assert!(
+            taint_result["result"]["preview_seqs"]
+                .as_array()
+                .unwrap()
+                .len()
+                <= 3
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -548,9 +548,12 @@ impl TraceToolHandler {
             "string_index" => JobKind::StringIndex,
             "build_index" => JobKind::BuildIndex,
             "vm_analysis" => JobKind::VmAnalysis,
+            "taint" => JobKind::Taint,
+            "crypto" => JobKind::Crypto,
+            "search" => JobKind::Search,
             other => {
                 return Err(format!(
-                    "unknown job kind '{other}'; expected base_index, phase2_index, dependency_index, string_index, build_index or vm_analysis"
+                    "unknown job kind '{other}'; expected base_index, phase2_index, dependency_index, string_index, build_index, vm_analysis, taint, crypto or search"
                 ))
             }
         };
@@ -565,6 +568,16 @@ impl TraceToolHandler {
                 end_line: req.end_line,
                 ranges: Vec::new(),
                 vm_config: (kind == JobKind::VmAnalysis).then(VmAnalysisConfig::default),
+                from_specs: req.from_specs,
+                data_only: req.data_only,
+                include_lines: req.include_lines,
+                addr_range: req.addr_range,
+                ignore_regs: req.ignore_regs,
+                context_lines: req.context_lines,
+                search_query: req.search_query,
+                use_regex: req.use_regex,
+                case_sensitive: req.case_sensitive,
+                max_results: req.max_results,
             },
         )?;
         Ok(json(&job))
@@ -975,6 +988,16 @@ impl TraceToolHandler {
                         end_line: coverage.map(|range| range.end.0),
                         ranges: affected_ranges,
                         vm_config: Some(VmAnalysisConfig::default()),
+                        from_specs: Vec::new(),
+                        data_only: false,
+                        include_lines: None,
+                        addr_range: None,
+                        ignore_regs: None,
+                        context_lines: None,
+                        search_query: None,
+                        use_regex: None,
+                        case_sensitive: None,
+                        max_results: None,
                     },
                 )?),
                 coverage,

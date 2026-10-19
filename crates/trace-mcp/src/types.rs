@@ -336,6 +336,28 @@ pub struct StartAnalysisJobRequest {
     pub start_line: Option<u64>,
     #[schemars(description = "Exclusive VM analysis end line (default: end of trace)")]
     pub end_line: Option<u64>,
+    #[schemars(description = "Taint sources for kind='taint', e.g. ['reg:X0@1234']")]
+    #[serde(default)]
+    pub from_specs: Vec<String>,
+    #[schemars(description = "Taint data-only mode (default: false)")]
+    #[serde(default)]
+    pub data_only: bool,
+    #[schemars(description = "Taint/crypto preview line or match limit")]
+    pub include_lines: Option<u32>,
+    #[schemars(description = "Address range for taint/search, e.g. '0x1000-0x2000'")]
+    pub addr_range: Option<String>,
+    #[schemars(description = "Comma-separated noise registers for taint metadata")]
+    pub ignore_regs: Option<String>,
+    #[schemars(description = "Crypto context line count (metadata for future use)")]
+    pub context_lines: Option<u32>,
+    #[schemars(description = "Search query for kind='search'")]
+    pub search_query: Option<String>,
+    #[schemars(description = "Use regex for search jobs")]
+    pub use_regex: Option<bool>,
+    #[schemars(description = "Case-sensitive search")]
+    pub case_sensitive: Option<bool>,
+    #[schemars(description = "Maximum matches/rows returned by the job (default: 200, max: 500)")]
+    pub max_results: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
