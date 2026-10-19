@@ -168,6 +168,11 @@ pub struct VmAnalysisConfig {
     pub min_dispatch_executions: u64,
     pub max_handler_instances: usize,
     pub allow_provisional_primary: bool,
+    /// Native dispatch-site hints supplied by a profile. These are treated as
+    /// primary dispatchers even when the generic signature heuristic misses
+    /// them; all other analysis remains evidence-based.
+    #[serde(default)]
+    pub dispatch_sites: Vec<u64>,
 }
 
 impl Default for VmAnalysisConfig {
@@ -180,6 +185,7 @@ impl Default for VmAnalysisConfig {
             min_dispatch_executions: 2,
             max_handler_instances: 100_000,
             allow_provisional_primary: false,
+            dispatch_sites: Vec::new(),
         }
     }
 }
@@ -249,6 +255,7 @@ struct DispatchSite {
     targets: BTreeSet<u64>,
     signature: DispatchSignature,
     indirect_register: Option<RegId>,
+    manual: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1122,6 +1129,7 @@ impl VmAnalyzer {
                     targets: BTreeSet::new(),
                     signature: DispatchSignature::default(),
                     indirect_register: None,
+                    manual: false,
                 });
                 let is_first_execution = site.executions.is_empty();
                 if is_first_execution {
@@ -1157,12 +1165,39 @@ impl VmAnalyzer {
             }
         }
 
+        for &address in &self.config.dispatch_sites {
+            let entry = sites.entry(address).or_insert_with(|| DispatchSite {
+                executions: Vec::new(),
+                targets: BTreeSet::new(),
+                signature: DispatchSignature::default(),
+                indirect_register: None,
+                manual: true,
+            });
+            entry.manual = true;
+            if entry.executions.is_empty() {
+                for event in events.iter().filter(|event| event.address == address) {
+                    entry.executions.push(DispatchExecution {
+                        line: event.line,
+                        target: event.branch_target,
+                        guest_fetch: None,
+                    });
+                    if let Some(target) = event.branch_target {
+                        entry.targets.insert(target);
+                    }
+                    if entry.indirect_register.is_none() {
+                        entry.indirect_register = event.indirect_register;
+                    }
+                }
+            }
+        }
+
         let mut candidates = Vec::new();
         let mut executions_by_site = BTreeMap::new();
         for (address, site) in sites {
             let execution_count = site.executions.len() as u64;
-            if site.targets.len() < self.config.min_dispatch_targets
-                || execution_count < self.config.min_dispatch_executions
+            if !site.manual
+                && (site.targets.len() < self.config.min_dispatch_targets
+                    || execution_count < self.config.min_dispatch_executions)
             {
                 continue;
             }
@@ -1177,7 +1212,15 @@ impl VmAnalyzer {
                     .iter()
                     .all(|target| *target >= region.address_start && *target <= region.address_end)
             });
-            let (kind, confidence, reason) = classify_dispatch_site(&site, all_targets_in_region);
+            let (kind, confidence, reason) = if site.manual {
+                (
+                    DispatchKind::VmPrimary,
+                    0.9,
+                    "manual profile dispatch site",
+                )
+            } else {
+                classify_dispatch_site(&site, all_targets_in_region)
+            };
             let line = site
                 .executions
                 .first()
@@ -2870,5 +2913,42 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn manual_dispatch_site_overrides_generic_target_threshold() {
+        let events = vec![
+            NativeEvent::instruction(GlobalLine(0), 0x1000, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2000, "x9"),
+            NativeEvent::instruction(GlobalLine(1), 0x2000, "mov", "mov x0, x1")
+                .reads(&["x1"])
+                .writes(&["x0"]),
+        ];
+        let heuristic = VmAnalyzer::new(VmAnalysisConfig::default())
+            .analyze("trace", &events)
+            .unwrap();
+        assert!(
+            heuristic
+                .dispatchers
+                .iter()
+                .all(|dispatcher| dispatcher.address != 0x1000),
+            "one target is below the generic dispatch threshold"
+        );
+
+        let profiled = VmAnalyzer::new(VmAnalysisConfig {
+            dispatch_sites: vec![0x1000],
+            ..VmAnalysisConfig::default()
+        })
+        .analyze("trace", &events)
+        .unwrap();
+        let dispatcher = profiled
+            .dispatchers
+            .iter()
+            .find(|dispatcher| dispatcher.address == 0x1000)
+            .expect("manual dispatcher");
+        assert_eq!(dispatcher.kind, DispatchKind::VmPrimary);
+        assert_eq!(dispatcher.confidence, 0.9);
+        assert!(dispatcher.reason.contains("manual profile"));
     }
 }

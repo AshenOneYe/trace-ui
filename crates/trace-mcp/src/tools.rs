@@ -69,6 +69,9 @@ fn vm_trace_rows(
     start_line: u64,
     end_line: u64,
 ) -> Vec<Value> {
+    const MAX_EFFECTS: usize = 32;
+    const MAX_STATE: usize = 64;
+    const MAX_UNKNOWN: usize = 16;
     let instances: HashMap<&str, &trace_core::analysis::HandlerInstance> = result
         .handler_instances
         .iter()
@@ -94,6 +97,10 @@ fn vm_trace_rows(
         .into_iter()
         .map(|instruction| {
             let instance = instances.get(instruction.handler_instance_id.as_str());
+            let memory_effect_count = instruction.memory_effects.len();
+            let state_read_count = instruction.state_reads.len();
+            let state_write_count = instruction.state_writes.len();
+            let unknown_effect_count = instruction.unknown_effects.len();
             serde_json::json!({
                 "native_seq": instruction.native_lines.start.get(),
                 "native_end_seq": instruction.native_lines.end.get(),
@@ -104,13 +111,21 @@ fn vm_trace_rows(
                 "handler_cluster_id": instance.and_then(|value| value.cluster_id.clone()),
                 "op": instruction.operation,
                 "operands": instruction.operands,
-                "state_reads": instruction.state_reads,
-                "state_writes": instruction.state_writes,
-                "memory_effects": instruction.memory_effects,
+                "state_reads": instruction.state_reads.iter().take(MAX_STATE).cloned().collect::<Vec<_>>(),
+                "state_read_count": state_read_count,
+                "state_reads_truncated": state_read_count > MAX_STATE,
+                "state_writes": instruction.state_writes.iter().take(MAX_STATE).cloned().collect::<Vec<_>>(),
+                "state_write_count": state_write_count,
+                "state_writes_truncated": state_write_count > MAX_STATE,
+                "memory_effects": instruction.memory_effects.iter().take(MAX_EFFECTS).cloned().collect::<Vec<_>>(),
+                "memory_effect_count": memory_effect_count,
+                "memory_effects_truncated": memory_effect_count > MAX_EFFECTS,
                 "control_target": instruction.control_target,
                 "confidence": instruction.confidence,
                 "execution_count": instruction.execution_count,
-                "unknown_effects": instruction.unknown_effects,
+                "unknown_effects": instruction.unknown_effects.iter().take(MAX_UNKNOWN).cloned().collect::<Vec<_>>(),
+                "unknown_effect_count": unknown_effect_count,
+                "unknown_effects_truncated": unknown_effect_count > MAX_UNKNOWN,
                 // Explicitly null until a VM profile supplies a VPC source.
                 "vpc": Value::Null,
             })
@@ -263,6 +278,9 @@ mod tests {
         assert_eq!(rows[0]["native_seq"], 10);
         assert_eq!(rows[0]["handler_cluster_id"], "c1");
         assert_eq!(rows[0]["op"], "add");
+        assert_eq!(rows[0]["memory_effect_count"], 0);
+        assert_eq!(rows[0]["state_read_count"], 0);
+        assert_eq!(rows[0]["state_write_count"], 0);
         assert!(rows[0]["vpc"].is_null());
         assert!(vm_trace_rows(&result, 21, u64::MAX).is_empty());
     }
@@ -390,6 +408,17 @@ fn parse_read_filter(rw: Option<&str>) -> Result<Option<bool>, String> {
             value
         )),
     }
+}
+
+fn parse_dispatch_sites(sites: &[String]) -> Result<Vec<u64>, String> {
+    sites.iter().map(|site| parse_hex_addr(site)).collect()
+}
+
+fn vm_config_with_dispatch_sites(sites: &[String]) -> Result<VmAnalysisConfig, String> {
+    Ok(VmAnalysisConfig {
+        dispatch_sites: parse_dispatch_sites(sites)?,
+        ..VmAnalysisConfig::default()
+    })
 }
 
 /// Check if TraceLine's SO offset falls within an address range
@@ -561,6 +590,7 @@ impl TraceToolHandler {
                 ))
             }
         };
+        let dispatch_sites = parse_dispatch_sites(&req.dispatch_sites)?;
         let job = self.jobs.start(
             kind,
             AnalysisJobInput {
@@ -571,7 +601,10 @@ impl TraceToolHandler {
                 start_line: req.start_line,
                 end_line: req.end_line,
                 ranges: Vec::new(),
-                vm_config: (kind == JobKind::VmAnalysis).then(VmAnalysisConfig::default),
+                vm_config: (kind == JobKind::VmAnalysis).then(|| VmAnalysisConfig {
+                    dispatch_sites,
+                    ..VmAnalysisConfig::default()
+                }),
                 from_specs: req.from_specs,
                 data_only: req.data_only,
                 include_lines: req.include_lines,
@@ -1023,7 +1056,8 @@ impl TraceToolHandler {
         req: VmAnalysisRequest,
     ) -> Result<trace_core::VmAnalysisResult, String> {
         let sid = self.resolve_session(req.session_id)?;
-        self.analyze_vm_session(&sid, req.start_line, req.end_line)
+        let config = vm_config_with_dispatch_sites(&req.dispatch_sites)?;
+        self.analyze_vm_session_with_config(&sid, req.start_line, req.end_line, config)
     }
 
     fn analyze_vm_session(
@@ -1031,6 +1065,21 @@ impl TraceToolHandler {
         session_id: &str,
         start_line: Option<u64>,
         end_line: Option<u64>,
+    ) -> Result<trace_core::VmAnalysisResult, String> {
+        self.analyze_vm_session_with_config(
+            session_id,
+            start_line,
+            end_line,
+            VmAnalysisConfig::default(),
+        )
+    }
+
+    fn analyze_vm_session_with_config(
+        &self,
+        session_id: &str,
+        start_line: Option<u64>,
+        end_line: Option<u64>,
+        config: VmAnalysisConfig,
     ) -> Result<trace_core::VmAnalysisResult, String> {
         let info = self
             .engine
@@ -1040,7 +1089,7 @@ impl TraceToolHandler {
         let end = GlobalLine::new(end_line.unwrap_or(info.total_lines));
         let result = self
             .engine
-            .analyze_vm_range(session_id, start, end, VmAnalysisConfig::default())
+            .analyze_vm_range(session_id, start, end, config)
             .map_err(|e| e.to_string())?;
         self.engine
             .save_vm_analysis(session_id, &result)
@@ -1184,7 +1233,13 @@ impl TraceToolHandler {
         blocking(move || {
             let start_line = req.start_line.unwrap_or(0);
             let end_line = req.end_line.unwrap_or(u64::MAX);
-            let result = handler.analyze_vm_session(&sid, req.start_line, req.end_line)?;
+            let config = vm_config_with_dispatch_sites(&req.dispatch_sites)?;
+            let result = handler.analyze_vm_session_with_config(
+                &sid,
+                req.start_line,
+                req.end_line,
+                config,
+            )?;
             let all_rows = vm_trace_rows(&result, start_line, end_line);
             let total = all_rows.len();
             let offset = req.offset as usize;
@@ -1353,8 +1408,9 @@ impl TraceToolHandler {
         let sid = self.resolve_session(req.session_id)?;
         let handler = self.clone();
         blocking(move || {
+            let config = vm_config_with_dispatch_sites(&req.dispatch_sites)?;
             let result =
-                handler.analyze_vm_session(&sid, req.start_line, req.end_line)?;
+                handler.analyze_vm_session_with_config(&sid, req.start_line, req.end_line, config)?;
             let (artifact, payload) = match req.artifact.as_str() {
                 "state" => ("state", serde_json::to_value(&result.state_candidates).unwrap_or_default()),
                 "ir" => (

@@ -58,7 +58,8 @@ VM analysis:
 ```text
 detect_vm_regions(session_id="...")
 get_vm_handlers(session_id="...")
-vm_trace(session_id="...", start_line=0, end_line=100000, limit=100)
+vm_trace(session_id="...", start_line=0, end_line=100000, limit=100,
+         dispatch_sites=["0x7359f5931c"])
 get_vm_artifacts(session_id="...", artifact="state|ir|cfg|handlers|transitions")
 cluster_vm_handlers(session_id="...", must_link=[["h1","h2"]],
                     locked_labels={"h1":"manual-a"})
@@ -79,6 +80,12 @@ result itself is kept small and stable for persistence.
 seq, with operation, handler/cluster identity, state/memory effects and
 confidence. `vpc` is explicitly `null` until a VM profile supplies an
 explicit VPC source; do not treat native seq as a virtual PC.
+`state_reads`/`state_writes`/`memory_effects` are bounded previews with
+`*_count` and `*_truncated` fields; use `get_vm_artifacts(artifact="ir")`
+when the full effect list is required.
+`dispatch_sites` is an optional profile hint: a native address from
+`detect_vm_regions` can be forced to `VmPrimary` when the generic signature
+heuristic misses it.
 
 Hypothesis collaboration:
 

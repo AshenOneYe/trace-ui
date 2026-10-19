@@ -313,6 +313,9 @@ pub struct VmAnalysisRequest {
     pub end_line: Option<u64>,
     #[schemars(description = "Max regions to return (default: 20, max: 100)")]
     pub limit: Option<u32>,
+    #[schemars(description = "Optional native dispatch-site hints, e.g. ['0x7359f5931c']")]
+    #[serde(default)]
+    pub dispatch_sites: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -358,6 +361,9 @@ pub struct StartAnalysisJobRequest {
     pub case_sensitive: Option<bool>,
     #[schemars(description = "Maximum matches/rows returned by the job (default: 200, max: 500)")]
     pub max_results: Option<u32>,
+    #[schemars(description = "VM dispatch-site hints for kind='vm_analysis'")]
+    #[serde(default)]
+    pub dispatch_sites: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -483,6 +489,9 @@ pub struct VmTraceRequest {
     #[schemars(description = "Max folded rows per page (default: 100, max: 1000)")]
     #[serde(default = "default_vm_trace_limit")]
     pub limit: u32,
+    #[schemars(description = "Optional native dispatch-site hints, e.g. ['0x7359f5931c']")]
+    #[serde(default)]
+    pub dispatch_sites: Vec<String>,
 }
 
 fn default_vm_trace_limit() -> u32 {
@@ -615,6 +624,9 @@ pub struct VmArtifactRequest {
     pub id: Option<String>,
     pub start_line: Option<u64>,
     pub end_line: Option<u64>,
+    #[schemars(description = "Optional native dispatch-site hints")]
+    #[serde(default)]
+    pub dispatch_sites: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
