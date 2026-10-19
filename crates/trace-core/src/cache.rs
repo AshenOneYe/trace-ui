@@ -28,7 +28,7 @@ pub fn cache_dir() -> Option<PathBuf> {
 
 fn cache_path(file_path: &str, suffix: &str) -> Option<PathBuf> {
     let mut hasher = Sha256::new();
-    hasher.update(file_path.as_bytes());
+    hasher.update(normalized_cache_key(file_path).as_bytes());
     let hash = format!("{:x}", hasher.finalize());
     cache_dir().map(|d| d.join(format!("{}{}.bin", hash, suffix)))
 }
@@ -36,7 +36,7 @@ fn cache_path(file_path: &str, suffix: &str) -> Option<PathBuf> {
 /// Cache path with explicit extension (no automatic `.bin` suffix).
 fn cache_path_ext(file_path: &str, suffix: &str) -> Option<PathBuf> {
     let mut hasher = Sha256::new();
-    hasher.update(file_path.as_bytes());
+    hasher.update(normalized_cache_key(file_path).as_bytes());
     let hash = format!("{:x}", hasher.finalize());
     cache_dir().map(|d| d.join(format!("{}{}", hash, suffix)))
 }
@@ -50,12 +50,18 @@ pub fn checkpoint_dir(
     fingerprint: &crate::index_manifest::TraceFingerprint,
 ) -> Option<PathBuf> {
     let mut hasher = Sha256::new();
-    hasher.update(file_path.as_bytes());
+    hasher.update(normalized_cache_key(file_path).as_bytes());
     if let Ok(fp) = serde_json::to_vec(fingerprint) {
         hasher.update(fp);
     }
     let hash = format!("{:x}", hasher.finalize());
     cache_dir().map(|dir| dir.join("checkpoints").join(hash))
+}
+
+fn normalized_cache_key(file_path: &str) -> String {
+    std::fs::canonicalize(file_path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| file_path.to_string())
 }
 
 fn head_hash(data: &[u8]) -> [u8; 32] {

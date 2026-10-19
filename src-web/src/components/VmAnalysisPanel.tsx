@@ -19,7 +19,7 @@ interface Props {
   sessions?: Array<{ sessionId: string; fileName: string }>;
 }
 
-type Section = "regions" | "handlers" | "state" | "ir" | "cfg" | "compare" | "hypotheses" | "jobs";
+type Section = "regions" | "handlers" | "guest" | "state" | "ir" | "cfg" | "compare" | "hypotheses" | "jobs";
 
 function pct(value: number): string {
   return `${Math.round(value * 100)}%`;
@@ -135,7 +135,7 @@ function HandlerCard({
     >
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         <strong style={{ fontSize: 12 }}>{cluster.id}</strong>
-        <Chip tone="accent">{cluster.instance_count} instances</Chip>
+        <Chip tone="accent">{cluster.instance_count} executions</Chip>
         <Chip tone={cluster.confidence < 0.6 ? "warn" : "neutral"}>
           {pct(cluster.confidence)}
         </Chip>
@@ -223,6 +223,8 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
   const [editingHypothesis, setEditingHypothesis] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const [jobs, setJobs] = useState<AnalysisJob[]>([]);
+  const [analyzeStartedAt, setAnalyzeStartedAt] = useState<number | null>(null);
+  const [analyzeElapsedMs, setAnalyzeElapsedMs] = useState(0);
   const sessionKey = sessions
     .map(item => `${item.sessionId}:${item.fileName}`)
     .join("|");
@@ -253,6 +255,17 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
       setIndexStatus(null);
     }
   }, [sessionId, sessionKey]);
+
+  useEffect(() => {
+    if (analyzeStartedAt == null) {
+      setAnalyzeElapsedMs(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setAnalyzeElapsedMs(Date.now() - analyzeStartedAt);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [analyzeStartedAt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -314,6 +327,7 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
       return;
     }
     setLoading(true);
+    setAnalyzeStartedAt(Date.now());
     setError(null);
     try {
       const start = startLine.trim() ? Number(startLine) : null;
@@ -334,6 +348,7 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
       setError(String(cause));
     } finally {
       setLoading(false);
+      setAnalyzeStartedAt(null);
     }
   };
 
@@ -373,7 +388,11 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
             <Chip tone="warn">experimental</Chip>
             <Chip>{result.regions.length} regions</Chip>
             <Chip>{result.handler_clusters.length} clusters</Chip>
-            <Chip>{result.handler_instances.length} instances</Chip>
+            <Chip>
+              {result.handler_instances.length} handlers / {
+                result.handler_instances.reduce((sum, instance) => sum + (instance.execution_count ?? 1), 0)
+              } executions
+            </Chip>
           </>
         )}
         {indexStatus && (
@@ -403,6 +422,18 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
         <div style={{ padding: 10, color: "#e06c75", fontSize: 12 }}>{error}</div>
       )}
 
+      {loading && (
+        <div style={{
+          padding: "6px 10px",
+          fontSize: 11,
+          color: "var(--text-secondary)",
+          borderBottom: "1px solid var(--border-color)",
+        }}>
+          Analyzing VM… {Math.floor(analyzeElapsedMs / 1000)}s elapsed
+          {" · "}large traces extract events first, then run handler/CFG analysis
+        </div>
+      )}
+
       {!result && !loading && !error && (
         section === "jobs" ? (
           <div style={{ flex: 1, overflow: "auto", padding: 10 }}>
@@ -420,7 +451,7 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
       {result && (
         <>
           <div style={{ display: "flex", borderBottom: "1px solid var(--border-color)" }}>
-            {(["regions", "handlers", "state", "ir", "cfg", "compare", "hypotheses", "jobs"] as const).map(name => (
+            {(["regions", "handlers", "guest", "state", "ir", "cfg", "compare", "hypotheses", "jobs"] as const).map(name => (
               <button key={name} onClick={() => setSection(name)} style={{
                 padding: "5px 12px", fontSize: 11, textTransform: "capitalize",
                 background: section === name ? "var(--bg-secondary)" : "transparent",
@@ -509,6 +540,7 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
                         />
                         <strong>{instance.id}</strong>
                         <Chip>0x{instance.native_address.toString(16)}</Chip>
+                        <Chip>{instance.execution_count ?? 1} executions</Chip>
                         <Chip>lines {instance.entry_line}–{Math.max(instance.entry_line, instance.end_line - 1)}</Chip>
                         {instance.unknown_effects.length > 0 && <Chip tone="warn">partial</Chip>}
                       </div>
@@ -519,6 +551,39 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
                     </div>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {section === "guest" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+                <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center" }}>
+                  <Chip tone="accent">{result.guest_fetch_count} guest fetches</Chip>
+                  <Chip>first {result.guest_fetch_first == null ? "n/a" : `0x${result.guest_fetch_first.toString(16)}`}</Chip>
+                  <Chip>last {result.guest_fetch_last == null ? "n/a" : `0x${result.guest_fetch_last.toString(16)}`}</Chip>
+                  <Chip>{result.guest_opcode_stats.length} opcodes</Chip>
+                </div>
+                {(() => {
+                  const max = Math.max(1, ...result.guest_opcode_stats.map(item => item.count));
+                  return result.guest_opcode_stats.map(stat => (
+                    <div key={stat.opcode} style={{
+                      display: "grid",
+                      gridTemplateColumns: "70px 1fr 80px",
+                      gap: 8,
+                      alignItems: "center",
+                      fontSize: 11,
+                    }}>
+                      <code>0x{stat.opcode.toString(16).padStart(2, "0")}</code>
+                      <div style={{ height: 8, background: "var(--bg-tertiary)", borderRadius: 4, overflow: "hidden" }}>
+                        <div style={{
+                          width: `${Math.max(2, (stat.count / max) * 100)}%`,
+                          height: "100%",
+                          background: "#61afef",
+                        }} />
+                      </div>
+                      <span style={{ color: "var(--text-secondary)", textAlign: "right" }}>{stat.count}</span>
+                    </div>
+                  ));
+                })()}
               </div>
             )}
 
@@ -758,6 +823,7 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
                   <strong style={{ fontSize: 11 }}>{instruction.operation}</strong>
                   <Chip tone="accent">{instruction.handler_instance_id}</Chip>
                   <Chip>{pct(instruction.confidence)}</Chip>
+                  <Chip>{instruction.execution_count ?? 1} executions</Chip>
                   <Chip>lines {rangeLabel(instruction.native_lines)}</Chip>
                 </div>
                 <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
@@ -795,6 +861,7 @@ export default function VmAnalysisPanel({ sessionId, isPhase2Ready, onJumpToSeq,
                   <span style={{ color: "var(--text-secondary)" }}>→</span>
                   <strong style={{ fontSize: 11 }}>{edge.to ?? "unresolved"}</strong>
                   <Chip tone="accent">{edge.kind}</Chip>
+                  <Chip>{edge.execution_count ?? 1} executions</Chip>
                   <Chip tone={edge.confidence < 0.6 ? "warn" : "neutral"}>{pct(edge.confidence)}</Chip>
                   {edge.conditional && <Chip tone="warn">conditional</Chip>}
                 </div>

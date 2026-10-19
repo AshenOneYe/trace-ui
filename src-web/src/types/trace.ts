@@ -241,6 +241,7 @@ export interface HandlerInstance {
   dispatcher_line: number | null;
   template_hash: string;
   cluster_id: string | null;
+  execution_count: number;
   unknown_effects: string[];
   evidence: EvidenceRef[];
 }
@@ -256,6 +257,7 @@ export interface VmInstruction {
   control_target: number | null;
   native_lines: LineRange;
   confidence: number;
+  execution_count: number;
   unknown_effects: string[];
   evidence: EvidenceRef[];
 }
@@ -266,6 +268,7 @@ export interface VirtualCfgEdge {
   kind: string;
   conditional: boolean;
   confidence: number;
+  execution_count: number;
   reason: string;
   evidence: EvidenceRef[];
 }
@@ -280,9 +283,18 @@ export interface VmAnalysisResult {
   vm_instructions: VmInstruction[];
   cfg_edges: VirtualCfgEdge[];
   coverage: LineRange[];
+  guest_fetch_count: number;
+  guest_fetch_first: number | null;
+  guest_fetch_last: number | null;
+  guest_opcode_stats: GuestOpcodeStat[];
   warnings: string[];
   algorithm_version: string;
   experimental: boolean;
+}
+
+export interface GuestOpcodeStat {
+  opcode: number;
+  count: number;
 }
 
 export interface Hypothesis {

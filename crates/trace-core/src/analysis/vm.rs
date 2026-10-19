@@ -7,7 +7,7 @@ use crate::position::{GlobalLine, LineRange};
 
 use super::types::{
     CfgEdgeKind, DispatchKind, DispatcherCandidate, EvidenceKind, EvidenceRef, HandlerCluster,
-    HandlerInstance, HandlerSemantics, VirtualCfgEdge, VmAnalysisResult, VmInstruction,
+    GuestOpcodeStat, HandlerInstance, HandlerSemantics, VirtualCfgEdge, VmAnalysisResult, VmInstruction,
     VmOperation, VmRegion, VmStateCandidate, VmStateRole,
 };
 use super::{Hypothesis, HypothesisSource, HypothesisStatus};
@@ -26,6 +26,7 @@ pub struct NativeEvent {
     pub mem_width: u8,
     pub mem_is_write: bool,
     pub mem_present: bool,
+    pub mem_value: Option<u64>,
     pub branch_target: Option<u64>,
     pub indirect_branch: bool,
     pub conditional_branch: bool,
@@ -100,6 +101,7 @@ impl NativeEvent {
             mem_width: 0,
             mem_is_write: false,
             mem_present: false,
+            mem_value: None,
             branch_target: None,
             indirect_branch: false,
             conditional_branch: false,
@@ -140,6 +142,11 @@ impl NativeEvent {
         self.mem_width = width;
         self.mem_is_write = false;
         self.mem_present = true;
+        self
+    }
+
+    pub fn memory_value(mut self, value: u64) -> Self {
+        self.mem_value = Some(value);
         self
     }
 
@@ -233,6 +240,7 @@ pub(crate) fn vm_hint_flags(mnemonic: &str, disasm: &str) -> u8 {
 struct DispatchExecution {
     line: GlobalLine,
     target: Option<u64>,
+    guest_fetch: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -283,6 +291,19 @@ impl VmAnalyzer {
         if events.windows(2).any(|pair| pair[0].line > pair[1].line) {
             return Err(VmAnalysisError::UnsortedEvents);
         }
+        let mut profile_mark = std::time::Instant::now();
+        macro_rules! profile {
+            ($name:expr) => {
+                if std::env::var_os("TRACE_VM_PROFILE").is_some() {
+                    eprintln!(
+                        "[vm-profile] {}: {}ms",
+                        $name,
+                        profile_mark.elapsed().as_millis()
+                    );
+                }
+                profile_mark = std::time::Instant::now();
+            };
+        }
 
         let mut frequencies: BTreeMap<u64, u64> = BTreeMap::new();
         let mut lines_by_address: BTreeMap<u64, (GlobalLine, GlobalLine)> = BTreeMap::new();
@@ -306,6 +327,7 @@ impl VmAnalyzer {
             frequencies.keys().copied().collect(),
             self.config.max_address_gap,
         );
+        profile!("frequency/address clusters");
         let region_end = events
             .last()
             .map(|event| {
@@ -411,6 +433,7 @@ impl VmAnalyzer {
         }
 
         let inventory = self.find_dispatchers(trace_id, events, &regions, region_end);
+        profile!("find dispatchers");
         if is_cancelled() {
             return Err(VmAnalysisError::Cancelled);
         }
@@ -451,6 +474,29 @@ impl VmAnalyzer {
                     DispatchKind::VmPrimary | DispatchKind::VmProvisional
                 )
             })
+            .collect();
+
+        let mut guest_fetch_count = 0u64;
+        let mut guest_fetch_first = None;
+        let mut guest_fetch_last = None;
+        let mut guest_opcode_counts: BTreeMap<u64, u64> = BTreeMap::new();
+        for dispatcher in &primary_dispatchers {
+            let Some(executions) = executions_by_site.get(&dispatcher.address) else {
+                continue;
+            };
+            for execution in executions {
+                let Some((fetch_address, opcode)) = execution.guest_fetch else {
+                    continue;
+                };
+                guest_fetch_count += 1;
+                guest_fetch_first.get_or_insert(fetch_address);
+                guest_fetch_last = Some(fetch_address);
+                *guest_opcode_counts.entry(opcode).or_default() += 1;
+            }
+        }
+        let guest_opcode_stats = guest_opcode_counts
+            .into_iter()
+            .map(|(opcode, count)| GuestOpcodeStat { opcode, count })
             .collect();
 
         #[derive(Debug)]
@@ -513,6 +559,95 @@ impl VmAnalyzer {
             }
         }
         intervals.sort_by_key(|interval| (interval.start, interval.end));
+        profile!("build/sort handler intervals");
+
+        // AVM handlers usually converge into a shared interpreter tail: state
+        // update, guest fetch, and the next dispatch. Leaving that tail inside
+        // every handler makes all handlers look semantically identical. Find
+        // the longest common address suffix across representative handler
+        // entries and trim it before hashing/semantic inference.
+        let mut samples: Vec<Vec<u64>> = Vec::new();
+        let mut sampled_targets = BTreeSet::new();
+        for interval in &intervals {
+            let target_key = (interval.dispatcher.region_id.clone(), interval.target);
+            if !sampled_targets.insert(target_key) {
+                continue;
+            }
+            let begin = events.partition_point(|event| event.line < interval.start);
+            let end = events.partition_point(|event| event.line < interval.end);
+            if end > begin {
+                samples.push(
+                    events[begin..end]
+                        .iter()
+                        .map(|event| event.address)
+                        .collect(),
+                );
+            }
+            if samples.len() >= 32 {
+                break;
+            }
+        }
+        if samples.len() >= 2 {
+            let mut common_addresses: BTreeSet<u64> =
+                samples[0].iter().copied().collect();
+            for sample in &samples[1..] {
+                let addresses: BTreeSet<u64> = sample.iter().copied().collect();
+                common_addresses.retain(|address| addresses.contains(address));
+            }
+            if !common_addresses.is_empty() {
+                for interval in &mut intervals {
+                    let begin = events.partition_point(|event| event.line < interval.start);
+                    let end = events.partition_point(|event| event.line < interval.end);
+                    if let Some(offset) = events[begin..end]
+                        .iter()
+                        .enumerate()
+                        .find(|(index, event)| {
+                            *index >= 4 && common_addresses.contains(&event.address)
+                        })
+                        .map(|(index, _)| index)
+                    {
+                        interval.end = events[begin + offset].line;
+                    }
+                }
+                intervals.retain(|interval| interval.start < interval.end);
+            } else {
+                // Fallback for handlers whose shared tail is not an exact
+                // prefix-intersection but still has an identical suffix.
+                let common_suffix_len = longest_common_suffix(&samples);
+                if common_suffix_len >= 8 {
+                    let shortest = samples.iter().map(Vec::len).min().unwrap_or(0);
+                    if common_suffix_len + 1 < shortest {
+                        let suffix =
+                            &samples[0][samples[0].len() - common_suffix_len..];
+                        for interval in &mut intervals {
+                            let begin =
+                                events.partition_point(|event| event.line < interval.start);
+                            let end =
+                                events.partition_point(|event| event.line < interval.end);
+                            if end <= begin || end - begin <= common_suffix_len {
+                                continue;
+                            }
+                            let mut cut = end;
+                            let mut matched = 0usize;
+                            while cut > begin && matched < common_suffix_len {
+                                if events[cut - 1].address
+                                    != suffix[common_suffix_len - 1 - matched]
+                                {
+                                    break;
+                                }
+                                cut -= 1;
+                                matched += 1;
+                            }
+                            if matched == common_suffix_len && cut > begin {
+                                interval.end = events[cut].line;
+                            }
+                        }
+                        intervals.retain(|interval| interval.start < interval.end);
+                    }
+                }
+            }
+        }
+        profile!("common-tail trim");
 
         // Use a bounded, evenly-spaced sample of execution windows for state
         // inference. The old code walked every dynamic handler interval and
@@ -651,6 +786,7 @@ impl VmAnalyzer {
         state_ranges.sort_by_key(|range| (range.start, range.end));
         state_ranges.dedup_by_key(|range| (range.start, range.end));
         state_ranges.truncate(4096);
+        profile!("aggregate handlers");
 
         let mut key_to_id: BTreeMap<HandlerKey, String> = BTreeMap::new();
         let mut semantics_by_id: BTreeMap<String, HandlerSemantics> = BTreeMap::new();
@@ -698,6 +834,7 @@ impl VmAnalyzer {
             &state_ranges,
             region_end,
         );
+        profile!("infer states");
 
         let mut grouped: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
         for (index, instance) in handler_instances.iter().enumerate() {
@@ -798,6 +935,21 @@ impl VmAnalyzer {
                     .or_insert_with(|| instruction_id.clone());
             }
         }
+        let handler_addresses: BTreeSet<u64> = handler_instances
+            .iter()
+            .map(|instance| instance.native_address)
+            .collect();
+        let mut target_frequencies: BTreeMap<u64, u64> = BTreeMap::new();
+        for instruction in &vm_instructions {
+            if let Some(target) = instruction.control_target {
+                *target_frequencies.entry(target).or_default() += instruction.execution_count;
+            }
+        }
+        let dispatcher_entries: BTreeSet<u64> = target_frequencies
+            .iter()
+            .filter(|(target, count)| !handler_addresses.contains(target) && **count >= 2)
+            .map(|(target, _)| *target)
+            .collect();
         let mut edge_keys = BTreeSet::new();
         for instruction in &vm_instructions {
             if let Some(target) = instruction.control_target {
@@ -817,6 +969,25 @@ impl VmAnalyzer {
                             confidence: 0.65,
                             execution_count: instruction.execution_count,
                             reason: format!("native branch target 0x{target:x}"),
+                            evidence: instruction.evidence.clone(),
+                        });
+                    }
+                } else if dispatcher_entries.contains(&target) {
+                    let key = (
+                        instruction.id.clone(),
+                        format!("dispatcher-{target:x}"),
+                    );
+                    if edge_keys.insert(key) {
+                        cfg_edges.push(VirtualCfgEdge {
+                            from: instruction.id.clone(),
+                            to: None,
+                            kind: CfgEdgeKind::BackToDispatcher,
+                            conditional: false,
+                            confidence: 0.8,
+                            execution_count: instruction.execution_count,
+                            reason: format!(
+                                "returns to common dispatcher entry 0x{target:x}"
+                            ),
                             evidence: instruction.evidence.clone(),
                         });
                     }
@@ -875,6 +1046,7 @@ impl VmAnalyzer {
                 });
             }
         }
+        profile!("clusters/instructions/cfg");
 
         let mut warnings = vec![
             "VM analysis is heuristic and experimental; validate every inference against native evidence"
@@ -911,6 +1083,7 @@ impl VmAnalyzer {
             warnings
                 .push("an open-ended final handler interval was capped at 4096 lines".to_string());
         }
+        let _ = profile_mark;
 
         Ok(VmAnalysisResult {
             trace_id: trace_id.to_string(),
@@ -922,6 +1095,10 @@ impl VmAnalyzer {
             vm_instructions,
             cfg_edges,
             coverage: vec![LineRange::new(events[0].line, region_end)],
+            guest_fetch_count,
+            guest_fetch_first,
+            guest_fetch_last,
+            guest_opcode_stats,
             warnings,
             algorithm_version: VM_ALGORITHM_VERSION.to_string(),
             experimental: true,
@@ -950,9 +1127,24 @@ impl VmAnalyzer {
                 if is_first_execution {
                     site.signature = signature_for_window(&window, event);
                 }
+                let guest_fetch = window
+                    .iter()
+                    .find(|candidate| {
+                        candidate.mem_present
+                            && !candidate.mem_is_write
+                            && candidate.mem_value.is_some()
+                            && (candidate.mnemonic.as_str().starts_with("ldrb")
+                                || candidate.mnemonic.as_str().starts_with("ldrh"))
+                    })
+                    .and_then(|candidate| {
+                        candidate
+                            .mem_value
+                            .map(|value| (candidate.mem_start, value))
+                    });
                 site.executions.push(DispatchExecution {
                     line: event.line,
                     target: event.branch_target,
+                    guest_fetch,
                 });
                 if let Some(target) = event.branch_target {
                     site.targets.insert(target);
@@ -1723,6 +1915,26 @@ fn cluster_addresses(addresses: Vec<u64>, max_gap: u64) -> Vec<Vec<u64>> {
     clusters
 }
 
+fn longest_common_suffix(samples: &[Vec<u64>]) -> usize {
+    if samples.len() < 2 {
+        return 0;
+    }
+    let shortest = samples.iter().map(Vec::len).min().unwrap_or(0);
+    let mut matched = 0usize;
+    while matched < shortest {
+        let candidate = samples[0][samples[0].len() - 1 - matched];
+        if samples
+            .iter()
+            .all(|sample| sample[sample.len() - 1 - matched] == candidate)
+        {
+            matched += 1;
+        } else {
+            break;
+        }
+    }
+    matched
+}
+
 fn template_hash(events: &[NativeEvent]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for event in events {
@@ -1813,40 +2025,74 @@ fn infer_semantics(events: &[NativeEvent]) -> HandlerSemantics {
 
 fn operation_for_mnemonic(mnemonic: &str) -> VmOperation {
     let mnemonic = mnemonic.to_ascii_lowercase();
-    if mnemonic.starts_with("ldrb") || mnemonic.starts_with("ldrh") || mnemonic.starts_with("ldrs")
+    if mnemonic.starts_with("ldp")
+        || mnemonic.starts_with("ldur")
+        || mnemonic.starts_with("ldxr")
+        || mnemonic.starts_with("ldar")
+        || mnemonic.starts_with("ldrb")
+        || mnemonic.starts_with("ldrh")
+        || mnemonic.starts_with("ldrs")
     {
         VmOperation::Load
-    } else if mnemonic.starts_with("mov") || mnemonic.starts_with("ldr") {
+    } else if mnemonic.starts_with("stp")
+        || mnemonic.starts_with("stur")
+        || mnemonic.starts_with("stxr")
+        || mnemonic.starts_with("stlr")
+        || mnemonic.starts_with("str")
+    {
+        VmOperation::Store
+    } else if mnemonic.starts_with("bl") {
+        // Must come before the generic b/br checks; blr starts with "b".
+        VmOperation::Call
+    } else if mnemonic.starts_with("b.")
+        || mnemonic.starts_with("cb")
+        || mnemonic.starts_with("tb")
+    {
+        VmOperation::ConditionalBranch
+    } else if mnemonic == "b" || mnemonic.starts_with("br") {
+        VmOperation::Branch
+    } else if mnemonic.starts_with("ret") {
+        VmOperation::Return
+    } else if mnemonic.starts_with("mov")
+        || mnemonic.starts_with("ldr")
+        || mnemonic.starts_with("adr")
+        || mnemonic.starts_with("csel")
+        || mnemonic.starts_with("csinc")
+        || mnemonic.starts_with("csinv")
+        || mnemonic.starts_with("csneg")
+    {
         VmOperation::Move
     } else if mnemonic.starts_with("add") {
         VmOperation::Add
     } else if mnemonic.starts_with("sub") {
         VmOperation::Sub
-    } else if mnemonic.starts_with("mul") {
+    } else if mnemonic.starts_with("mul")
+        || mnemonic.starts_with("madd")
+        || mnemonic.starts_with("msub")
+    {
         VmOperation::Mul
-    } else if mnemonic.starts_with("and") {
+    } else if mnemonic.starts_with("and") || mnemonic.starts_with("bic") {
         VmOperation::And
-    } else if mnemonic.starts_with("orr") {
+    } else if mnemonic.starts_with("orr") || mnemonic.starts_with("orn") {
         VmOperation::Or
-    } else if mnemonic.starts_with("eor") {
+    } else if mnemonic.starts_with("eor") || mnemonic.starts_with("eon") {
         VmOperation::Xor
     } else if mnemonic.starts_with("lsl")
         || mnemonic.starts_with("lsr")
         || mnemonic.starts_with("asr")
+        || mnemonic.starts_with("ubfx")
+        || mnemonic.starts_with("sbfx")
+        || mnemonic.starts_with("bfi")
+        || mnemonic.starts_with("bfxil")
+        || mnemonic.starts_with("extr")
     {
         VmOperation::Shift
-    } else if mnemonic.starts_with("cmp") || mnemonic.starts_with("tst") {
+    } else if mnemonic.starts_with("cmp")
+        || mnemonic.starts_with("tst")
+        || mnemonic.starts_with("ccmp")
+        || mnemonic.starts_with("ccmn")
+    {
         VmOperation::Compare
-    } else if mnemonic.starts_with("str") {
-        VmOperation::Store
-    } else if mnemonic.starts_with("b.") || mnemonic.starts_with("cb") {
-        VmOperation::ConditionalBranch
-    } else if mnemonic.starts_with("br") || mnemonic.starts_with("b") {
-        VmOperation::Branch
-    } else if mnemonic.starts_with("ret") {
-        VmOperation::Return
-    } else if mnemonic.starts_with("bl") {
-        VmOperation::Call
     } else {
         VmOperation::Unknown
     }
@@ -1945,6 +2191,7 @@ pub fn merge_vm_results(trace_id: &str, parts: Vec<VmAnalysisResult>) -> VmAnaly
         experimental: true,
         ..VmAnalysisResult::default()
     };
+    let mut guest_opcodes: BTreeMap<u64, u64> = BTreeMap::new();
     for (part_index, mut part) in parts.into_iter().enumerate() {
         let prefix = format!("p{part_index}-");
         for region in &mut part.regions {
@@ -1983,6 +2230,21 @@ pub fn merge_vm_results(trace_id: &str, parts: Vec<VmAnalysisResult>) -> VmAnaly
         merged.vm_instructions.extend(part.vm_instructions);
         merged.cfg_edges.extend(part.cfg_edges);
         merged.coverage.extend(part.coverage);
+        merged.guest_fetch_count += part.guest_fetch_count;
+        if let Some(first) = part.guest_fetch_first {
+            merged.guest_fetch_first = Some(
+                merged
+                    .guest_fetch_first
+                    .map_or(first, |current| current.min(first)),
+            );
+        }
+        if let Some(last) = part.guest_fetch_last {
+            merged.guest_fetch_last =
+                Some(merged.guest_fetch_last.map_or(last, |current| current.max(last)));
+        }
+        for stat in part.guest_opcode_stats {
+            *guest_opcodes.entry(stat.opcode).or_default() += stat.count;
+        }
         merged.warnings.extend(part.warnings);
         merged.experimental |= part.experimental;
     }
@@ -1992,6 +2254,10 @@ pub fn merge_vm_results(trace_id: &str, parts: Vec<VmAnalysisResult>) -> VmAnaly
     merged.coverage = coalesce_line_ranges(merged.coverage);
     merged.warnings.sort();
     merged.warnings.dedup();
+    merged.guest_opcode_stats = guest_opcodes
+        .into_iter()
+        .map(|(opcode, count)| GuestOpcodeStat { opcode, count })
+        .collect();
     merged
 }
 
@@ -2394,5 +2660,215 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), merged.handler_instances.len());
         assert_eq!(merged.coverage.len(), 1);
+    }
+
+    #[test]
+    fn classifies_common_arm64_mnemonics() {
+        assert_eq!(operation_for_mnemonic("stp"), VmOperation::Store);
+        assert_eq!(operation_for_mnemonic("ldp"), VmOperation::Load);
+        assert_eq!(operation_for_mnemonic("stur"), VmOperation::Store);
+        assert_eq!(operation_for_mnemonic("csel"), VmOperation::Move);
+        assert_eq!(operation_for_mnemonic("adrp"), VmOperation::Move);
+        assert_eq!(operation_for_mnemonic("ubfx"), VmOperation::Shift);
+        assert_eq!(operation_for_mnemonic("blr"), VmOperation::Call);
+        assert_eq!(
+            operation_for_mnemonic("b.eq"),
+            VmOperation::ConditionalBranch
+        );
+        assert_eq!(operation_for_mnemonic("b"), VmOperation::Branch);
+    }
+
+    #[test]
+    fn trims_common_interpreter_tail_from_handlers() {
+        let mut events = Vec::new();
+        events.push(
+            NativeEvent::instruction(GlobalLine(0), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2000, "x9"),
+        );
+        for (index, address) in [0x2000u64, 0x2004, 0x2008, 0x200c, 0x2010]
+            .iter()
+            .enumerate()
+        {
+            events.push(
+                NativeEvent::instruction(
+                    GlobalLine(index as u64 + 1),
+                    *address,
+                    "add",
+                    "add x0, x0, #1",
+                )
+                .writes(&["x0"]),
+            );
+        }
+        for (index, address) in [0x4000u64, 0x4004, 0x4008, 0x400c, 0x4010, 0x4014]
+            .iter()
+            .enumerate()
+        {
+            events.push(
+                NativeEvent::instruction(
+                    GlobalLine(index as u64 + 6),
+                    *address,
+                    "mov",
+                    "mov x1, x0",
+                )
+                .writes(&["x1"]),
+            );
+        }
+        events.push(
+            NativeEvent::instruction(GlobalLine(13), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x3000, "x9"),
+        );
+        for (index, address) in [0x3000u64, 0x3004, 0x3008, 0x300c, 0x3010]
+            .iter()
+            .enumerate()
+        {
+            events.push(
+                NativeEvent::instruction(
+                    GlobalLine(index as u64 + 14),
+                    *address,
+                    "sub",
+                    "sub x0, x0, #1",
+                )
+                .writes(&["x0"]),
+            );
+        }
+        for (index, address) in [0x4000u64, 0x4004, 0x4008, 0x400c, 0x4010, 0x4014]
+            .iter()
+            .enumerate()
+        {
+            events.push(
+                NativeEvent::instruction(
+                    GlobalLine(index as u64 + 19),
+                    *address,
+                    "mov",
+                    "mov x1, x0",
+                )
+                .writes(&["x1"]),
+            );
+        }
+        events.push(
+            NativeEvent::instruction(GlobalLine(26), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2000, "x9"),
+        );
+
+        let result = VmAnalyzer::new(VmAnalysisConfig {
+            min_region_executions: 1,
+            min_repeated_instructions: 0,
+            allow_provisional_primary: true,
+            ..VmAnalysisConfig::default()
+        })
+        .analyze("trace", &events)
+        .unwrap();
+        let handlers = result
+            .handler_instances
+            .iter()
+            .filter(|handler| matches!(handler.native_address, 0x1235_2000 | 0x1235_3000 | 0x2000 | 0x3000))
+            .collect::<Vec<_>>();
+        assert!(!handlers.is_empty());
+        assert!(handlers.iter().all(|handler| handler.end_line.get() <= 19));
+        assert!(result
+            .handler_clusters
+            .iter()
+            .all(|cluster| !cluster.semantics.operations.contains(&VmOperation::Unknown)));
+    }
+
+    #[test]
+    fn marks_shared_targets_as_back_to_dispatcher() {
+        let events = vec![
+            NativeEvent::instruction(GlobalLine(0), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2000, "x9"),
+            NativeEvent::instruction(GlobalLine(1), 0x2000, "add", "add x0, x0, #1")
+                .writes(&["x0"]),
+            NativeEvent::instruction(GlobalLine(2), 0x2004, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x5000, "x9"),
+            NativeEvent::instruction(GlobalLine(3), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x3000, "x9"),
+            NativeEvent::instruction(GlobalLine(4), 0x3000, "sub", "sub x0, x0, #1")
+                .writes(&["x0"]),
+            NativeEvent::instruction(GlobalLine(5), 0x3004, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x5000, "x9"),
+            NativeEvent::instruction(GlobalLine(6), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2000, "x9"),
+        ];
+        let result = VmAnalyzer::new(VmAnalysisConfig {
+            min_region_executions: 1,
+            min_repeated_instructions: 0,
+            allow_provisional_primary: true,
+            ..VmAnalysisConfig::default()
+        })
+        .analyze("trace", &events)
+        .unwrap();
+        assert!(result
+            .cfg_edges
+            .iter()
+            .any(|edge| edge.kind == CfgEdgeKind::BackToDispatcher
+                && edge.reason.contains("0x5000")));
+    }
+
+    #[test]
+    fn records_guest_opcode_statistics() {
+        let mut events = vec![
+            NativeEvent::instruction(GlobalLine(0), 0x0ff0, "ldrb", "ldrb w12, [x10, #1]")
+                .reads(&["x10"])
+                .writes(&["w12"])
+                .memory_read(0x8000_0001, 1)
+                .memory_value(0x05),
+            NativeEvent::instruction(GlobalLine(1), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2000, "x9"),
+            NativeEvent::instruction(GlobalLine(2), 0x2000, "add", "add x0, x0, #1")
+                .writes(&["x0"]),
+        ];
+        for index in 0..30u64 {
+            events.push(NativeEvent::instruction(
+                GlobalLine(index + 3),
+                0x3000 + index * 4,
+                "nop",
+                "nop",
+            ));
+        }
+        events.extend([
+            NativeEvent::instruction(GlobalLine(33), 0x0ff0, "ldrb", "ldrb w12, [x10, #1]")
+                .reads(&["x10"])
+                .writes(&["w12"])
+                .memory_read(0x8000_0005, 1)
+                .memory_value(0x15),
+            NativeEvent::instruction(GlobalLine(34), 0x100c, "br", "br x9")
+                .reads(&["x9"])
+                .dispatch(0x2010, "x9"),
+            NativeEvent::instruction(GlobalLine(35), 0x2010, "sub", "sub x0, x0, #1")
+                .writes(&["x0"]),
+        ]);
+        let result = VmAnalyzer::new(VmAnalysisConfig {
+            min_region_executions: 1,
+            min_repeated_instructions: 0,
+            allow_provisional_primary: true,
+            ..VmAnalysisConfig::default()
+        })
+        .analyze("trace", &events)
+        .unwrap();
+        assert_eq!(result.guest_fetch_count, 2);
+        assert_eq!(result.guest_fetch_first, Some(0x8000_0001));
+        assert_eq!(result.guest_fetch_last, Some(0x8000_0005));
+        assert_eq!(
+            result.guest_opcode_stats,
+            vec![
+                GuestOpcodeStat {
+                    opcode: 0x05,
+                    count: 1
+                },
+                GuestOpcodeStat {
+                    opcode: 0x15,
+                    count: 1
+                }
+            ]
+        );
     }
 }

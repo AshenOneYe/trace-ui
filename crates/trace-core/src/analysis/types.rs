@@ -228,6 +228,7 @@ pub enum CfgEdgeKind {
     Fallthrough,
     Conditional,
     Unconditional,
+    BackToDispatcher,
     Indirect,
     Uncertain,
 }
@@ -243,9 +244,23 @@ pub struct VmAnalysisResult {
     pub vm_instructions: Vec<VmInstruction>,
     pub cfg_edges: Vec<VirtualCfgEdge>,
     pub coverage: Vec<LineRange>,
+    #[serde(default)]
+    pub guest_fetch_count: u64,
+    #[serde(default)]
+    pub guest_fetch_first: Option<u64>,
+    #[serde(default)]
+    pub guest_fetch_last: Option<u64>,
+    #[serde(default)]
+    pub guest_opcode_stats: Vec<GuestOpcodeStat>,
     pub warnings: Vec<String>,
     pub algorithm_version: String,
     pub experimental: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestOpcodeStat {
+    pub opcode: u64,
+    pub count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

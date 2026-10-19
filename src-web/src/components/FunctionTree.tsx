@@ -313,8 +313,9 @@ export default function FunctionTree({
                 : <span style={{ color: "var(--text-address)", flexShrink: 0 }}>{row.func_addr}</span>
               }
               <span style={{ color: "var(--text-secondary)", fontSize: 11, marginLeft: "auto", flexShrink: 0 }}>
-                {row.call_count > 1 ? `x${formatLineCount(row.call_count)} · ` : ""}
-                {formatLineCount(row.line_count)}
+                {row.call_count > 1
+                  ? `x${formatLineCount(row.call_count)} calls · span ${formatLineCount(row.line_count)}`
+                  : formatLineCount(row.line_count)}
               </span>
             </div>
           );

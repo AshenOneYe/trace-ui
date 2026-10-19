@@ -94,10 +94,23 @@ fn node_to_dto(
         }
     };
 
+    let func_name = n.func_name.clone().or_else(|| {
+        if n.func_addr == 0 {
+            None
+        } else {
+            let address = if func_addr == "0x0" {
+                format!("{:x}", n.func_addr)
+            } else {
+                func_addr.trim_start_matches("0x").to_string()
+            };
+            Some(format!("sub_{address}"))
+        }
+    });
+
     CallTreeNodeDto {
         id: n.id,
         func_addr,
-        func_name: n.func_name.clone(),
+        func_name,
         entry_seq: n.entry_seq,
         exit_seq: n.exit_seq,
         parent_id: n.parent_id,
