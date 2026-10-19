@@ -12,6 +12,7 @@ interface FlatRow {
   func_name: string | null;
   entry_seq: number;
   line_count: number;
+  call_count: number;
   depth: number;
   hasChildren: boolean;
   isExpanded: boolean;
@@ -77,6 +78,7 @@ export default function FunctionTree({
         id: dto.id, func_addr: dto.func_addr, func_name: dto.func_name ?? null,
         entry_seq: dto.entry_seq,
         line_count: dto.exit_seq - dto.entry_seq + 1,
+        call_count: dto.call_count ?? 1,
         depth, hasChildren, isExpanded: isExp, isChildrenLoaded,
       });
       if (hasChildren && isExp && isChildrenLoaded) {
@@ -311,6 +313,7 @@ export default function FunctionTree({
                 : <span style={{ color: "var(--text-address)", flexShrink: 0 }}>{row.func_addr}</span>
               }
               <span style={{ color: "var(--text-secondary)", fontSize: 11, marginLeft: "auto", flexShrink: 0 }}>
+                {row.call_count > 1 ? `x${formatLineCount(row.call_count)} · ` : ""}
                 {formatLineCount(row.line_count)}
               </span>
             </div>

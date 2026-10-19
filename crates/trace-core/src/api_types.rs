@@ -251,6 +251,7 @@ pub struct CallTreeNodeDto {
     pub parent_id: Option<u32>,
     pub children_ids: Vec<u32>,
     pub line_count: u64,
+    pub call_count: u32,
 }
 
 // ── Strings ──

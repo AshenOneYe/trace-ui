@@ -6,8 +6,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-const MAGIC: &[u8; 8] = b"TCACHE07";
-const MAGIC_V4: &[u8; 8] = b"TCACHE07";
+const MAGIC: &[u8; 8] = b"TCACHE08";
+const MAGIC_V4: &[u8; 8] = b"TCACHE08";
 const HEAD_SIZE: usize = 1024 * 1024; // 1MB
 const HEADER_LEN_V4: usize = 64;
 

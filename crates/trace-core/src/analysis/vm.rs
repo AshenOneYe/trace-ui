@@ -247,6 +247,7 @@ struct DispatchSite {
 struct DispatchInventory {
     candidates: Vec<DispatcherCandidate>,
     executions_by_site: BTreeMap<u64, Vec<DispatchExecution>>,
+    merged_primaries: usize,
 }
 
 impl Default for VmAnalyzer {
@@ -413,7 +414,11 @@ impl VmAnalyzer {
         if is_cancelled() {
             return Err(VmAnalysisError::Cancelled);
         }
-        let dispatchers = inventory.candidates;
+        let DispatchInventory {
+            candidates: dispatchers,
+            executions_by_site,
+            merged_primaries,
+        } = inventory;
         let used_regions: BTreeSet<String> = dispatchers
             .iter()
             .map(|dispatcher| dispatcher.region_id.clone())
@@ -460,7 +465,7 @@ impl VmAnalyzer {
 
         let mut intervals = Vec::new();
         for dispatcher in &primary_dispatchers {
-            let Some(executions) = inventory.executions_by_site.get(&dispatcher.address) else {
+            let Some(executions) = executions_by_site.get(&dispatcher.address) else {
                 continue;
             };
             for pair in executions.windows(2) {
@@ -509,16 +514,53 @@ impl VmAnalyzer {
         }
         intervals.sort_by_key(|interval| (interval.start, interval.end));
 
-        let mut handler_instances = Vec::new();
-        let mut instance_semantics: Vec<HandlerSemantics> = Vec::new();
+        // Use a bounded, evenly-spaced sample of execution windows for state
+        // inference. The old code walked every dynamic handler interval and
+        // could materialise millions of events on large traces.
+        let mut state_ranges = Vec::new();
+        let state_step = (intervals.len() / 4096).max(1);
+        for (index, interval) in intervals.iter().enumerate() {
+            if index % state_step == 0 {
+                state_ranges.push(LineRange::new(interval.start, interval.end));
+                if state_ranges.len() >= 4096 {
+                    break;
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        struct HandlerKey {
+            region_id: String,
+            native_address: u64,
+            template_hash: String,
+        }
+
+        struct HandlerAggregate {
+            region_id: String,
+            native_address: u64,
+            template_hash: String,
+            execution_count: u64,
+            first_entry: GlobalLine,
+            first_end: GlobalLine,
+            first_dispatch: GlobalLine,
+            last_entry: GlobalLine,
+            last_dispatch: GlobalLine,
+            last_end: GlobalLine,
+            semantics: HandlerSemantics,
+            first_evidence: EvidenceRef,
+        }
+
+        let mut aggregates: BTreeMap<HandlerKey, HandlerAggregate> = BTreeMap::new();
+        let mut transitions: BTreeMap<(HandlerKey, HandlerKey), u64> = BTreeMap::new();
         let mut event_cursor = 0usize;
         let mut last_handler_end = GlobalLine::ZERO;
         let mut clipped_intervals = 0usize;
         let mut capped_tail = false;
+        let mut previous_key: Option<HandlerKey> = None;
+        let mut unique_limit_hit = false;
+        let mut dropped_executions = 0u64;
+
         for interval in intervals {
-            if handler_instances.len() >= self.config.max_handler_instances {
-                break;
-            }
             if is_cancelled() {
                 return Err(VmAnalysisError::Cancelled);
             }
@@ -552,35 +594,108 @@ impl VmAnalyzer {
                 capped_tail = true;
             }
             let template = template_hash(slice);
-            let semantics = infer_semantics(slice);
             let native_address = interval.target.unwrap_or(slice[0].address);
-            let id = format!("handler-{}-{}", interval.dispatch_line.0, native_address);
+            let key = HandlerKey {
+                region_id: interval.dispatcher.region_id.clone(),
+                native_address,
+                template_hash: template,
+            };
+
+            if let Some(aggregate) = aggregates.get_mut(&key) {
+                aggregate.execution_count += 1;
+                aggregate.last_entry = entry_line;
+                aggregate.last_dispatch = interval.dispatch_line;
+                aggregate.last_end = end_line;
+            } else if aggregates.len() >= self.config.max_handler_instances {
+                unique_limit_hit = true;
+                dropped_executions += 1;
+                previous_key = None;
+                continue;
+            } else {
+                if state_ranges.len() < 4096 {
+                    state_ranges.push(LineRange::new(start, end_line));
+                }
+                aggregates.insert(
+                    key.clone(),
+                    HandlerAggregate {
+                        region_id: key.region_id.clone(),
+                        native_address,
+                        template_hash: key.template_hash.clone(),
+                        execution_count: 1,
+                        first_entry: entry_line,
+                        first_end: end_line,
+                        first_dispatch: interval.dispatch_line,
+                        last_entry: entry_line,
+                        last_dispatch: interval.dispatch_line,
+                        last_end: end_line,
+                        semantics: infer_semantics(slice),
+                        first_evidence: EvidenceRef {
+                            trace_id: trace_id.to_string(),
+                            lines: LineRange::new(interval.dispatch_line, end_line),
+                            native_address: Some(native_address),
+                            kind: EvidenceKind::HandlerSequence,
+                            detail: Some(
+                                "first observed execution of this handler".to_string(),
+                            ),
+                        },
+                    },
+                );
+            }
+
+            if let Some(previous) = previous_key.take() {
+                *transitions.entry((previous, key.clone())).or_default() += 1;
+            }
+            previous_key = Some(key);
+        }
+
+        state_ranges.sort_by_key(|range| (range.start, range.end));
+        state_ranges.dedup_by_key(|range| (range.start, range.end));
+        state_ranges.truncate(4096);
+
+        let mut key_to_id: BTreeMap<HandlerKey, String> = BTreeMap::new();
+        let mut semantics_by_id: BTreeMap<String, HandlerSemantics> = BTreeMap::new();
+        let mut handler_instances = Vec::new();
+        for (key, aggregate) in &aggregates {
+            let short_hash = &aggregate.template_hash[..aggregate.template_hash.len().min(8)];
+            let id = format!(
+                "handler-{}-{:x}-{}",
+                aggregate.region_id, aggregate.native_address, short_hash
+            );
+            key_to_id.insert(key.clone(), id.clone());
+            semantics_by_id.insert(id.clone(), aggregate.semantics.clone());
+            let mut evidence = vec![aggregate.first_evidence.clone()];
+            if aggregate.execution_count > 1 {
+                evidence.push(EvidenceRef {
+                    trace_id: trace_id.to_string(),
+                    lines: LineRange::new(aggregate.last_dispatch, aggregate.last_end),
+                    native_address: Some(aggregate.native_address),
+                    kind: EvidenceKind::HandlerSequence,
+                    detail: Some("last observed execution of this handler".to_string()),
+                });
+            }
             handler_instances.push(HandlerInstance {
                 id,
-                region_id: interval.dispatcher.region_id.clone(),
-                entry_line,
-                end_line,
-                native_address,
-                dispatcher_line: Some(interval.dispatch_line),
-                template_hash: template,
+                region_id: aggregate.region_id.clone(),
+                entry_line: aggregate.first_entry,
+                end_line: aggregate.first_end,
+                native_address: aggregate.native_address,
+                dispatcher_line: Some(aggregate.first_dispatch),
+                template_hash: aggregate.template_hash.clone(),
                 cluster_id: None,
-                unknown_effects: semantics.unknown_effects.clone(),
-                evidence: vec![EvidenceRef {
-                    trace_id: trace_id.to_string(),
-                    lines: LineRange::new(interval.dispatch_line, end_line),
-                    native_address: Some(native_address),
-                    kind: EvidenceKind::HandlerSequence,
-                    detail: Some("execution interval after primary dispatcher".to_string()),
-                }],
+                execution_count: aggregate.execution_count,
+                unknown_effects: aggregate.semantics.unknown_effects.clone(),
+                evidence,
             });
-            instance_semantics.push(semantics);
         }
+        handler_instances.sort_by_key(|instance| {
+            (instance.entry_line, instance.native_address, instance.id.clone())
+        });
 
         let state_candidates = self.infer_state_candidates(
             trace_id,
             events,
             &dispatchers,
-            &handler_instances,
+            &state_ranges,
             region_end,
         );
 
@@ -599,12 +714,19 @@ impl VmAnalyzer {
                 handler_instances[*index].cluster_id = Some(cluster_id.clone());
             }
             let representative = &handler_instances[indices[0]];
-            let semantics = instance_semantics[indices[0]].clone();
+            let semantics = semantics_by_id
+                .get(&representative.id)
+                .cloned()
+                .unwrap_or_default();
+            let instance_count = indices
+                .iter()
+                .map(|index| handler_instances[*index].execution_count)
+                .sum::<u64>() as usize;
             handler_clusters.push(HandlerCluster {
                 id: cluster_id,
                 region_id,
                 template_hash: template,
-                instance_count: indices.len(),
+                instance_count,
                 representative_lines: indices
                     .iter()
                     .take(8)
@@ -613,7 +735,7 @@ impl VmAnalyzer {
                         LineRange::new(instance.entry_line, instance.end_line)
                     })
                     .collect(),
-                confidence: if indices.len() > 1 { 0.75 } else { 0.45 },
+                confidence: if instance_count > 1 { 0.8 } else { 0.55 },
                 semantics,
                 conflicts: Vec::new(),
                 evidence: vec![EvidenceRef::native(
@@ -624,7 +746,11 @@ impl VmAnalyzer {
         }
 
         let mut vm_instructions = Vec::new();
-        for (instance, semantics) in handler_instances.iter().zip(instance_semantics.iter()) {
+        for instance in &handler_instances {
+            let semantics = semantics_by_id
+                .get(&instance.id)
+                .cloned()
+                .unwrap_or_default();
             vm_instructions.push(VmInstruction {
                 id: format!("vm-insn-{}", instance.id),
                 handler_instance_id: instance.id.clone(),
@@ -644,6 +770,7 @@ impl VmAnalyzer {
                     .and_then(|value| u64::from_str_radix(value, 16).ok()),
                 native_lines: LineRange::new(instance.entry_line, instance.end_line),
                 confidence: semantics.confidence,
+                execution_count: instance.execution_count,
                 unknown_effects: semantics.unknown_effects.clone(),
                 evidence: instance.evidence.clone(),
             });
@@ -659,14 +786,18 @@ impl VmAnalyzer {
                 )
             })
             .collect();
-        let instruction_by_address: BTreeMap<u64, String> = handler_instances
+        let instruction_by_id: BTreeMap<String, &VmInstruction> = vm_instructions
             .iter()
-            .filter_map(|instance| {
-                instruction_by_instance
-                    .get(&instance.id)
-                    .map(|instruction_id| (instance.native_address, instruction_id.clone()))
-            })
+            .map(|instruction| (instruction.id.clone(), instruction))
             .collect();
+        let mut instruction_by_address: BTreeMap<u64, String> = BTreeMap::new();
+        for instance in &handler_instances {
+            if let Some(instruction_id) = instruction_by_instance.get(&instance.id) {
+                instruction_by_address
+                    .entry(instance.native_address)
+                    .or_insert_with(|| instruction_id.clone());
+            }
+        }
         let mut edge_keys = BTreeSet::new();
         for instruction in &vm_instructions {
             if let Some(target) = instruction.control_target {
@@ -684,6 +815,7 @@ impl VmAnalyzer {
                             },
                             conditional,
                             confidence: 0.65,
+                            execution_count: instruction.execution_count,
                             reason: format!("native branch target 0x{target:x}"),
                             evidence: instruction.evidence.clone(),
                         });
@@ -697,6 +829,7 @@ impl VmAnalyzer {
                             kind: CfgEdgeKind::Uncertain,
                             conditional: instruction.operation == VmOperation::ConditionalBranch,
                             confidence: 0.3,
+                            execution_count: instruction.execution_count,
                             reason: format!(
                                 "branch target 0x{target:x} was not observed as a handler entry"
                             ),
@@ -706,20 +839,39 @@ impl VmAnalyzer {
                 }
             }
         }
-        for pair in vm_instructions.windows(2) {
-            let key = (pair[0].id.clone(), pair[1].id.clone());
-            if edge_keys.insert(key) {
+        for ((from_key, to_key), execution_count) in &transitions {
+            let (Some(from_id), Some(to_id)) =
+                (key_to_id.get(from_key), key_to_id.get(to_key))
+            else {
+                continue;
+            };
+            let from_instruction_id = format!("vm-insn-{from_id}");
+            let to_instruction_id = format!("vm-insn-{to_id}");
+            let edge_key = (from_instruction_id.clone(), to_instruction_id.clone());
+            if edge_keys.insert(edge_key) {
+                let from_instruction = instruction_by_id
+                    .get(&from_instruction_id)
+                    .expect("handler key has an instruction");
+                let conditional =
+                    from_instruction.operation == VmOperation::ConditionalBranch;
+                let kind = if conditional {
+                    CfgEdgeKind::Conditional
+                } else if from_instruction.control_target.is_some() {
+                    CfgEdgeKind::Unconditional
+                } else {
+                    CfgEdgeKind::Fallthrough
+                };
                 cfg_edges.push(VirtualCfgEdge {
-                    from: pair[0].id.clone(),
-                    to: Some(pair[1].id.clone()),
-                    kind: CfgEdgeKind::Fallthrough,
-                    conditional: false,
-                    confidence: 0.35,
-                    reason: "consecutive observed handler instances".to_string(),
-                    evidence: vec![EvidenceRef::native(
-                        trace_id,
-                        LineRange::new(pair[0].native_lines.end, pair[1].native_lines.start),
-                    )],
+                    from: from_instruction_id,
+                    to: Some(to_instruction_id),
+                    kind,
+                    conditional,
+                    confidence: 0.6,
+                    execution_count: *execution_count,
+                    reason: format!(
+                        "{execution_count} observed transitions between handler templates"
+                    ),
+                    evidence: from_instruction.evidence.clone(),
                 });
             }
         }
@@ -739,15 +891,20 @@ impl VmAnalyzer {
                 "{excluded_regions} regions without dispatcher candidates were excluded"
             ));
         }
+        if merged_primaries > 0 {
+            warnings.push(format!(
+                "merged {merged_primaries} overlapping primary dispatchers into nested dispatchers"
+            ));
+        }
         if clipped_intervals > 0 {
             warnings.push(format!(
                 "{clipped_intervals} overlapping primary handler intervals were clipped"
             ));
         }
-        if handler_instances.len() >= self.config.max_handler_instances {
+        if unique_limit_hit {
             warnings.push(format!(
-                "handler instance limit {} reached; analysis was truncated",
-                self.config.max_handler_instances
+                "unique handler limit {} reached; {dropped_executions} executions of untracked handlers were omitted",
+                self.config.max_handler_instances,
             ));
         }
         if capped_tail {
@@ -861,7 +1018,8 @@ impl VmAnalyzer {
         }
 
         candidates.sort_by_key(|candidate| (candidate.line, candidate.address));
-        select_primary_sites(&mut candidates, self.config.allow_provisional_primary);
+        let merged_primaries =
+            select_primary_sites(&mut candidates, regions, self.config.allow_provisional_primary);
         for (index, candidate) in candidates.iter_mut().enumerate() {
             candidate.id = format!("dispatcher-{index}-{:x}", candidate.address);
         }
@@ -869,6 +1027,7 @@ impl VmAnalyzer {
         DispatchInventory {
             candidates,
             executions_by_site,
+            merged_primaries,
         }
     }
 
@@ -877,19 +1036,19 @@ impl VmAnalyzer {
         trace_id: &str,
         events: &[NativeEvent],
         dispatchers: &[DispatcherCandidate],
-        handlers: &[HandlerInstance],
+        handler_ranges: &[LineRange],
         region_end: GlobalLine,
     ) -> Vec<VmStateCandidate> {
-        if handlers.is_empty() {
+        if handler_ranges.is_empty() {
             return Vec::new();
         }
         let mut state_events: Vec<&NativeEvent> = Vec::new();
         let mut cursor = 0usize;
-        for handler in handlers {
-            while cursor < events.len() && events[cursor].line < handler.entry_line {
+        for range in handler_ranges {
+            while cursor < events.len() && events[cursor].line < range.start {
                 cursor += 1;
             }
-            while cursor < events.len() && events[cursor].line < handler.end_line {
+            while cursor < events.len() && events[cursor].line < range.end {
                 state_events.push(&events[cursor]);
                 cursor += 1;
             }
@@ -1400,7 +1559,13 @@ fn classify_dispatch_site(
     (DispatchKind::Unknown, 0.3, "ambiguous indirect branch")
 }
 
-fn select_primary_sites(candidates: &mut [DispatcherCandidate], allow_provisional: bool) {
+const REGION_MERGE_ADDRESS_GAP: u64 = 0x10000;
+
+fn select_primary_sites(
+    candidates: &mut [DispatcherCandidate],
+    regions: &[VmRegion],
+    allow_provisional: bool,
+) -> usize {
     let has_primary = candidates
         .iter()
         .any(|candidate| candidate.kind == DispatchKind::VmPrimary);
@@ -1428,26 +1593,86 @@ fn select_primary_sites(candidates: &mut [DispatcherCandidate], allow_provisiona
         }
     }
 
-    let mut by_region: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        if candidate.region_id != "unassigned" {
-            by_region
-                .entry(candidate.region_id.clone())
-                .or_default()
-                .push(index);
+    let is_primary = |candidate: &DispatcherCandidate| {
+        matches!(
+            candidate.kind,
+            DispatchKind::VmPrimary | DispatchKind::VmProvisional
+        )
+    };
+    let region_by_id: BTreeMap<&str, &VmRegion> = regions
+        .iter()
+        .map(|region| (region.id.as_str(), region))
+        .collect();
+
+    // Region detection clusters native addresses with a small gap. A single
+    // interpreter can therefore be split into several regions when its hot
+    // blocks are farther apart than max_address_gap. Those regions have
+    // heavily overlapping line windows because their blocks execute
+    // interleaved. Treat overlapping windows from nearby addresses as one VM
+    // so only one of them keeps the primary role.
+    let candidate_count = candidates.len();
+    let mut parent: Vec<usize> = (0..candidate_count).collect();
+    fn find(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    fn union(parent: &mut [usize], left: usize, right: usize) {
+        let left_root = find(parent, left);
+        let right_root = find(parent, right);
+        if left_root != right_root {
+            parent[right_root] = left_root;
         }
     }
-    for indices in by_region.into_values() {
-        let primaries: Vec<usize> = indices
-            .into_iter()
-            .filter(|index| {
-                matches!(
-                    candidates[*index].kind,
-                    DispatchKind::VmPrimary | DispatchKind::VmProvisional
-                )
-            })
-            .collect();
-        if primaries.is_empty() {
+
+    for left in 0..candidate_count {
+        if !is_primary(&candidates[left]) {
+            continue;
+        }
+        for right in (left + 1)..candidate_count {
+            if !is_primary(&candidates[right]) {
+                continue;
+            }
+            let same_region = candidates[left].region_id == candidates[right].region_id;
+            let merge = same_region
+                || match (
+                    region_by_id.get(candidates[left].region_id.as_str()),
+                    region_by_id.get(candidates[right].region_id.as_str()),
+                ) {
+                    (Some(left_region), Some(right_region)) => {
+                        let line_overlap = left_region.lines.start.get()
+                            < right_region.lines.end.get()
+                            && right_region.lines.start.get() < left_region.lines.end.get();
+                        let address_gap = if left_region.address_end < right_region.address_start {
+                            right_region.address_start - left_region.address_end
+                        } else if right_region.address_end < left_region.address_start {
+                            left_region.address_start - right_region.address_end
+                        } else {
+                            0
+                        };
+                        line_overlap && address_gap <= REGION_MERGE_ADDRESS_GAP
+                    }
+                    _ => false,
+                };
+            if merge {
+                union(&mut parent, left, right);
+            }
+        }
+    }
+
+    let mut by_group: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for index in 0..candidate_count {
+        if is_primary(&candidates[index]) {
+            let root = find(&mut parent, index);
+            by_group.entry(root).or_default().push(index);
+        }
+    }
+
+    let mut demoted = 0usize;
+    for primaries in by_group.into_values() {
+        if primaries.len() <= 1 {
             continue;
         }
         let mut best = primaries[0];
@@ -1471,11 +1696,13 @@ fn select_primary_sites(candidates: &mut [DispatcherCandidate], allow_provisiona
             if index != best {
                 candidates[index].kind = DispatchKind::VmNested;
                 candidates[index].reason =
-                    "secondary primary candidate within the same region".to_string();
+                    "secondary primary candidate in an overlapping VM region".to_string();
                 candidates[index].confidence *= 0.8;
+                demoted += 1;
             }
         }
     }
+    demoted
 }
 
 fn cluster_addresses(addresses: Vec<u64>, max_gap: u64) -> Vec<Vec<u64>> {
@@ -1499,8 +1726,8 @@ fn cluster_addresses(addresses: Vec<u64>, max_gap: u64) -> Vec<Vec<u64>> {
 fn template_hash(events: &[NativeEvent]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for event in events {
-        for byte in event.mnemonic.as_str().to_ascii_lowercase().bytes() {
-            hash ^= byte as u64;
+        for byte in event.mnemonic.as_str().as_bytes() {
+            hash ^= byte.to_ascii_lowercase() as u64;
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         for register in event.reads.iter().chain(event.writes.iter()) {

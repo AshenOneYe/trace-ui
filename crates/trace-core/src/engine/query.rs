@@ -103,6 +103,7 @@ fn node_to_dto(
         parent_id: n.parent_id,
         children_ids: n.children_ids.clone(),
         line_count: n.exit_seq.saturating_sub(n.entry_seq) + 1,
+        call_count: n.call_count,
     }
 }
 

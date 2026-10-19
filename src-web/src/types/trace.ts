@@ -80,6 +80,7 @@ export interface CallTreeNodeDto {
   parent_id: number | null;
   children_ids: number[];
   line_count: number;
+  call_count: number;
 }
 
 export interface SliceResult {

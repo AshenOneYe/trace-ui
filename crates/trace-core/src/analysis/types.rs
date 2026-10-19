@@ -122,6 +122,8 @@ pub struct HandlerInstance {
     pub dispatcher_line: Option<GlobalLine>,
     pub template_hash: String,
     pub cluster_id: Option<String>,
+    #[serde(default = "default_execution_count")]
+    pub execution_count: u64,
     pub unknown_effects: Vec<String>,
     pub evidence: Vec<EvidenceRef>,
 }
@@ -197,6 +199,8 @@ pub struct VmInstruction {
     pub control_target: Option<u64>,
     pub native_lines: LineRange,
     pub confidence: f32,
+    #[serde(default = "default_execution_count")]
+    pub execution_count: u64,
     pub unknown_effects: Vec<String>,
     pub evidence: Vec<EvidenceRef>,
 }
@@ -208,8 +212,14 @@ pub struct VirtualCfgEdge {
     pub kind: CfgEdgeKind,
     pub conditional: bool,
     pub confidence: f32,
+    #[serde(default = "default_execution_count")]
+    pub execution_count: u64,
     pub reason: String,
     pub evidence: Vec<EvidenceRef>,
+}
+
+fn default_execution_count() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
