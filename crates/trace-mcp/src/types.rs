@@ -447,6 +447,26 @@ fn default_watch_limit() -> u32 {
     200
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VmTraceRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Inclusive VM analysis start line (default: 0)")]
+    pub start_line: Option<u64>,
+    #[schemars(description = "Inclusive VM analysis end line (default: end of trace)")]
+    pub end_line: Option<u64>,
+    #[schemars(description = "Pagination offset in folded instruction rows (default: 0)")]
+    #[serde(default)]
+    pub offset: u32,
+    #[schemars(description = "Max folded rows per page (default: 100, max: 1000)")]
+    #[serde(default = "default_vm_trace_limit")]
+    pub limit: u32,
+}
+
+fn default_vm_trace_limit() -> u32 {
+    100
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

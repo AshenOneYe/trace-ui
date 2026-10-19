@@ -88,7 +88,7 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 | 异步任务 | `start_analysis_job`、`get_job_status`、`list_analysis_jobs`、`cancel_analysis_job`、`resume_analysis_job`、`get_job_result` |
 | 结果句柄 | `get_result_page` |
 | 批量查询 | `batch_query` |
-| VM 分析 | `detect_vm_regions`、`get_vm_handlers`、`cluster_vm_handlers`、`get_vm_artifacts`、`compare_vm_traces` |
+| VM 分析 | `detect_vm_regions`、`get_vm_handlers`、`vm_trace`、`cluster_vm_handlers`、`get_vm_artifacts`、`compare_vm_traces` |
 | 假设修正 | `get_vm_hypotheses`、`validate_vm_hypothesis`、`set_vm_override`、`undo_vm_override`、`redo_vm_override`、`get_analysis_conflicts`、`reanalyze_affected` |
 | Agent 工作区 | `get_analysis_workspace`、`add_analysis_note`、`add_open_question`、`resolve_open_question`、`add_verified_conclusion` |
 | 资源预算 | `get_resource_budgets`、`set_resource_budgets` |

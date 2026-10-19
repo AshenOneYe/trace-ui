@@ -55,6 +55,7 @@ VM analysis:
 ```text
 detect_vm_regions(session_id="...")
 get_vm_handlers(session_id="...")
+vm_trace(session_id="...", start_line=0, end_line=100000, limit=100)
 get_vm_artifacts(session_id="...", artifact="state|ir|cfg|handlers|transitions")
 cluster_vm_handlers(session_id="...", must_link=[["h1","h2"]],
                     locked_labels={"h1":"manual-a"})
@@ -66,6 +67,11 @@ Large arrays are returned as result handles. Continue with:
 ```text
 get_result_page(result_id="...", offset=0, limit=100)
 ```
+
+`vm_trace` folds handler-level VM instructions into rows ordered by native
+seq, with operation, handler/cluster identity, state/memory effects and
+confidence. `vpc` is explicitly `null` until a VM profile supplies an
+explicit VPC source; do not treat native seq as a virtual PC.
 
 Hypothesis collaboration:
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rmcp::{
@@ -56,6 +57,65 @@ fn call_tree_node_value(node: &trace_core::api_types::CallTreeNodeDto) -> serde_
         "line_count": node.line_count,
         "call_count": node.call_count,
     })
+}
+
+/// Project handler-instruction evidence into a folded VM trace.
+///
+/// This deliberately does not invent a virtual PC: current VM analysis exposes
+/// native line ranges, handler instances and inferred operations. Rows carry
+/// `vpc: null` until a VM profile provides an explicit VPC source.
+fn vm_trace_rows(
+    result: &trace_core::VmAnalysisResult,
+    start_line: u64,
+    end_line: u64,
+) -> Vec<Value> {
+    let instances: HashMap<&str, &trace_core::analysis::HandlerInstance> = result
+        .handler_instances
+        .iter()
+        .map(|instance| (instance.id.as_str(), instance))
+        .collect();
+    let mut instructions: Vec<_> = result
+        .vm_instructions
+        .iter()
+        .filter(|instruction| {
+            let start = instruction.native_lines.start.get();
+            let end = instruction.native_lines.end.get();
+            end >= start_line && start <= end_line
+        })
+        .collect();
+    instructions.sort_by_key(|instruction| {
+        (
+            instruction.native_lines.start.get(),
+            instruction.native_lines.end.get(),
+            instruction.id.clone(),
+        )
+    });
+    instructions
+        .into_iter()
+        .map(|instruction| {
+            let instance = instances.get(instruction.handler_instance_id.as_str());
+            serde_json::json!({
+                "native_seq": instruction.native_lines.start.get(),
+                "native_end_seq": instruction.native_lines.end.get(),
+                "native_address": instance.map(|value| format!("0x{:x}", value.native_address)),
+                "dispatcher_seq": instance
+                    .and_then(|value| value.dispatcher_line.map(|line| line.get())),
+                "handler_instance_id": instruction.handler_instance_id,
+                "handler_cluster_id": instance.and_then(|value| value.cluster_id.clone()),
+                "op": instruction.operation,
+                "operands": instruction.operands,
+                "state_reads": instruction.state_reads,
+                "state_writes": instruction.state_writes,
+                "memory_effects": instruction.memory_effects,
+                "control_target": instruction.control_target,
+                "confidence": instruction.confidence,
+                "execution_count": instruction.execution_count,
+                "unknown_effects": instruction.unknown_effects,
+                // Explicitly null until a VM profile supplies a VPC source.
+                "vpc": Value::Null,
+            })
+        })
+        .collect()
 }
 
 // ── 截断常量 ──
@@ -161,6 +221,50 @@ mod tests {
         let named = node("0x1000", Some("malloc"));
         assert!(call_tree_node_matches(&named, "MAL"));
         assert!(!call_tree_node_matches(&named, "free"));
+    }
+
+    #[test]
+    fn vm_trace_projects_handler_rows_and_keeps_vpc_explicitly_null() {
+        use trace_core::analysis::{HandlerInstance, VmInstruction, VmOperation};
+
+        let result = trace_core::VmAnalysisResult {
+            handler_instances: vec![HandlerInstance {
+                id: "i1".to_string(),
+                region_id: "r1".to_string(),
+                entry_line: GlobalLine::new(10),
+                end_line: GlobalLine::new(20),
+                native_address: 0x1000,
+                dispatcher_line: Some(GlobalLine::new(9)),
+                template_hash: "t1".to_string(),
+                cluster_id: Some("c1".to_string()),
+                execution_count: 1,
+                unknown_effects: vec![],
+                evidence: vec![],
+            }],
+            vm_instructions: vec![VmInstruction {
+                id: "in1".to_string(),
+                handler_instance_id: "i1".to_string(),
+                operation: VmOperation::Add,
+                operands: vec!["r0".to_string()],
+                state_reads: vec![],
+                state_writes: vec![],
+                memory_effects: vec![],
+                control_target: None,
+                native_lines: trace_core::LineRange::new(GlobalLine::new(10), GlobalLine::new(20)),
+                confidence: 0.5,
+                execution_count: 1,
+                unknown_effects: vec![],
+                evidence: vec![],
+            }],
+            ..Default::default()
+        };
+        let rows = vm_trace_rows(&result, 0, u64::MAX);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["native_seq"], 10);
+        assert_eq!(rows[0]["handler_cluster_id"], "c1");
+        assert_eq!(rows[0]["op"], "add");
+        assert!(rows[0]["vpc"].is_null());
+        assert!(vm_trace_rows(&result, 21, u64::MAX).is_empty());
     }
 }
 
@@ -1032,6 +1136,63 @@ impl TraceToolHandler {
                 "instances_result": instance_handle,
                 "instances": result.handler_instances.iter().take(limit * 8).collect::<Vec<_>>(),
                 "warnings": result.warnings,
+            })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "vm_trace",
+        description = "Fold a VM analysis into handler-level instruction rows instead of returning \
+            one row per native ARM instruction. Rows are ordered by native seq and include op, \
+            handler/cluster identity, state/memory effects and confidence. VPC is null until a VM \
+            profile supplies an explicit VPC source."
+    )]
+    async fn vm_trace(
+        &self,
+        Parameters(req): Parameters<VmTraceRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let handler = self.clone();
+        blocking(move || {
+            let start_line = req.start_line.unwrap_or(0);
+            let end_line = req.end_line.unwrap_or(u64::MAX);
+            let result = handler.analyze_vm_session(&sid, req.start_line, req.end_line)?;
+            let all_rows = vm_trace_rows(&result, start_line, end_line);
+            let total = all_rows.len();
+            let offset = req.offset as usize;
+            let limit = req.limit.clamp(1, 1000) as usize;
+            let rows: Vec<_> = all_rows.iter().skip(offset).take(limit).cloned().collect();
+            let mut warnings = result.warnings.clone();
+            warnings
+                .push("vpc is null until a VM profile provides an explicit VPC source".to_string());
+            let handle = handler
+                .results
+                .store(
+                    "vm_trace",
+                    all_rows,
+                    serde_json::json!({
+                        "trace_id": result.trace_id,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                    }),
+                    serde_json::to_value(&result.coverage).unwrap_or(Value::Null),
+                    "experimental",
+                    warnings.clone(),
+                )
+                .ok();
+            Ok(json(&serde_json::json!({
+                "trace_id": result.trace_id,
+                "algorithm_version": result.algorithm_version,
+                "experimental": result.experimental,
+                "coverage": result.coverage,
+                "total": total,
+                "offset": offset,
+                "count": rows.len(),
+                "has_more": offset.saturating_add(rows.len()) < total,
+                "trace_result": handle,
+                "rows": rows,
+                "warnings": warnings,
             })))
         })
         .await
