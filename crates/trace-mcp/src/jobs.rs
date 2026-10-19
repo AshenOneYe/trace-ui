@@ -10,6 +10,8 @@ use trace_core::{
     BuildOptions, GlobalLine, SearchOptions, SliceOptions, TraceEngine, VmAnalysisConfig,
 };
 
+use crate::results::ResultManager;
+
 const JOB_SCHEMA_VERSION: u32 = 1;
 
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -120,6 +122,7 @@ impl Default for JobStore {
 #[derive(Clone)]
 pub struct JobManager {
     engine: Arc<TraceEngine>,
+    results: Arc<ResultManager>,
     path: PathBuf,
     store: Arc<Mutex<JobStore>>,
     cancellations: Arc<Mutex<HashMap<String, JobCancellation>>>,
@@ -127,10 +130,18 @@ pub struct JobManager {
 
 impl JobManager {
     pub fn new(engine: Arc<TraceEngine>) -> Self {
-        Self::with_path(engine, default_job_path())
+        Self::with_path_and_results(engine, default_job_path(), Arc::new(ResultManager::new()))
     }
 
-    pub(crate) fn with_path(engine: Arc<TraceEngine>, path: PathBuf) -> Self {
+    pub fn new_with_results(engine: Arc<TraceEngine>, results: Arc<ResultManager>) -> Self {
+        Self::with_path_and_results(engine, default_job_path(), results)
+    }
+
+    pub(crate) fn with_path_and_results(
+        engine: Arc<TraceEngine>,
+        path: PathBuf,
+        results: Arc<ResultManager>,
+    ) -> Self {
         let mut store = load_store(&path).unwrap_or_default();
         let mut interrupted = false;
         for job in store.jobs.values_mut() {
@@ -149,6 +160,7 @@ impl JobManager {
 
         Self {
             engine,
+            results,
             path,
             store: Arc::new(Mutex::new(store)),
             cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -227,9 +239,18 @@ impl JobManager {
         }
 
         let engine = self.engine.clone();
+        let results = self.results.clone();
         let run_id = id.clone();
         let result = tokio::task::spawn_blocking(move || {
-            execute_job(engine, kind, input, run_id, token, cancellation_flag)
+            execute_job(
+                engine,
+                results,
+                kind,
+                input,
+                run_id,
+                token,
+                cancellation_flag,
+            )
         })
         .await;
 
@@ -388,6 +409,7 @@ pub fn persisted_jobs() -> Result<Vec<AnalysisJob>, String> {
 
 fn execute_job(
     engine: Arc<TraceEngine>,
+    results: Arc<ResultManager>,
     kind: JobKind,
     input: AnalysisJobInput,
     job_id: String,
@@ -614,6 +636,26 @@ fn execute_job(
                 .iter()
                 .map(|line| serde_json::to_value(line).unwrap_or(Value::Null))
                 .collect::<Vec<_>>();
+            let preview_items: Vec<Value> =
+                preview_seqs.iter().map(|seq| json!({"seq": seq})).collect();
+            let handle = results
+                .store(
+                    "taint_seqs",
+                    preview_items,
+                    json!({
+                        "trace_id": session_id,
+                        "total_marked": seqs.len(),
+                        "preview_count": preview_seqs.len(),
+                    }),
+                    Value::Null,
+                    if seqs.len() > include {
+                        "bounded_preview"
+                    } else {
+                        "complete_preview"
+                    },
+                    vec!["full taint line set is not materialized in the job result".to_string()],
+                )
+                .ok();
             Ok(json!({
                 "job_id": job_id,
                 "session_id": session_id,
@@ -622,6 +664,7 @@ fn execute_job(
                 "preview_seqs": preview_seqs,
                 "preview_lines": preview_lines,
                 "truncated": seqs.len() > include,
+                "result_id": handle.map(|meta| meta.result_id),
                 "addr_range": input.addr_range,
                 "ignore_regs": input.ignore_regs,
             }))
@@ -629,17 +672,38 @@ fn execute_job(
         JobKind::Crypto => {
             let result = engine.scan_crypto(&session_id).map_err(|e| e.to_string())?;
             let limit = input.max_results.unwrap_or(50).min(200) as usize;
-            let preview =
-                serde_json::to_value(result.matches.iter().take(limit).collect::<Vec<_>>())
-                    .unwrap_or(Value::Null);
+            let preview_items: Vec<Value> = result
+                .matches
+                .iter()
+                .take(limit)
+                .map(|item| serde_json::to_value(item).unwrap_or(Value::Null))
+                .collect();
+            let handle = results
+                .store(
+                    "crypto_matches",
+                    preview_items.clone(),
+                    json!({
+                        "trace_id": session_id,
+                        "match_count": result.matches.len(),
+                    }),
+                    Value::Null,
+                    if result.matches.len() > limit {
+                        "bounded_preview"
+                    } else {
+                        "complete_preview"
+                    },
+                    Vec::new(),
+                )
+                .ok();
             Ok(json!({
                 "job_id": job_id,
                 "session_id": session_id,
                 "algorithms_found": result.algorithms_found,
                 "match_count": result.matches.len(),
                 "total_lines_scanned": result.total_lines_scanned,
-                "matches": preview,
+                "matches": preview_items,
                 "truncated": result.matches.len() > limit,
+                "result_id": handle.map(|meta| meta.result_id),
             }))
         }
         JobKind::Search => {
@@ -678,6 +742,29 @@ fn execute_job(
                     limit,
                 )
                 .map_err(|e| e.to_string())?;
+            let preview_items: Vec<Value> = outcome
+                .match_seqs
+                .iter()
+                .map(|seq| json!({"seq": seq}))
+                .collect();
+            let handle = results
+                .store(
+                    "search_matches",
+                    preview_items,
+                    json!({
+                        "trace_id": session_id,
+                        "query": query,
+                        "total_in_range": outcome.total_in_range,
+                    }),
+                    Value::Null,
+                    if outcome.total_in_range > limit {
+                        "bounded_preview"
+                    } else {
+                        "complete_preview"
+                    },
+                    Vec::new(),
+                )
+                .ok();
             Ok(json!({
                 "job_id": job_id,
                 "session_id": session_id,
@@ -686,6 +773,7 @@ fn execute_job(
                 "total_in_range": outcome.total_in_range,
                 "total_scanned": outcome.total_scanned,
                 "truncated": outcome.total_in_range > limit,
+                "result_id": handle.map(|meta| meta.result_id),
             }))
         }
     }
@@ -788,7 +876,12 @@ mod tests {
             now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = JobManager::with_path(Arc::new(TraceEngine::new()), dir.join("jobs.json"));
+        let results = Arc::new(ResultManager::with_dir(dir.join("results")));
+        let manager = JobManager::with_path_and_results(
+            Arc::new(TraceEngine::new()),
+            dir.join("jobs.json"),
+            results.clone(),
+        );
         let trace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example-trace-gumtrace.txt");
         let job = manager
             .start(
@@ -854,7 +947,12 @@ mod tests {
             now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let manager = JobManager::with_path(Arc::new(TraceEngine::new()), dir.join("jobs.json"));
+        let results = Arc::new(ResultManager::with_dir(dir.join("results")));
+        let manager = JobManager::with_path_and_results(
+            Arc::new(TraceEngine::new()),
+            dir.join("jobs.json"),
+            results.clone(),
+        );
         let trace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example-trace-gumtrace.txt");
         let input = AnalysisJobInput {
             file_path: trace.to_string_lossy().to_string(),
@@ -890,6 +988,11 @@ mod tests {
                 .len()
                 <= 5
         );
+        let search_result_id = search_result["result"]["result_id"]
+            .as_str()
+            .expect("search result_id");
+        let page = results.page(search_result_id, 0, 5).unwrap();
+        assert!(page["items"].as_array().unwrap().len() <= 5);
 
         let taint = manager
             .start(
@@ -926,6 +1029,7 @@ mod tests {
                 .len()
                 <= 3
         );
+        assert!(taint_result["result"]["result_id"].as_str().is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

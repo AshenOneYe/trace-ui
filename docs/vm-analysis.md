@@ -71,6 +71,10 @@ Large arrays are returned as result handles. Continue with:
 get_result_page(result_id="...", offset=0, limit=100)
 ```
 
+`search`, `taint` and `crypto` jobs also return a `result_id` for their
+bounded preview arrays. Use `get_result_page` to page those arrays; the job
+result itself is kept small and stable for persistence.
+
 `vm_trace` folds handler-level VM instructions into rows ordered by native
 seq, with operation, handler/cluster identity, state/memory effects and
 confidence. `vpc` is explicitly `null` until a VM profile supplies an

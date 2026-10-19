@@ -417,9 +417,13 @@ impl std::fmt::Debug for TraceToolHandler {
 #[tool_router]
 impl TraceToolHandler {
     pub fn new(engine: Arc<TraceEngine>) -> Self {
+        let results = Arc::new(ResultManager::new());
         Self {
-            jobs: Arc::new(JobManager::new(engine.clone())),
-            results: Arc::new(ResultManager::new()),
+            jobs: Arc::new(JobManager::new_with_results(
+                engine.clone(),
+                results.clone(),
+            )),
+            results,
             engine,
             tool_router: Self::tool_router(),
         }
