@@ -463,6 +463,39 @@ fn test_taint_analysis_data_only() {
 }
 
 #[test]
+fn test_run_slice_isolated_does_not_overwrite_session_slice() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+    let options = trace_core::SliceOptions {
+        start_seq: None,
+        end_seq: None,
+        data_only: true,
+    };
+    let first = engine
+        .run_slice(&sid, &["reg:x0@last".to_string()], options)
+        .expect("run_slice");
+    let before = engine.get_tainted_seqs(&sid).expect("session taint");
+    assert_eq!(before.len() as u64, first.marked_count);
+
+    let (isolated, seqs) = engine
+        .run_slice_isolated(
+            &sid,
+            &["reg:x0@last".to_string()],
+            trace_core::SliceOptions {
+                start_seq: None,
+                end_seq: None,
+                data_only: true,
+            },
+        )
+        .expect("isolated slice");
+    assert_eq!(isolated.marked_count, seqs.len() as u64);
+    assert_eq!(
+        engine.get_tainted_seqs(&sid).expect("session taint after"),
+        before,
+        "isolated jobs must not replace the session slice bitmap"
+    );
+}
+
+#[test]
 fn test_taint_analysis_with_range() {
     let (engine, sid) = setup_session(&get_trace_path());
     let info = engine.get_session_info(&sid).unwrap();

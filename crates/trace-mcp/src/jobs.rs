@@ -614,8 +614,8 @@ fn execute_job(
             if input.from_specs.is_empty() {
                 return Err("taint job requires from_specs".to_string());
             }
-            let slice = engine
-                .run_slice(
+            let (slice, seqs) = engine
+                .run_slice_isolated(
                     &session_id,
                     &input.from_specs,
                     SliceOptions {
@@ -624,9 +624,6 @@ fn execute_job(
                         data_only: input.data_only,
                     },
                 )
-                .map_err(|e| e.to_string())?;
-            let seqs = engine
-                .get_tainted_seqs(&session_id)
                 .map_err(|e| e.to_string())?;
             let include = input.include_lines.unwrap_or(30).min(200) as usize;
             let preview_seqs: Vec<u64> = seqs.iter().take(include).copied().collect();

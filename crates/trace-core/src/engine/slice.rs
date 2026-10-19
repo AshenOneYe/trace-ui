@@ -160,63 +160,61 @@ fn resolve_mem_store(
 }
 
 impl TraceEngine {
-    pub fn run_slice(
+    fn compute_slice_marked(
         &self,
         session_id: &str,
         from_specs: &[String],
-        options: SliceOptions,
-    ) -> Result<SliceResult> {
+        options: &SliceOptions,
+    ) -> Result<bitvec::prelude::BitVec> {
         let _query_lease = self.acquire_query_lease()?;
-        // Phase 1: read lock — resolve specs, run BFS, apply range filter
-        let marked = {
-            let handle = self.get_handle(session_id)?;
-            let state = handle
-                .state
-                .read()
-                .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-            let reg_last_def = state
-                .reg_last_def
-                .as_ref()
-                .ok_or(TraceError::IndexNotReady)?;
-            let mem_last_def = state.mem_last_def_view().ok_or(TraceError::IndexNotReady)?;
-            let scan_view = state.scan_view().ok_or(TraceError::IndexNotReady)?;
-            let format = state.trace_format;
+        let reg_last_def = state
+            .reg_last_def
+            .as_ref()
+            .ok_or(TraceError::IndexNotReady)?;
+        let mem_last_def = state.mem_last_def_view().ok_or(TraceError::IndexNotReady)?;
+        let scan_view = state.scan_view().ok_or(TraceError::IndexNotReady)?;
+        let format = state.trace_format;
 
-            let mut start_indices = Vec::new();
-            for spec in from_specs {
-                let lidx_view = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
-                let idx = resolve_start_index(
-                    spec,
-                    reg_last_def,
-                    &mem_last_def,
-                    &state.mmap,
-                    &lidx_view,
-                    format,
-                )
-                .map_err(|e| TraceError::InvalidArgument(e))?;
-                start_indices.push(idx);
-            }
+        let mut start_indices = Vec::new();
+        for spec in from_specs {
+            let lidx_view = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
+            let idx = resolve_start_index(
+                spec,
+                reg_last_def,
+                &mem_last_def,
+                &state.mmap,
+                &lidx_view,
+                format,
+            )
+            .map_err(TraceError::InvalidArgument)?;
+            start_indices.push(idx);
+        }
 
-            let mut marked = if options.data_only {
-                bfs_slice_with_options(&scan_view, &start_indices, true)
-            } else {
-                bfs_slice(&scan_view, &start_indices)
-            };
-
-            // Apply optional range filter
-            if let Some(s) = options.start_seq {
-                let end = (s as usize).min(marked.len());
-                marked[..end].fill(false);
-            }
-            if let Some(e) = options.end_seq {
-                let start = ((e as usize) + 1).min(marked.len());
-                marked[start..].fill(false);
-            }
-
-            marked
+        let mut marked = if options.data_only {
+            bfs_slice_with_options(&scan_view, &start_indices, true)
+        } else {
+            bfs_slice(&scan_view, &start_indices)
         };
 
+        if let Some(s) = options.start_seq {
+            let end = (s as usize).min(marked.len());
+            marked[..end].fill(false);
+        }
+        if let Some(e) = options.end_seq {
+            let start = ((e as usize) + 1).min(marked.len());
+            marked[start..].fill(false);
+        }
+
+        Ok(marked)
+    }
+
+    fn slice_stats(marked: &bitvec::prelude::BitVec) -> SliceResult {
         let marked_count = marked.count_ones() as u64;
         let total_lines = marked.len() as u64;
         let percentage = if total_lines > 0 {
@@ -224,6 +222,21 @@ impl TraceEngine {
         } else {
             0.0
         };
+        SliceResult {
+            marked_count,
+            total_lines,
+            percentage,
+        }
+    }
+
+    pub fn run_slice(
+        &self,
+        session_id: &str,
+        from_specs: &[String],
+        options: SliceOptions,
+    ) -> Result<SliceResult> {
+        let marked = self.compute_slice_marked(session_id, from_specs, &options)?;
+        let stats = Self::slice_stats(&marked);
 
         // Phase 2: write lock — store result + slice_origin
         {
@@ -241,11 +254,22 @@ impl TraceEngine {
             });
         }
 
-        Ok(SliceResult {
-            marked_count,
-            total_lines,
-            percentage,
-        })
+        Ok(stats)
+    }
+
+    /// Compute a taint slice without mutating the session's shared slice state.
+    /// Used by persistent jobs so concurrent analyses cannot overwrite each
+    /// other's bitmaps.
+    pub fn run_slice_isolated(
+        &self,
+        session_id: &str,
+        from_specs: &[String],
+        options: SliceOptions,
+    ) -> Result<(SliceResult, Vec<u64>)> {
+        let marked = self.compute_slice_marked(session_id, from_specs, &options)?;
+        let stats = Self::slice_stats(&marked);
+        let seqs = marked.iter_ones().map(|index| index as u64).collect();
+        Ok((stats, seqs))
     }
 
     pub fn clear_slice(&self, session_id: &str) -> Result<()> {
