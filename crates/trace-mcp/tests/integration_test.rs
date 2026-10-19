@@ -677,12 +677,56 @@ fn test_get_strings() {
                 offset: 0,
                 limit: 100,
                 search: None,
+                seq_start: None,
+                seq_end: None,
             },
         )
         .expect("get_strings");
     // May or may not have strings depending on trace content
     // Just verify it doesn't error
     // get_strings should succeed (may have 0 strings in small trace)
+
+    engine.close_session(&sid).unwrap();
+}
+
+#[test]
+fn test_get_strings_seq_window_filters_first_observed_seq() {
+    let (engine, sid) = setup_session(&get_trace_path());
+
+    let all = engine
+        .get_strings(
+            &sid,
+            trace_core::StringQueryOptions {
+                min_len: 4,
+                offset: 0,
+                limit: 200,
+                search: None,
+                seq_start: None,
+                seq_end: None,
+            },
+        )
+        .expect("get_strings");
+    if let Some(first) = all.strings.first() {
+        let first_seq = first.seq;
+        let filtered = engine
+            .get_strings(
+                &sid,
+                trace_core::StringQueryOptions {
+                    min_len: 4,
+                    offset: 0,
+                    limit: 200,
+                    search: None,
+                    seq_start: Some(first_seq),
+                    seq_end: Some(first_seq),
+                },
+            )
+            .expect("windowed get_strings");
+        assert!(filtered.total >= 1);
+        assert!(filtered
+            .strings
+            .iter()
+            .all(|string| string.seq == first_seq));
+    }
 
     engine.close_session(&sid).unwrap();
 }
@@ -719,6 +763,8 @@ fn test_scan_strings_after_skip() {
                 offset: 0,
                 limit: 100,
                 search: None,
+                seq_start: None,
+                seq_end: None,
             },
         )
         .expect("get_strings after scan");
@@ -739,6 +785,8 @@ fn test_get_string_xrefs() {
                 offset: 0,
                 limit: 10,
                 search: None,
+                seq_start: None,
+                seq_end: None,
             },
         )
         .expect("get_strings");
@@ -1626,6 +1674,114 @@ fn test_get_mem_history_page() {
     assert_eq!(empty.total, 0);
 }
 
+#[test]
+fn test_mem_summary_buckets_and_filters() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    let summary = engine
+        .mem_summary(
+            &sid,
+            trace_core::MemSummaryOptions {
+                start_seq: 0,
+                end_seq: u64::MAX,
+                start_addr: 0,
+                end_addr: u64::MAX,
+                read_filter: None,
+                bucket_size: 0x1000,
+                offset: 0,
+                limit: 500,
+            },
+        )
+        .expect("mem_summary");
+    assert!(
+        summary.total_buckets > 0,
+        "sample trace has memory accesses"
+    );
+    assert!(summary.filtered_accesses > 0);
+    let bucket = summary
+        .buckets
+        .iter()
+        .find(|bucket| {
+            let start = u64::from_str_radix(bucket.start.trim_start_matches("0x"), 16).unwrap();
+            let end = u64::from_str_radix(bucket.end.trim_start_matches("0x"), 16).unwrap();
+            start <= 0xbfffbf60 && 0xbfffbf60 < end
+        })
+        .expect("bucket containing 0xbfffbf60");
+    assert!(bucket.access_count > 0);
+    assert!(bucket.write_count > 0);
+
+    let writes = engine
+        .mem_summary(
+            &sid,
+            trace_core::MemSummaryOptions {
+                start_seq: 0,
+                end_seq: u64::MAX,
+                start_addr: 0xbfffbf60,
+                end_addr: 0xbfffbf61,
+                read_filter: Some(false),
+                bucket_size: 0x1000,
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .expect("write-only mem_summary");
+    assert!(writes.filtered_accesses > 0);
+    assert_eq!(
+        writes.total_accesses_in_addr_range,
+        writes.filtered_accesses
+    );
+}
+
+#[test]
+fn test_watch_slots_time_series_and_filter() {
+    let (engine, sid) = setup_session(&get_unidbg_trace_path());
+
+    let all = engine
+        .watch_slots(
+            &sid,
+            trace_core::SlotWatchOptions {
+                base_addr: 0xbfffbf60,
+                slot_stride: 8,
+                slots: vec![0, 1],
+                width: 8,
+                start_seq: 0,
+                end_seq: u64::MAX,
+                read_filter: None,
+                offset: 0,
+                limit: 500,
+            },
+        )
+        .expect("watch_slots");
+    assert!(all.total >= 1);
+    assert!(all.records.iter().all(|record| record.slot <= 1));
+    assert!(all
+        .records
+        .windows(2)
+        .all(|pair| pair[0].seq <= pair[1].seq));
+    assert!(all
+        .records
+        .iter()
+        .any(|record| record.slot == 0 && record.seq == 2759 && record.rw == "W"));
+
+    let writes = engine
+        .watch_slots(
+            &sid,
+            trace_core::SlotWatchOptions {
+                base_addr: 0xbfffbf60,
+                slot_stride: 8,
+                slots: vec![0],
+                width: 8,
+                start_seq: 0,
+                end_seq: u64::MAX,
+                read_filter: Some(false),
+                offset: 0,
+                limit: 500,
+            },
+        )
+        .expect("write-only watch_slots");
+    assert!(writes.records.iter().all(|record| record.rw == "W"));
+}
+
 /// P7: 按值搜索内存写入（通配符 + 任意偏移 + rw）
 #[test]
 fn test_search_memory_values() {
@@ -1730,6 +1886,8 @@ fn test_string_xrefs_engine() {
                 offset: 0,
                 limit: 200,
                 search: None,
+                seq_start: None,
+                seq_end: None,
             },
         )
         .unwrap();

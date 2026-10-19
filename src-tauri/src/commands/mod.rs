@@ -501,6 +501,8 @@ pub fn get_strings(
                 offset,
                 limit,
                 search,
+                seq_start: None,
+                seq_end: None,
             },
         )
         .map_err(|e| e.to_string())

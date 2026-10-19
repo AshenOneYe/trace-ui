@@ -1,5 +1,8 @@
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::atomic::Ordering;
+
+use rustc_hash::FxHashSet;
 
 use crate::api_types::*;
 use crate::browse::{parse_trace_line, parse_trace_line_gumtrace};
@@ -65,6 +68,18 @@ fn mem_rec_to_dto(
         disasm,
         data_known: rec.is_data_known(),
     }
+}
+
+#[derive(Default)]
+struct MemBucketAcc {
+    read_count: u64,
+    write_count: u64,
+    access_bytes: u64,
+    unique_addresses: FxHashSet<u64>,
+    unique_writers: FxHashSet<u64>,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+    unknown_data_writes: u64,
 }
 
 /// 将 CallTreeNode 转为 DTO
@@ -642,6 +657,197 @@ impl super::TraceEngine {
         })
     }
 
+    /// Aggregate memory accesses by address bucket and seq window.
+    ///
+    /// `total_accesses_in_addr_range` counts records in the address range
+    /// before seq/rw filtering; `filtered_accesses` counts the records that
+    /// contributed to the returned buckets.
+    pub fn mem_summary(
+        &self,
+        session_id: &str,
+        options: MemSummaryOptions,
+    ) -> Result<MemSummaryResult> {
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
+
+        let bucket_size = options.bucket_size.max(1);
+        let mut buckets: BTreeMap<u64, MemBucketAcc> = BTreeMap::new();
+        let mut total_accesses_in_addr_range = 0u64;
+        let mut filtered_accesses = 0u64;
+
+        for (addr, records) in mem_view.iter_range(options.start_addr, options.end_addr) {
+            for rec in records {
+                total_accesses_in_addr_range += 1;
+                if rec.seq < options.start_seq || rec.seq > options.end_seq {
+                    continue;
+                }
+                if let Some(want_read) = options.read_filter {
+                    if rec.is_read() != want_read {
+                        continue;
+                    }
+                }
+                filtered_accesses += 1;
+                let bucket_start = (addr / bucket_size) * bucket_size;
+                let acc = buckets.entry(bucket_start).or_default();
+                if rec.is_read() {
+                    acc.read_count += 1;
+                } else {
+                    acc.write_count += 1;
+                    if !rec.is_data_known() {
+                        acc.unknown_data_writes += 1;
+                    }
+                }
+                acc.access_bytes += rec.size as u64;
+                acc.unique_addresses.insert(addr);
+                acc.unique_writers.insert(rec.insn_addr);
+                acc.first_seq = Some(acc.first_seq.map_or(rec.seq, |v| v.min(rec.seq)));
+                acc.last_seq = Some(acc.last_seq.map_or(rec.seq, |v| v.max(rec.seq)));
+            }
+        }
+
+        let total_buckets = buckets.len();
+        let start = options.offset.min(total_buckets);
+        let end = start.saturating_add(options.limit).min(total_buckets);
+        let buckets = buckets
+            .into_iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(bucket_start, acc)| MemSummaryBucket {
+                start: format!("0x{:x}", bucket_start),
+                end: format!("0x{:x}", bucket_start.saturating_add(bucket_size)),
+                read_count: acc.read_count,
+                write_count: acc.write_count,
+                access_count: acc.read_count + acc.write_count,
+                access_bytes: acc.access_bytes,
+                unique_addresses: acc.unique_addresses.len() as u64,
+                unique_writers: acc.unique_writers.len() as u64,
+                first_seq: acc.first_seq,
+                last_seq: acc.last_seq,
+                unknown_data_writes: acc.unknown_data_writes,
+            })
+            .collect::<Vec<_>>();
+
+        Ok(MemSummaryResult {
+            total_buckets,
+            offset: options.offset,
+            count: buckets.len(),
+            has_more: end < total_buckets,
+            total_accesses_in_addr_range,
+            filtered_accesses,
+            buckets,
+        })
+    }
+
+    /// Time series for a fixed slot array (register file / VM slot table).
+    ///
+    /// Records from all slots are merged in seq order without building one
+    /// combined copy of the histories. `width` masks the printed value to the
+    /// expected slot width; the trace's original access size is kept in
+    /// `size`.
+    pub fn watch_slots(
+        &self,
+        session_id: &str,
+        options: SlotWatchOptions,
+    ) -> Result<SlotWatchResult> {
+        if options.width == 0 || options.width > 8 {
+            return Err(TraceError::InvalidArgument(
+                "width must be in 1..=8 bytes".into(),
+            ));
+        }
+        if options.slot_stride == 0 {
+            return Err(TraceError::InvalidArgument(
+                "slot_stride must be greater than zero".into(),
+            ));
+        }
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
+        let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
+        let data: &[u8] = &state.mmap;
+        let format = state.trace_format;
+
+        let want_read = options.read_filter;
+        let mut per_slot: Vec<(u32, Vec<&crate::flat::mem_access::FlatMemAccessRecord>)> =
+            Vec::with_capacity(options.slots.len());
+        let mut total = 0u64;
+        for slot in &options.slots {
+            let offset = (*slot as u64)
+                .checked_mul(options.slot_stride)
+                .ok_or_else(|| TraceError::InvalidArgument("slot address overflow".into()))?;
+            let addr = options
+                .base_addr
+                .checked_add(offset)
+                .ok_or_else(|| TraceError::InvalidArgument("slot address overflow".into()))?;
+            let records = mem_view.query(addr).unwrap_or(&[]);
+            let filtered: Vec<_> = records
+                .iter()
+                .filter(|rec| rec.seq >= options.start_seq && rec.seq <= options.end_seq)
+                .filter(|rec| want_read.map_or(true, |wr| rec.is_read() == wr))
+                .collect();
+            total += filtered.len() as u64;
+            per_slot.push((*slot, filtered));
+        }
+
+        let mut heap: BinaryHeap<Reverse<(u64, u32, usize, usize)>> = BinaryHeap::new();
+        for (slot_index, (slot, records)) in per_slot.iter().enumerate() {
+            if let Some(rec) = records.first() {
+                heap.push(Reverse((rec.seq, *slot, slot_index, 0)));
+            }
+        }
+
+        let mask = if options.width >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (options.width as u32 * 8)) - 1
+        };
+        let mut seen = 0u64;
+        let mut rows = Vec::new();
+        while let Some(Reverse((seq, slot, slot_index, rec_index))) = heap.pop() {
+            if seen >= options.offset as u64 && rows.len() < options.limit {
+                let rec = per_slot[slot_index].1[rec_index];
+                let addr = options.base_addr + (slot as u64) * options.slot_stride;
+                let dto = mem_rec_to_dto(rec, seq, &line_index, data, format);
+                rows.push(SlotWatchRecord {
+                    seq,
+                    slot,
+                    addr: format!("0x{:x}", addr),
+                    rw: dto.rw,
+                    value: rec
+                        .is_data_known()
+                        .then(|| format!("0x{:x}", rec.data & mask)),
+                    size: rec.size,
+                    insn_addr: dto.insn_addr,
+                    disasm: dto.disasm,
+                    data_known: dto.data_known,
+                });
+            }
+            seen += 1;
+            let next = rec_index + 1;
+            if let Some(rec) = per_slot[slot_index].1.get(next) {
+                heap.push(Reverse((rec.seq, slot, slot_index, next)));
+            }
+            if seen >= options.offset as u64 + options.limit as u64 {
+                break;
+            }
+        }
+
+        Ok(SlotWatchResult {
+            total,
+            offset: options.offset,
+            count: rows.len(),
+            has_more: seen < total,
+            slots: options.slots,
+            records: rows,
+        })
+    }
+
     /// 按值搜索内存访问记录。
     /// pattern: 内存字节序的十六进制（如 "5d13d2b15aafa27f"），支持 ?? / ** 通配字节，
     /// 在每条记录内做字节对齐的任意偏移匹配。rw: None=只写(默认), Some("R")=读, Some("W")=写, Some("all")=全部
@@ -975,6 +1181,10 @@ impl super::TraceEngine {
             .iter()
             .enumerate()
             .filter(|(_, r)| r.byte_len >= options.min_len)
+            .filter(|(_, r)| {
+                options.seq_start.map_or(true, |start| r.seq >= start)
+                    && options.seq_end.map_or(true, |end| r.seq <= end)
+            })
             .filter(|(_, r)| match &search_lower {
                 Some(q) => r.content.to_lowercase().contains(q.as_str()),
                 None => true,

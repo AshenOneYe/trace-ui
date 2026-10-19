@@ -220,6 +220,81 @@ pub struct MemHistoryPage {
     pub records: Vec<MemHistoryRecord>,
 }
 
+pub struct MemSummaryOptions {
+    pub start_seq: u64,
+    pub end_seq: u64,
+    pub start_addr: u64,
+    pub end_addr: u64,
+    /// Some(true) = reads only, Some(false) = writes only, None = both.
+    pub read_filter: Option<bool>,
+    pub bucket_size: u64,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Serialize)]
+pub struct MemSummaryBucket {
+    pub start: String,
+    pub end: String,
+    pub read_count: u64,
+    pub write_count: u64,
+    pub access_count: u64,
+    pub access_bytes: u64,
+    pub unique_addresses: u64,
+    pub unique_writers: u64,
+    pub first_seq: Option<u64>,
+    pub last_seq: Option<u64>,
+    pub unknown_data_writes: u64,
+}
+
+#[derive(Serialize)]
+pub struct MemSummaryResult {
+    pub total_buckets: usize,
+    pub offset: usize,
+    pub count: usize,
+    pub has_more: bool,
+    pub total_accesses_in_addr_range: u64,
+    pub filtered_accesses: u64,
+    pub buckets: Vec<MemSummaryBucket>,
+}
+
+pub struct SlotWatchOptions {
+    pub base_addr: u64,
+    pub slot_stride: u64,
+    pub slots: Vec<u32>,
+    /// Expected slot width in bytes (1..=8). Values are masked to this width.
+    pub width: u8,
+    pub start_seq: u64,
+    pub end_seq: u64,
+    /// Some(true) = reads only, Some(false) = writes only, None = both.
+    pub read_filter: Option<bool>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+#[derive(Serialize)]
+pub struct SlotWatchRecord {
+    pub seq: u64,
+    pub slot: u32,
+    pub addr: String,
+    pub rw: String,
+    pub value: Option<String>,
+    pub size: u8,
+    pub insn_addr: String,
+    pub disasm: String,
+    pub data_known: bool,
+}
+
+#[derive(Serialize)]
+pub struct SlotWatchResult {
+    pub total: u64,
+    pub offset: usize,
+    pub count: usize,
+    pub has_more: bool,
+    pub slots: Vec<u32>,
+    pub records: Vec<SlotWatchRecord>,
+}
+
 // ── Memory Value Search ──
 
 #[derive(Debug, Serialize)]
@@ -261,6 +336,10 @@ pub struct StringQueryOptions {
     pub offset: u32,
     pub limit: u32,
     pub search: Option<String>,
+    /// Inclusive lower bound on the string's first-observed seq.
+    pub seq_start: Option<u64>,
+    /// Inclusive upper bound on the string's first-observed seq.
+    pub seq_end: Option<u64>,
 }
 
 #[derive(Serialize)]

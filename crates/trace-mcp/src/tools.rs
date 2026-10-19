@@ -11,8 +11,8 @@ use crate::jobs::{AnalysisJobInput, JobKind, JobManager};
 use crate::results::ResultManager;
 use crate::types::*;
 use trace_core::{
-    api_types::TraceLine, parse_hex_addr, BuildOptions, SearchOptions, SliceOptions,
-    StringQueryOptions, TraceEngine,
+    api_types::TraceLine, parse_hex_addr, BuildOptions, MemSummaryOptions, SearchOptions,
+    SliceOptions, SlotWatchOptions, StringQueryOptions, TraceEngine,
 };
 use trace_core::{GlobalLine, VmAnalysisConfig};
 
@@ -254,6 +254,38 @@ fn parse_seq_range(range: &str) -> Result<(u64, u64), String> {
         ));
     }
     Ok((start, end))
+}
+
+fn parse_hex_range(range: &str) -> Result<(u64, u64), String> {
+    let parts: Vec<&str> = range.split('-').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid address range '{}'. Expected: '0x1000-0x2000'",
+            range
+        ));
+    }
+    let start = parse_hex_addr(parts[0].trim())?;
+    let end = parse_hex_addr(parts[1].trim())?;
+    if start > end {
+        return Err(format!(
+            "Invalid address range: start (0x{:x}) > end (0x{:x})",
+            start, end
+        ));
+    }
+    Ok((start, end))
+}
+
+fn parse_read_filter(rw: Option<&str>) -> Result<Option<bool>, String> {
+    match rw.map(|value| value.trim().to_ascii_uppercase()) {
+        None => Ok(None),
+        Some(value) if value.is_empty() || value == "ALL" => Ok(None),
+        Some(value) if value == "R" || value == "READ" => Ok(Some(true)),
+        Some(value) if value == "W" || value == "WRITE" => Ok(Some(false)),
+        Some(value) => Err(format!(
+            "Invalid rw filter '{}'; expected R, W or all",
+            value
+        )),
+    }
 }
 
 /// Check if TraceLine's SO offset falls within an address range
@@ -1285,13 +1317,14 @@ impl TraceToolHandler {
         let sid = self.resolve_session(req.session_id)?;
         let addr = parse_hex_addr(&req.address)?;
         let count = req.count.min(500) as usize;
+        let anchor_seq = req.anchor_seq.or(req.seq);
         let page = self
             .engine
             .get_mem_history_page(
                 &sid,
                 addr,
                 req.rw.as_deref(),
-                req.seq,
+                anchor_seq,
                 req.offset as usize,
                 count,
             )
@@ -1300,12 +1333,115 @@ impl TraceToolHandler {
             "address": req.address,
             "total": page.total,
             "center_index": page.center_index,
+            "anchor_seq": anchor_seq,
+            "anchor_index": page.center_index,
             "offset": req.offset,
             "count": page.records.len(),
             "has_more": (req.offset as usize + page.records.len()) < page.total,
             "records": page.records,
         });
         Ok(json(&response))
+    }
+
+    #[tool(
+        name = "mem_summary",
+        description = "Aggregate memory accesses by seq window and address bucket. \
+            Returns read/write counts, access bytes, unique addresses/writers, first/last seq \
+            and unknown-value writes. Use this to locate buffers and data-flow hotspots without \
+            enumerating millions of individual mem records."
+    )]
+    async fn mem_summary(
+        &self,
+        Parameters(req): Parameters<MemSummaryRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let (start_seq, end_seq) = match req.seq_range {
+            Some(ref range) => parse_seq_range(range)?,
+            None => (0, u64::MAX),
+        };
+        let (start_addr, end_addr) = match req.addr_range {
+            Some(ref range) => parse_hex_range(range)?,
+            None => (0, u64::MAX),
+        };
+        let read_filter = parse_read_filter(req.rw.as_deref())?;
+        let bucket_size = req.bucket_size.max(1);
+        let offset = req.offset as usize;
+        let limit = req.limit.clamp(1, 500) as usize;
+        let engine = self.engine.clone();
+        blocking(move || {
+            engine
+                .mem_summary(
+                    &sid,
+                    MemSummaryOptions {
+                        start_seq,
+                        end_seq,
+                        start_addr,
+                        end_addr,
+                        read_filter,
+                        bucket_size,
+                        offset,
+                        limit,
+                    },
+                )
+                .map(|result| json(&result))
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    #[tool(
+        name = "watch_slots",
+        description = "Watch a fixed slot array (VM register file / stack slots) as a time series. \
+            Merges read/write records from all requested slots in seq order and returns \
+            (seq, slot, value, rw, writer/reader instruction). Use watch_addr-style single-address \
+            history via get_mem_history."
+    )]
+    async fn watch_slots(
+        &self,
+        Parameters(req): Parameters<WatchSlotsRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let base_addr = parse_hex_addr(&req.regfile_base)?;
+        let (start_seq, end_seq) = match req.seq_range {
+            Some(ref range) => parse_seq_range(range)?,
+            None => (0, u64::MAX),
+        };
+        let read_filter = parse_read_filter(req.rw.as_deref())?;
+        let mut seen = std::collections::HashSet::new();
+        let slots: Vec<u32> = req
+            .slots
+            .into_iter()
+            .filter(|slot| seen.insert(*slot))
+            .collect();
+        if slots.is_empty() {
+            return Err("slots must contain at least one slot index".to_string());
+        }
+        if slots.len() > 256 {
+            return Err("at most 256 slots can be watched per call".to_string());
+        }
+        let offset = req.offset as usize;
+        let limit = req.limit.clamp(1, 2000) as usize;
+        let engine = self.engine.clone();
+        blocking(move || {
+            engine
+                .watch_slots(
+                    &sid,
+                    SlotWatchOptions {
+                        base_addr,
+                        slot_stride: req.slot_stride.max(1),
+                        slots,
+                        width: req.width,
+                        start_seq,
+                        end_seq,
+                        read_filter,
+                        offset,
+                        limit,
+                    },
+                )
+                .map(|result| json(&result))
+                .map_err(|e| e.to_string())
+        })
+        .await
     }
 
     #[tool(
@@ -1876,11 +2012,20 @@ impl TraceToolHandler {
     ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let limit = req.limit.min(200);
+        let (seq_start, seq_end) = match req.seq_range {
+            Some(ref range) => {
+                let (start, end) = parse_seq_range(range)?;
+                (Some(start), Some(end))
+            }
+            None => (None, None),
+        };
         let options = StringQueryOptions {
             min_len: req.min_len,
             offset: req.offset,
             limit,
             search: req.search,
+            seq_start,
+            seq_end,
         };
         let result = self
             .engine

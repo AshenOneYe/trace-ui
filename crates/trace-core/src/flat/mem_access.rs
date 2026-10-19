@@ -112,6 +112,19 @@ impl<'a> MemAccessView<'a> {
         })
     }
 
+    /// Iterate `(addr, records)` for addresses in `[start_addr, end_addr)`.
+    /// Uses binary search over the sorted address table, so callers can bound
+    /// the scan to a hot address window instead of walking the whole trace.
+    pub fn iter_range(
+        &self,
+        start_addr: u64,
+        end_addr: u64,
+    ) -> impl Iterator<Item = (u64, &[FlatMemAccessRecord])> {
+        let start_idx = self.addrs.partition_point(|&addr| addr < start_addr);
+        let end_idx = self.addrs.partition_point(|&addr| addr < end_addr);
+        self.iter_addr_range(start_idx, end_idx)
+    }
+
     #[allow(dead_code)]
     pub fn total_records(&self) -> usize {
         self.records.len()

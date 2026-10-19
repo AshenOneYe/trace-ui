@@ -256,6 +256,41 @@ AI 会依次调用：
 | seq | u32 | 否（默认为最后一行） | 行号（从 0 开始） |
 | length | u32 | 否（默认 64，最大 256） | 读取的字节数 |
 
+`length` 同时接受 JSON 数字、十进制字符串和十六进制字符串（如 `64`、`"64"`、`"0x40"`）。
+
+#### mem_summary
+
+按 seq 窗口和地址 bucket 聚合内存访问，用于定位数据缓冲区、读写热点和异常写入，
+无需逐条枚举内存记录。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 否 | 会话 ID |
+| seq_range | string | 否 | 闭区间，如 `1000-5000`；默认整个 trace |
+| addr_range | string | 否 | 地址范围，如 `0x70000000-0x70100000` |
+| rw | string | 否 | `R` 只读、`W` 只写、省略或 `all` 全部 |
+| bucket_size | u64 | 否 | 聚合 bucket 字节数，默认 4096 |
+| offset / limit | u32 | 否 | 分页，limit 默认 100、最大 500 |
+
+每个 bucket 返回 `read_count`、`write_count`、`access_bytes`、`unique_addresses`、
+`unique_writers`、`first_seq`、`last_seq` 和 `unknown_data_writes`。
+
+#### watch_slots
+
+把固定 stride 的 slot 数组（VM 寄存器文件、栈槽等）折叠为按 seq 排序的时间序列。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| regfile_base | string | 是 | slot 0 的基地址 |
+| slot_stride | u64 | 否 | slot 间距，默认 8 |
+| slots | u32[] | 是 | 要观察的 slot 索引，最多 256 个 |
+| width | u8 | 否 | slot 宽度 1..8，默认 8；返回值按该宽度截断 |
+| seq_range | string | 否 | 闭区间 seq 窗口 |
+| rw | string | 否 | `R`、`W` 或 `all` |
+
+单地址历史可直接使用 `get_mem_history`；`anchor_seq` 与 `seq` 等价，
+响应同时返回 `anchor_index` 和兼容字段 `center_index`。
+
 ### 搜索
 
 #### search_instructions
@@ -371,6 +406,7 @@ AI 会依次调用：
 | search | string | 否 | 搜索包含此子串的字符串 |
 | offset | u32 | 否（默认 0） | 分页偏移 |
 | limit | u32 | 否（默认 50，最大 200） | 返回的最大数量 |
+| seq_range | string | 否 | 只返回首次出现 seq 落在该闭区间的字符串 |
 
 **返回**：字符串数组（地址、内容、编码、长度、交叉引用数）、总数、是否有更多。
 

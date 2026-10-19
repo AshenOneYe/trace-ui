@@ -1,5 +1,34 @@
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Accept both JSON numbers and decimal/hex strings for byte counts.
+fn deserialize_u32_flexible<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U32Like {
+        Number(u32),
+        Text(String),
+    }
+
+    match U32Like::deserialize(deserializer)? {
+        U32Like::Number(value) => Ok(value),
+        U32Like::Text(text) => {
+            let trimmed = text.trim();
+            let parsed = if let Some(hex) = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16)
+            } else {
+                trimmed.parse::<u32>()
+            };
+            parsed.map_err(serde::de::Error::custom)
+        }
+    }
+}
 
 // ── 会话管理 ──
 
@@ -52,7 +81,10 @@ pub struct GetMemoryRequest {
     #[schemars(description = "Line number to read memory at (default: last line of trace)")]
     pub seq: Option<u64>,
     #[schemars(description = "Number of bytes to read (default: 64, max: 256)")]
-    #[serde(default = "default_mem_length")]
+    #[serde(
+        default = "default_mem_length",
+        deserialize_with = "deserialize_u32_flexible"
+    )]
     pub length: u32,
 }
 
@@ -178,6 +210,10 @@ pub struct GetStringsRequest {
     #[schemars(description = "Max strings to return (default: 50, max: 200)")]
     #[serde(default = "default_strings_limit")]
     pub limit: u32,
+    #[schemars(
+        description = "Only strings whose first-observed seq is in this inclusive window, e.g. '1000-2000'"
+    )]
+    pub seq_range: Option<String>,
 }
 
 fn default_min_str_len() -> u32 {
@@ -326,6 +362,10 @@ pub struct GetMemHistoryRequest {
         description = "Reference seq: response includes center_index pointing at the first record at/after this seq"
     )]
     pub seq: Option<u64>,
+    #[schemars(
+        description = "Alias for seq with clearer semantics: anchor_seq is the reference seq used to compute center_index"
+    )]
+    pub anchor_seq: Option<u64>,
     #[schemars(description = "Pagination offset (default: 0)")]
     #[serde(default)]
     pub offset: u32,
@@ -336,6 +376,106 @@ pub struct GetMemHistoryRequest {
 
 fn default_mem_history_count() -> u32 {
     50
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemSummaryRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Inclusive seq window, e.g. '1000-5000' (default: whole trace)")]
+    pub seq_range: Option<String>,
+    #[schemars(
+        description = "Address range, e.g. '0x70000000-0x70100000' (default: whole address space)"
+    )]
+    pub addr_range: Option<String>,
+    #[schemars(description = "Filter: 'R' reads only, 'W' writes only, omit/'all' for both")]
+    pub rw: Option<String>,
+    #[schemars(description = "Aggregation bucket size in bytes (default: 4096)")]
+    #[serde(default = "default_bucket_size")]
+    pub bucket_size: u64,
+    #[schemars(description = "Pagination offset (default: 0)")]
+    #[serde(default)]
+    pub offset: u32,
+    #[schemars(description = "Max buckets per page (default: 100, max: 500)")]
+    #[serde(default = "default_mem_summary_limit")]
+    pub limit: u32,
+}
+
+fn default_bucket_size() -> u64 {
+    4096
+}
+
+fn default_mem_summary_limit() -> u32 {
+    100
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WatchSlotsRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Base address of slot 0 in hex")]
+    pub regfile_base: String,
+    #[schemars(description = "Byte stride between slots (default: 8)")]
+    #[serde(default = "default_slot_stride")]
+    pub slot_stride: u64,
+    #[schemars(description = "Slot indices to watch, e.g. [0,1,2,15]")]
+    pub slots: Vec<u32>,
+    #[schemars(description = "Expected slot width in bytes, 1..=8 (default: 8)")]
+    #[serde(default = "default_slot_width")]
+    pub width: u8,
+    #[schemars(description = "Inclusive seq window, e.g. '0-5000' (default: whole trace)")]
+    pub seq_range: Option<String>,
+    #[schemars(description = "Filter: 'R' reads only, 'W' writes only, omit/'all' for both")]
+    pub rw: Option<String>,
+    #[schemars(description = "Pagination offset (default: 0)")]
+    #[serde(default)]
+    pub offset: u32,
+    #[schemars(description = "Max records per page (default: 200, max: 2000)")]
+    #[serde(default = "default_watch_limit")]
+    pub limit: u32,
+}
+
+fn default_slot_stride() -> u64 {
+    8
+}
+
+fn default_slot_width() -> u8 {
+    8
+}
+
+fn default_watch_limit() -> u32 {
+    200
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_memory_length_accepts_number_decimal_and_hex_strings() {
+        let number: GetMemoryRequest =
+            serde_json::from_value(serde_json::json!({"address": "0x1000", "length": 64}))
+                .expect("numeric length");
+        assert_eq!(number.length, 64);
+
+        let decimal: GetMemoryRequest =
+            serde_json::from_value(serde_json::json!({"address": "0x1000", "length": "64"}))
+                .expect("decimal string length");
+        assert_eq!(decimal.length, 64);
+
+        let hex: GetMemoryRequest =
+            serde_json::from_value(serde_json::json!({"address": "0x1000", "length": "0x40"}))
+                .expect("hex string length");
+        assert_eq!(hex.length, 64);
+    }
+
+    #[test]
+    fn get_memory_length_defaults_when_missing() {
+        let request: GetMemoryRequest =
+            serde_json::from_value(serde_json::json!({"address": "0x1000"}))
+                .expect("default length");
+        assert_eq!(request.length, 64);
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
