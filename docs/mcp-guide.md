@@ -224,7 +224,9 @@ AI 会依次调用：
 | force_rebuild | bool | 否（默认 false） | 即使缓存存在也强制重建索引 |
 | skip_strings | bool | 否（默认 false） | 跳过字符串索引以加速打开 |
 
-**返回**：session_id、module_name（模块名）、entry_address（入口地址）、trace_format（格式）、function_count（函数数量）、total_lines（总行数）、file_size（文件大小）、has_string_index（是否有字符串索引）、from_cache（是否从缓存加载）。
+**返回**：session_id、module_name（模块名）、entry_address（入口地址）、trace_format（格式）、function_count（函数数量）、call_tree_nodes（调用树节点数）、function_count_semantics（`function_count` 的语义，当前为 `call_tree_nodes`）、total_lines（总行数）、file_size（文件大小）、has_string_index（是否有字符串索引）、from_cache（是否从缓存加载）。
+
+> `function_count` 与 `call_tree_nodes` 当前是同一个值：调用树节点数，而不是旧版按地址粒度展开的原始函数数量。
 
 **注意**：首次打开大文件需要构建索引（千万行约 15 秒），构建完成后自动缓存，再次打开秒级加载。
 
@@ -337,16 +339,16 @@ AI 会依次调用：
 
 **返回**：函数地址、名称、入口/出口行号、行数、X0-X7 入口参数值、X0 返回值、子调用列表。
 
-**模式二：按函数名搜索**
+**模式二：按函数名或地址搜索**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | session_id | string | 否 | 会话 ID（单会话时可省略） |
-| func_name | string | 是 | 函数名（支持模糊搜索） |
+| func_name | string | 是 | 函数名子串（不区分大小写），或十六进制地址子串，例如 `sub_120f`、`0x120f97c0`、`120f97c0` |
 
 **返回**：匹配的函数列表。
 
-**模式三：列出所有函数（无额外参数）**
+**模式三：列出所有调用树节点（无额外参数）**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -354,7 +356,7 @@ AI 会依次调用：
 | offset | u32 | 否（默认 0） | 分页偏移 |
 | limit | u32 | 否（默认 50） | 返回的最大数量 |
 
-**返回**：按函数名分组的调用列表，包含每次调用的行号。适合快速了解哪些函数被调用最多。
+**返回**：调用树节点清单（含 `node_id`、`func_addr`、`func_name`、`line_count`、`call_count`），按 `line_count` 降序排列，适合按热点函数做首轮 triage。
 
 ### 字符串分析
 

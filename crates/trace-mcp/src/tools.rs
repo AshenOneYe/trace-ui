@@ -16,6 +16,48 @@ use trace_core::{
 };
 use trace_core::{GlobalLine, VmAnalysisConfig};
 
+fn call_tree_node_name(node: &trace_core::api_types::CallTreeNodeDto) -> String {
+    node.func_name.clone().unwrap_or_else(|| {
+        let address = node.func_addr.trim_start_matches("0x");
+        format!("sub_{address}")
+    })
+}
+
+fn call_tree_node_matches(node: &trace_core::api_types::CallTreeNodeDto, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    if call_tree_node_name(node).to_lowercase().contains(&query) {
+        return true;
+    }
+
+    let address = node.func_addr.to_lowercase();
+    if address.contains(&query) {
+        return true;
+    }
+
+    let query_hex = query.strip_prefix("0x").unwrap_or(&query);
+    let address_hex = address.strip_prefix("0x").unwrap_or(&address);
+    !query_hex.is_empty()
+        && query_hex.chars().all(|c| c.is_ascii_hexdigit())
+        && address_hex.contains(query_hex)
+}
+
+fn call_tree_node_value(node: &trace_core::api_types::CallTreeNodeDto) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": node.id,
+        "id": node.id,
+        "func_name": call_tree_node_name(node),
+        "func_addr": node.func_addr,
+        "entry_seq": node.entry_seq,
+        "exit_seq": node.exit_seq,
+        "line_count": node.line_count,
+        "call_count": node.call_count,
+    })
+}
+
 // ── 截断常量 ──
 // NOTE: 修改这些值时，需同步更新对应 #[tool] 描述中的硬编码数字。
 
@@ -83,6 +125,42 @@ fn format_lines(lines: &[TraceLine], full: bool) -> Vec<serde_json::Value> {
             .collect()
     } else {
         lines.iter().map(|l| compact_line(l)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(address: &str, name: Option<&str>) -> trace_core::api_types::CallTreeNodeDto {
+        trace_core::api_types::CallTreeNodeDto {
+            id: 7,
+            func_addr: address.to_string(),
+            func_name: name.map(str::to_string),
+            entry_seq: 10,
+            exit_seq: 20,
+            parent_id: Some(0),
+            children_ids: vec![],
+            line_count: 11,
+            call_count: 3,
+        }
+    }
+
+    #[test]
+    fn function_search_matches_fallback_name_and_hex_address() {
+        let anonymous = node("0x120f97c0", None);
+        assert_eq!(call_tree_node_name(&anonymous), "sub_120f97c0");
+        assert!(call_tree_node_matches(&anonymous, "sub_120f"));
+        assert!(call_tree_node_matches(&anonymous, "0x120f97c0"));
+        assert!(call_tree_node_matches(&anonymous, "120f97"));
+        assert!(!call_tree_node_matches(&anonymous, "sub_dead"));
+    }
+
+    #[test]
+    fn function_search_matches_named_node_case_insensitively() {
+        let named = node("0x1000", Some("malloc"));
+        assert!(call_tree_node_matches(&named, "MAL"));
+        assert!(!call_tree_node_matches(&named, "free"));
     }
 }
 
@@ -236,7 +314,7 @@ impl TraceToolHandler {
         name = "open_trace",
         description = "Open a trace file and build its index. This is the first step before any analysis. \
             Returns session info including session_id, module_name, entry_address, trace_format, \
-            function_count, and other metadata needed for all subsequent operations. \
+            function_count (call tree node count) and call_tree_nodes, plus other metadata. \
             Building the index may take a few seconds for large files."
     )]
     async fn open_trace(
@@ -273,7 +351,8 @@ impl TraceToolHandler {
                         .ok()
                         .and_then(|info| info.trace_format.map(|f| format!("{:?}", f)));
 
-                    let function_count = engine.get_call_tree_node_count(&session_id).ok();
+                    let call_tree_nodes = engine.get_call_tree_node_count(&session_id).ok();
+                    let function_count = call_tree_nodes;
 
                     Ok(json(&serde_json::json!({
                         "session_id": session_id,
@@ -286,6 +365,8 @@ impl TraceToolHandler {
                         "entry_address": entry_address,
                         "trace_format": trace_format,
                         "function_count": function_count,
+                        "call_tree_nodes": call_tree_nodes,
+                        "function_count_semantics": "call_tree_nodes",
                     })))
                 }
                 Err(e) => {
@@ -1963,8 +2044,8 @@ impl TraceToolHandler {
         name = "analyze_function",
         description = "Analyze functions. Three modes: \
             (1) node_id: detailed analysis of one call with entry args (X0-X7) and return value (X0). \
-            (2) func_name: find all calls matching a name (partial, case-insensitive). \
-            (3) No arguments: list all functions with pagination (use offset/limit)."
+            (2) func_name: search call tree nodes by name substring or hex address substring. \
+            (3) No arguments: list call tree nodes with pagination, sorted by line_count descending."
     )]
     fn analyze_function(
         &self,
@@ -2034,80 +2115,76 @@ impl TraceToolHandler {
                 "sub_call_count": sub_calls.len(),
             })))
         } else if let Some(ref func_name) = req.func_name {
-            // Mode 2: 按名称搜索函数
-            let result = self
-                .engine
-                .get_function_calls(&sid)
-                .map_err(|e| e.to_string())?;
+            // Mode 2: 按名称或地址搜索调用树节点
+            let nodes = self.engine.get_call_tree(&sid).map_err(|e| e.to_string())?;
 
-            let query_lower = func_name.to_lowercase();
-            let matched: Vec<serde_json::Value> = result
-                .functions
+            let mut matched: Vec<_> = nodes
                 .iter()
-                .filter(|f| f.func_name.to_lowercase().contains(&query_lower))
-                .map(|f| {
-                    let occs: Vec<serde_json::Value> = f
-                        .occurrences
-                        .iter()
-                        .take(50)
-                        .map(|o| {
-                            serde_json::json!({
-                                "seq": o.seq,
-                                "summary": o.summary,
-                            })
-                        })
-                        .collect();
-                    let total_occs = f.occurrences.len();
-                    serde_json::json!({
-                        "func_name": f.func_name,
-                        "call_count": total_occs,
-                        "is_jni": f.is_jni,
-                        "occurrences": occs,
-                        "occurrences_truncated": total_occs > 50,
-                    })
-                })
+                .filter(|node| node.id != 0 && call_tree_node_matches(node, func_name))
+                .collect();
+            matched.sort_by(|a, b| {
+                b.line_count
+                    .cmp(&a.line_count)
+                    .then_with(|| b.call_count.cmp(&a.call_count))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+
+            let total = matched.len();
+            let limit = req.limit.min(100) as usize;
+            let page: Vec<_> = matched
+                .iter()
+                .skip(req.offset as usize)
+                .take(limit)
+                .map(|node| call_tree_node_value(node))
                 .collect();
 
             Ok(json(&serde_json::json!({
                 "query": func_name,
-                "matched_functions": matched.len(),
-                "functions": matched,
-                "hint": if matched.is_empty() {
-                    "No functions matched. Try a broader search term or use analyze_function with no arguments to list all functions."
+                "matched_functions": total,
+                "matched_nodes": total,
+                "functions": page,
+                "total": total,
+                "offset": req.offset,
+                "limit": limit,
+                "has_more": (req.offset as usize + page.len()) < total,
+                "sort": "line_count_desc",
+                "hint": if total == 0 {
+                    "No call tree node matched. Names are matched as substrings; addresses may be written as 0x120f97c0 or 120f97c0."
                 } else {
-                    "Use analyze_function with node_id from get_call_tree to inspect a specific call's arguments and return value."
+                    "Use node_id from a result with analyze_function(node_id=...) for entry registers, return value and sub-calls."
                 },
             })))
         } else {
-            // Mode 3: list all functions with pagination
-            let result = self
-                .engine
-                .get_function_calls(&sid)
-                .map_err(|e| e.to_string())?;
+            // Mode 3: list call tree nodes, hottest functions first
+            let nodes = self.engine.get_call_tree(&sid).map_err(|e| e.to_string())?;
+            let mut entries: Vec<_> = nodes.iter().filter(|node| node.id != 0).collect();
+            entries.sort_by(|a, b| {
+                b.line_count
+                    .cmp(&a.line_count)
+                    .then_with(|| b.call_count.cmp(&a.call_count))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
 
             let limit = req.limit.min(100) as usize;
-            let total = result.functions.len();
-            let page: Vec<serde_json::Value> = result
-                .functions
+            let total = entries.len();
+            let total_calls: u64 = entries.iter().map(|node| node.call_count as u64).sum();
+            let page: Vec<_> = entries
                 .iter()
                 .skip(req.offset as usize)
                 .take(limit)
-                .map(|f| {
-                    serde_json::json!({
-                        "func_name": f.func_name,
-                        "call_count": f.occurrences.len(),
-                        "is_jni": f.is_jni,
-                    })
-                })
+                .map(|node| call_tree_node_value(node))
                 .collect();
 
             Ok(json(&serde_json::json!({
                 "functions": page,
                 "total": total,
-                "total_calls": result.total_calls,
+                "total_nodes": total,
+                "total_calls": total_calls,
                 "offset": req.offset,
+                "limit": limit,
                 "has_more": (req.offset as usize + page.len()) < total,
-                "hint": "Use analyze_function with func_name to search, or node_id for detailed analysis with entry arguments.",
+                "sort": "line_count_desc",
+                "hint": "Call tree nodes are sorted by line_count descending. Use func_name for substring/address search, or node_id for detailed analysis.",
             })))
         }
     }
