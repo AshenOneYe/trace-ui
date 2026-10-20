@@ -492,6 +492,16 @@ pub struct VmTraceRequest {
     #[schemars(description = "Optional native dispatch-site hints, e.g. ['0x7359f5931c']")]
     #[serde(default)]
     pub dispatch_sites: Vec<String>,
+    #[schemars(description = "Absolute address of the VM program-counter slot")]
+    pub vpc_addr: Option<String>,
+    #[schemars(description = "VPC slot width in bytes (default: 8, max: 8)")]
+    pub vpc_width: Option<u8>,
+    #[schemars(description = "Optional register-file base used to derive vpc_addr")]
+    pub regfile_base: Option<String>,
+    #[schemars(description = "Optional VPC slot index within the register file")]
+    pub vpc_slot: Option<u32>,
+    #[schemars(description = "Slot stride in bytes when deriving vpc_addr (default: 8)")]
+    pub slot_stride: Option<u64>,
 }
 
 fn default_vm_trace_limit() -> u32 {

@@ -128,6 +128,7 @@ fn vm_trace_rows(
                 "unknown_effects_truncated": unknown_effect_count > MAX_UNKNOWN,
                 // Explicitly null until a VM profile supplies a VPC source.
                 "vpc": Value::Null,
+                "vpc_known": false,
             })
         })
         .collect()
@@ -284,6 +285,28 @@ mod tests {
         assert!(rows[0]["vpc"].is_null());
         assert!(vm_trace_rows(&result, 21, u64::MAX).is_empty());
     }
+
+    #[test]
+    fn vpc_profile_derives_slot_address_and_decodes_le_value() {
+        let addr = derive_vpc_addr(None, Some("0x1000"), Some(3), 8)
+            .unwrap()
+            .expect("derived address");
+        assert_eq!(addr, 0x1018);
+        assert_eq!(
+            derive_vpc_addr(Some("0x2000"), None, None, 8).unwrap(),
+            Some(0x2000)
+        );
+
+        let snapshot = trace_core::api_types::MemorySnapshot {
+            base_addr: "0x1018".to_string(),
+            bytes: vec![0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0],
+            known: vec![true, true, true, true, false, false, false, false],
+            length: 8,
+            unknown_data_writes: vec![],
+        };
+        assert_eq!(decode_le_snapshot(&snapshot, 4), Some(0x1234_5678));
+        assert_eq!(decode_le_snapshot(&snapshot, 8), None);
+    }
 }
 
 /// 检查 changes 字段是否仅包含噪音寄存器变化。
@@ -419,6 +442,48 @@ fn vm_config_with_dispatch_sites(sites: &[String]) -> Result<VmAnalysisConfig, S
         dispatch_sites: parse_dispatch_sites(sites)?,
         ..VmAnalysisConfig::default()
     })
+}
+
+fn derive_vpc_addr(
+    vpc_addr: Option<&str>,
+    regfile_base: Option<&str>,
+    vpc_slot: Option<u32>,
+    slot_stride: u64,
+) -> Result<Option<u64>, String> {
+    if let Some(addr) = vpc_addr {
+        return parse_hex_addr(addr).map(Some);
+    }
+    match (regfile_base, vpc_slot) {
+        (Some(base), Some(slot)) => {
+            let base = parse_hex_addr(base)?;
+            let offset = (slot as u64)
+                .checked_mul(slot_stride.max(1))
+                .ok_or_else(|| "vpc slot offset overflow".to_string())?;
+            base.checked_add(offset)
+                .map(Some)
+                .ok_or_else(|| "vpc address overflow".to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+fn decode_le_snapshot(snapshot: &trace_core::api_types::MemorySnapshot, width: u8) -> Option<u64> {
+    let width = width as usize;
+    if width == 0 || snapshot.bytes.len() < width || snapshot.known.len() < width {
+        return None;
+    }
+    if !snapshot.known[..width].iter().all(|known| *known) {
+        return None;
+    }
+    Some(
+        snapshot.bytes[..width]
+            .iter()
+            .enumerate()
+            .fold(0u64, |value, (index, byte)| {
+                value | ((*byte as u64) << (index * 8))
+            }),
+    )
 }
 
 /// Check if TraceLine's SO offset falls within an address range
@@ -1233,6 +1298,13 @@ impl TraceToolHandler {
         blocking(move || {
             let start_line = req.start_line.unwrap_or(0);
             let end_line = req.end_line.unwrap_or(u64::MAX);
+            let vpc_addr = derive_vpc_addr(
+                req.vpc_addr.as_deref(),
+                req.regfile_base.as_deref(),
+                req.vpc_slot,
+                req.slot_stride.unwrap_or(8),
+            )?;
+            let vpc_width = req.vpc_width.unwrap_or(8).clamp(1, 8);
             let config = vm_config_with_dispatch_sites(&req.dispatch_sites)?;
             let result = handler.analyze_vm_session_with_config(
                 &sid,
@@ -1240,14 +1312,42 @@ impl TraceToolHandler {
                 req.end_line,
                 config,
             )?;
-            let all_rows = vm_trace_rows(&result, start_line, end_line);
+            let mut all_rows = vm_trace_rows(&result, start_line, end_line);
+            if let Some(addr) = vpc_addr {
+                let seqs: Vec<u64> = all_rows
+                    .iter()
+                    .map(|row| {
+                        row.get("native_seq")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(u64::MAX)
+                    })
+                    .collect();
+                let values = handler
+                    .engine
+                    .get_memory_values_at(&sid, addr, &seqs, vpc_width)
+                    .map_err(|e| e.to_string())?;
+                for (row, value) in all_rows.iter_mut().zip(values) {
+                    if let Some(value) = value {
+                        row["vpc"] = serde_json::json!(value);
+                        row["vpc_known"] = serde_json::json!(true);
+                    }
+                }
+            }
             let total = all_rows.len();
             let offset = req.offset as usize;
             let limit = req.limit.clamp(1, 1000) as usize;
             let rows: Vec<_> = all_rows.iter().skip(offset).take(limit).cloned().collect();
             let mut warnings = result.warnings.clone();
-            warnings
-                .push("vpc is null until a VM profile provides an explicit VPC source".to_string());
+            if let Some(addr) = vpc_addr {
+                warnings.push(format!(
+                    "vpc annotated from memory 0x{addr:x} width {vpc_width}"
+                ));
+            } else {
+                warnings.push(
+                    "vpc is null until a VM profile provides vpc_addr or regfile_base+vpc_slot"
+                        .to_string(),
+                );
+            }
             let handle = handler
                 .results
                 .store(
@@ -1272,6 +1372,10 @@ impl TraceToolHandler {
                 "offset": offset,
                 "count": rows.len(),
                 "has_more": offset.saturating_add(rows.len()) < total,
+                "vpc_source": vpc_addr.map(|addr| serde_json::json!({
+                    "address": format!("0x{addr:x}"),
+                    "width": vpc_width,
+                })),
                 "trace_result": handle,
                 "rows": rows,
                 "warnings": warnings,

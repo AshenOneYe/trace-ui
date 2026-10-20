@@ -657,6 +657,46 @@ impl super::TraceEngine {
         })
     }
 
+    /// Read one address at many seq positions using the indexed access
+    /// history. This is intended for slot/VPC series annotation and avoids
+    /// rebuilding a full memory snapshot for every row.
+    pub fn get_memory_values_at(
+        &self,
+        session_id: &str,
+        addr: u64,
+        seqs: &[u64],
+        width: u8,
+    ) -> Result<Vec<Option<u64>>> {
+        if width == 0 || width > 8 {
+            return Err(TraceError::InvalidArgument(
+                "width must be in 1..=8 bytes".into(),
+            ));
+        }
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
+        let records = mem_view.query(addr).unwrap_or(&[]);
+        let mask = if width >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (width as u32 * 8)) - 1
+        };
+        Ok(seqs
+            .iter()
+            .map(|seq| {
+                let index = records.partition_point(|record| record.seq <= *seq);
+                if index == 0 {
+                    return None;
+                }
+                let record = &records[index - 1];
+                record.is_data_known().then_some(record.data & mask)
+            })
+            .collect())
+    }
+
     /// Aggregate memory accesses by address bucket and seq window.
     ///
     /// `total_accesses_in_addr_range` counts records in the address range

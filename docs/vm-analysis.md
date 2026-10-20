@@ -86,6 +86,10 @@ when the full effect list is required.
 `dispatch_sites` is an optional profile hint: a native address from
 `detect_vm_regions` can be forced to `VmPrimary` when the generic signature
 heuristic misses it.
+For VPC annotation, pass either `vpc_addr` (absolute memory address) or
+`regfile_base` + `vpc_slot` (+ optional `slot_stride`, default 8). Each row
+gets `vpc` and `vpc_known` from the last indexed access at that seq; this is
+a memory-slot observation, not a proof of virtual PC semantics.
 
 Hypothesis collaboration:
 
