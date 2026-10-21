@@ -11,7 +11,7 @@ use super::line_index::LineIndexArchive;
 use super::mem_access::{encode_group, FlatMemAccess};
 use super::mem_last_def::FlatMemLastDef;
 use super::pair_split::FlatPairSplit;
-use super::reg_checkpoints::{FlatRegCheckpoints, REG_COUNT};
+use super::reg_checkpoints::{encode_snapshots, FlatRegCheckpoints};
 
 fn append_compact_dep(output: &mut Vec<u8>, compact: u32) {
     let line = (compact & super::deps::COMPACT_LOCAL_LINE_MASK as u32) as u64;
@@ -68,14 +68,11 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
 
 /// Convert `RegCheckpoints` to `FlatRegCheckpoints` (flattened u64 array).
 pub fn reg_checkpoints_to_flat(ckpts: &RegCheckpoints) -> FlatRegCheckpoints {
-    let count = ckpts.snapshots.len() as u64;
-    let mut data = Vec::with_capacity(ckpts.snapshots.len() * REG_COUNT);
-    for snap in &ckpts.snapshots {
-        data.extend_from_slice(&snap.0);
-    }
+    let (offsets, data) = encode_snapshots(&ckpts.snapshots);
     FlatRegCheckpoints {
         interval: ckpts.interval,
-        count,
+        count: ckpts.snapshots.len() as u64,
+        offsets,
         data,
     }
 }
@@ -444,7 +441,8 @@ mod tests {
         let flat = reg_checkpoints_to_flat(&ckpts);
         assert_eq!(flat.interval, 100);
         assert_eq!(flat.count, 2);
-        assert_eq!(flat.data.len(), 2 * REG_COUNT);
+        assert_eq!(flat.offsets.len(), 3);
+        assert!(!flat.data.is_empty());
 
         let view = flat.view();
         let (seq0, regs0) = view.nearest_before(0).unwrap();

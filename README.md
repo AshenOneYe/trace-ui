@@ -104,7 +104,7 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 
 基于 mmap 内存映射 + 虚拟滚动实现，仅渲染可见区域的数十行。默认内存预算为 2 GiB，并会继续受当前可用内存和安全余量约束。超出完整索引预算时，`open_trace` 默认进入 lite 模式：只建立分段行检查点，不预先构建字符串和函数树；窗口级字符串、调用树和虚拟分段查询可按需构建。
 
-字符串与调用树缓存使用列式 section 数据和 mmap 查询，常驻堆内存不再随索引条目数线性增长。每个并行 chunk 完成后会立即把字符串访问写入独立 run，merge 再按 chunk 顺序流式读取；结果快照通过多路归并直接生成 mmap 档案。依赖边使用行字节偏移和紧凑 varint 流；内存访问记录按地址分组，对 seq 和指令地址做 delta varint，并将 size/rw/flags 合并为单字节元数据。大文件行检查点按 32 MiB 分块扫描并及时释放映射页，使冷构建的峰值 RSS 与 trace 文件大小解耦。索引构建完成后自动缓存，再次打开同一文件通常为毫秒级。
+字符串与调用树缓存使用列式 section 数据和 mmap 查询，常驻堆内存不再随索引条目数线性增长。每个并行 chunk 完成后会立即把字符串访问写入独立 run，merge 再按 chunk 顺序流式读取；结果快照通过多路归并直接生成 mmap 档案。依赖边使用行字节偏移和紧凑 varint 流；内存访问记录按地址分组，对 seq 和指令地址做 delta varint，并将 size/rw/flags 合并为单字节元数据；寄存器 checkpoint 使用带周期 keyframe 的稀疏变化流。大文件行检查点按 32 MiB 分块扫描并及时释放映射页，使冷构建的峰值 RSS 与 trace 文件大小解耦。索引构建完成后自动缓存，再次打开同一文件通常为毫秒级。
 
 大文件可先通过 `get_trace_segments` 获取虚拟段，再用 `open_trace_segment` 创建独立段 session。段 session 共享父 trace 的只读索引和 mmap，但查询范围、字符串结果、调用树和污点状态相互隔离。
 

@@ -1058,7 +1058,7 @@ impl super::TraceEngine {
             .nearest_before(seq)
             .ok_or_else(|| TraceError::Internal("无可用检查点".to_string()))?;
 
-        let mut values = *snapshot;
+        let mut values = snapshot;
 
         // 从检查点重放到目标 seq
         for replay_seq in ckpt_seq..=seq {

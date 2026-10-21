@@ -480,6 +480,8 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 内存访问索引使用 `.p2v3.cache`：地址表仍可直接二分；每个地址组的记录流中，seq 和指令地址使用 delta varint，data 保持 64 位原值，size/rw/unknown flags 压入 1 字节元数据。查询命中地址组时按需解码，不构造全量记录对象。
 
+寄存器 checkpoint 使用 `.p2v4.cache`：每 64 个 snapshot 写入一个 keyframe；普通 snapshot 只保存相对前一份发生变化的寄存器，值以 XOR varint 编码。随机查询从最近 keyframe 恢复，最多重放 63 个 snapshot。
+
 ## 限制与约束
 
 ### 数据量限制
