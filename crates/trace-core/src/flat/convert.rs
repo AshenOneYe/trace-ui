@@ -96,7 +96,7 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
                 .collect::<Result<Vec<u32>, _>>()?;
             let mut all_data = Vec::new();
             let mut all_offsets = Vec::with_capacity(cd.offsets_slice().len() + 1);
-            all_offsets.push(0u64);
+            all_offsets.push(0u32);
             for row in 0..cd.offsets_slice().len() {
                 let start = cd.offsets_slice()[row] as usize;
                 let end = cd
@@ -107,7 +107,11 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
                 for &dep in &compact[start..end] {
                     append_compact_dep(&mut all_data, dep);
                 }
-                all_offsets.push(all_data.len() as u64);
+                all_offsets.push(u32::try_from(all_data.len()).map_err(|_| {
+                    crate::error::TraceError::ResourceBudgetExceeded(
+                        "single-chunk dependency data exceeds 4 GiB offset range".to_string(),
+                    )
+                })?);
             }
             Ok(FlatDeps {
                 chunk_start_lines: vec![0u64],
@@ -146,7 +150,7 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                all_offsets.push(0u64);
+                all_offsets.push(0u32);
                 for row in 0..chunk.offsets_slice().len() {
                     let start = chunk.offsets_slice()[row] as usize;
                     let end = chunk
@@ -157,7 +161,14 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
                     for &dep in &compact[start..end] {
                         append_compact_dep(&mut all_data, dep);
                     }
-                    all_offsets.push((all_data.len() - chunk_data_start[chunk_id] as usize) as u64);
+                    all_offsets.push(
+                        u32::try_from(all_data.len() - chunk_data_start[chunk_id] as usize)
+                            .map_err(|_| {
+                                crate::error::TraceError::ResourceBudgetExceeded(format!(
+                                    "chunk {chunk_id} dependency data exceeds 4 GiB offset range"
+                                ))
+                            })?,
+                    );
                 }
             }
 

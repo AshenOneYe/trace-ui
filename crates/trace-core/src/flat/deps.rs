@@ -47,7 +47,7 @@ pub struct FlatDeps {
     pub chunk_start_lines: Vec<u64>,
     pub chunk_offsets_start: Vec<u64>, // where chunk i's offsets begin in all_offsets
     pub chunk_data_start: Vec<u64>,    // where chunk i's data begins in all_data
-    pub all_offsets: Vec<u64>,
+    pub all_offsets: Vec<u32>,
     pub all_data: Vec<u8>,
     pub patch_lines: Vec<u64>,   // sorted line numbers with patches
     pub patch_offsets: Vec<u64>, // CSR into patch_data
@@ -73,7 +73,7 @@ pub struct DepsView<'a> {
     chunk_start_lines: &'a [u64],
     chunk_offsets_start: &'a [u64],
     chunk_data_start: &'a [u64],
-    all_offsets: &'a [u64],
+    all_offsets: &'a [u32],
     all_data: &'a [u8],
     patch_lines: &'a [u64],
     patch_offsets: &'a [u64],
@@ -85,7 +85,7 @@ impl<'a> DepsView<'a> {
         chunk_start_lines: &'a [u64],
         chunk_offsets_start: &'a [u64],
         chunk_data_start: &'a [u64],
-        all_offsets: &'a [u64],
+        all_offsets: &'a [u32],
         all_data: &'a [u8],
         patch_lines: &'a [u64],
         patch_offsets: &'a [u64],
@@ -153,15 +153,15 @@ impl<'a> DepsView<'a> {
 mod tests {
     use super::*;
 
-    fn encode_rows(rows: &[&[u64]]) -> (Vec<u64>, Vec<u8>) {
-        let mut offsets = vec![0u64];
+    fn encode_rows(rows: &[&[u64]]) -> (Vec<u32>, Vec<u8>) {
+        let mut offsets = vec![0u32];
         let mut data = Vec::new();
         for row in rows {
             for &dep in *row {
                 super::super::varint::encode_u64(dep, &mut data);
                 data.push(0);
             }
-            offsets.push(data.len() as u64);
+            offsets.push(data.len() as u32);
         }
         (offsets, data)
     }

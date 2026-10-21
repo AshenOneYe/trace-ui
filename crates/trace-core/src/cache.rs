@@ -283,7 +283,7 @@ pub fn load_phase2_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
 }
 
 pub fn load_scan_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
-    let mmap = load_cache_mmap(file_path, data, ".scanv2.cache")?;
+    let mmap = load_cache_mmap(file_path, data, ".scanv3.cache")?;
     crate::flat::archives::ScanArchive::views_from_sections(&mmap[HEADER_LEN_V4..])?;
     Some(mmap)
 }
@@ -462,6 +462,7 @@ pub fn delete_cache(file_path: &str) {
         ".p2v4.cache",
         ".scan.cache",
         ".scanv2.cache",
+        ".scanv3.cache",
         ".lidx.cache",
         ".strings.bin",
         ".strings.cache",
@@ -536,6 +537,7 @@ fn known_cache_paths_in(dir: &std::path::Path, hash: &str) -> Vec<PathBuf> {
         ".p2v4.cache",
         ".scan.cache",
         ".scanv2.cache",
+        ".scanv3.cache",
         ".lidx.cache",
         ".strings.bin",
         ".strings.cache",
