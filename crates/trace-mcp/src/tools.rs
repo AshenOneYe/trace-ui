@@ -529,11 +529,15 @@ impl TraceToolHandler {
             Some(id) => Ok(id),
             None => {
                 let sessions = self.engine.list_sessions();
-                match sessions.len() {
+                let roots: Vec<_> = sessions
+                    .iter()
+                    .filter(|session| session.parent_session_id.is_none())
+                    .collect();
+                match roots.len() {
                     0 => Err("No active session. Call open_trace first.".into()),
-                    1 => Ok(sessions[0].session_id.clone()),
+                    1 => Ok(roots[0].session_id.clone()),
                     n => Err(format!(
-                        "Multiple sessions active ({}). Please specify session_id. \
+                        "Multiple root sessions active ({}). Please specify session_id. \
                          Use list_sessions to see all sessions.",
                         n
                     )),
@@ -1700,7 +1704,8 @@ impl TraceToolHandler {
                     .engine
                     .get_session_info(&sid)
                     .map_err(|e| e.to_string())?;
-                info.total_lines.saturating_sub(1)
+                info.seq_end
+                    .unwrap_or_else(|| info.total_lines.saturating_sub(1))
             }
         };
         self.engine
@@ -2447,7 +2452,28 @@ impl TraceToolHandler {
             "segment_lines": req.segment_lines.max(1),
             "count": segments.len(),
             "segments": segments,
-            "hint": "Pass each segment's start_seq-end_seq as seq_range to windowed string/call-tree queries or search_instructions.",
+            "hint": "Call open_trace_segment with a segment range to get an independent virtual session ID, or pass the range directly as seq_range.",
+        })))
+    }
+
+    #[tool(
+        name = "open_trace_segment",
+        description = "Create a lightweight virtual session over a parent trace's shared mmap/index. \
+            The segment session defaults browsing, search, strings and call-tree queries to its seq range."
+    )]
+    fn open_trace_segment(
+        &self,
+        Parameters(req): Parameters<OpenTraceSegmentRequest>,
+    ) -> Result<String, String> {
+        let parent = self.resolve_session(req.session_id)?;
+        let info = self
+            .engine
+            .create_segment_session(&parent, req.start_seq, req.end_seq, req.segment_index)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({
+            "session": info,
+            "parent_session_id": parent,
+            "scope": "virtual_segment",
         })))
     }
 

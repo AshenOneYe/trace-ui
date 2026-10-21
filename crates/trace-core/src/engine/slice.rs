@@ -210,6 +210,12 @@ impl TraceEngine {
             let start = ((e as usize) + 1).min(marked.len());
             marked[start..].fill(false);
         }
+        if let Some((segment_start, segment_end)) = handle.segment_range() {
+            let start = (segment_start as usize).min(marked.len());
+            let end = ((segment_end as usize) + 1).min(marked.len());
+            marked[..start].fill(false);
+            marked[end..].fill(false);
+        }
 
         Ok(marked)
     }
@@ -237,21 +243,27 @@ impl TraceEngine {
     ) -> Result<SliceResult> {
         let marked = self.compute_slice_marked(session_id, from_specs, &options)?;
         let stats = Self::slice_stats(&marked);
+        let handle = self.get_handle(session_id)?;
+        let origin = SliceOrigin {
+            from_specs: from_specs.to_vec(),
+            data_only: options.data_only,
+            start_seq: options.start_seq.or(handle.seq_start),
+            end_seq: options.end_seq.or(handle.seq_end),
+        };
 
         // Phase 2: write lock — store result + slice_origin
-        {
-            let handle = self.get_handle(session_id)?;
+        if handle.segment_range().is_some() {
+            *handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))? = Some((marked, origin));
+        } else {
             let mut state = handle
                 .state
                 .write()
                 .map_err(|e| TraceError::Internal(e.to_string()))?;
             state.slice_result = Some(marked);
-            state.slice_origin = Some(SliceOrigin {
-                from_specs: from_specs.to_vec(),
-                data_only: options.data_only,
-                start_seq: options.start_seq,
-                end_seq: options.end_seq,
-            });
+            state.slice_origin = Some(origin);
         }
 
         Ok(stats)
@@ -274,6 +286,13 @@ impl TraceEngine {
 
     pub fn clear_slice(&self, session_id: &str) -> Result<()> {
         let handle = self.get_handle(session_id)?;
+        if handle.segment_range().is_some() {
+            *handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))? = None;
+            return Ok(());
+        }
         let mut state = handle
             .state
             .write()
@@ -285,6 +304,14 @@ impl TraceEngine {
 
     pub fn get_slice_origin(&self, session_id: &str) -> Result<Option<SliceOrigin>> {
         let handle = self.get_handle(session_id)?;
+        if handle.segment_range().is_some() {
+            return Ok(handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?
+                .as_ref()
+                .map(|(_, origin)| origin.clone()));
+        }
         let state = handle
             .state
             .read()
@@ -294,6 +321,15 @@ impl TraceEngine {
 
     pub fn get_tainted_seqs(&self, session_id: &str) -> Result<Vec<u64>> {
         let handle = self.get_handle(session_id)?;
+        if handle.segment_range().is_some() {
+            return Ok(handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?
+                .as_ref()
+                .map(|(marked, _)| marked.iter_ones().map(|index| index as u64).collect())
+                .unwrap_or_default());
+        }
         let state = handle
             .state
             .read()
@@ -312,6 +348,22 @@ impl TraceEngine {
         count: u64,
     ) -> Result<Vec<bool>> {
         let handle = self.get_handle(session_id)?;
+        if handle.segment_range().is_some() {
+            let local = handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            return Ok(match local.as_ref() {
+                Some((marked, _)) => {
+                    let total = marked.len() as u64;
+                    let end = start_seq.saturating_add(count).min(total);
+                    (start_seq..end)
+                        .map(|index| marked[index as usize])
+                        .collect()
+                }
+                None => vec![false; count as usize],
+            });
+        }
         let state = handle
             .state
             .read()
@@ -335,22 +387,35 @@ impl TraceEngine {
         config: ExportConfig,
     ) -> Result<()> {
         let handle = self.get_handle(session_id)?;
+        let local_snapshot = if handle.segment_range().is_some() {
+            handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?
+                .clone()
+        } else {
+            None
+        };
         let state = handle
             .state
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let marked = state
-            .slice_result
-            .as_ref()
-            .ok_or_else(|| TraceError::InvalidArgument("没有活跃的污点分析结果".to_string()))?;
+        let (marked, slice_origin) = if let Some((marked, origin)) = local_snapshot.as_ref() {
+            (marked, Some(origin))
+        } else {
+            (
+                state.slice_result.as_ref().ok_or_else(|| {
+                    TraceError::InvalidArgument("没有活跃的污点分析结果".to_string())
+                })?,
+                state.slice_origin.as_ref(),
+            )
+        };
         let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
 
         // Fallback: if from_specs is empty, use stored slice_origin
         let actual_from_specs = if config.from_specs.is_empty() {
-            state
-                .slice_origin
-                .as_ref()
+            slice_origin
                 .map(|o| o.from_specs.clone())
                 .unwrap_or_default()
         } else {

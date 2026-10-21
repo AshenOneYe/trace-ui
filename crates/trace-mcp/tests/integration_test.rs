@@ -172,6 +172,64 @@ fn test_base_index_builds_window_local_strings_tree_and_segments() {
 }
 
 #[test]
+fn test_virtual_segment_session_isolates_ranges_and_slice_state() {
+    let (engine, parent) = setup_session(&get_trace_path());
+    let parent_info = engine.get_session_info(&parent).unwrap();
+    let start = 10u64;
+    let end = 20u64.min(parent_info.total_lines.saturating_sub(1));
+    let segment = engine
+        .create_segment_session(&parent, start, end, Some(3))
+        .expect("segment session");
+    assert_eq!(segment.parent_session_id.as_deref(), Some(parent.as_str()));
+    assert_eq!(segment.seq_start, Some(start));
+    assert_eq!(segment.seq_end, Some(end));
+
+    let lines = engine
+        .get_lines(
+            &segment.session_id,
+            &[start.saturating_sub(1), start, end, end + 1],
+        )
+        .unwrap();
+    assert_eq!(lines.len(), 2);
+    assert!(lines
+        .iter()
+        .all(|line| line.seq >= start && line.seq <= end));
+
+    let search = engine
+        .search(
+            &segment.session_id,
+            "mem[WRITE]",
+            trace_core::SearchOptions {
+                case_sensitive: false,
+                use_regex: false,
+                fuzzy: false,
+                max_results: Some(100),
+            },
+        )
+        .unwrap();
+    assert!(search
+        .match_seqs
+        .iter()
+        .all(|seq| *seq >= start && *seq <= end));
+
+    let (_, tainted) = engine
+        .run_slice_isolated(
+            &segment.session_id,
+            &[format!("reg:X0@{}", end + 1)],
+            trace_core::SliceOptions {
+                start_seq: None,
+                end_seq: None,
+                data_only: true,
+            },
+        )
+        .expect("segment slice");
+    assert!(tainted.iter().all(|seq| *seq >= start && *seq <= end));
+
+    engine.close_session(&parent).unwrap();
+    assert!(engine.get_session_info(&segment.session_id).is_err());
+}
+
+#[test]
 fn test_phase2_index_completes_functions_and_memory_but_not_dependencies() {
     let engine = Arc::new(TraceEngine::new());
     let temp_dir = std::env::temp_dir().join(format!(

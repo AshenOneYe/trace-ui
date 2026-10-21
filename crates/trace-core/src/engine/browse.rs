@@ -16,6 +16,9 @@ impl super::TraceEngine {
 
         let mut results = Vec::with_capacity(seqs.len());
         for &seq in seqs {
+            if !handle.contains_seq(seq) {
+                continue;
+            }
             if let Some(raw) = line_index.get_line(&state.mmap, seq) {
                 let parsed = match format {
                     TraceFormat::Unidbg => crate::browse::parse_trace_line(seq, raw),
@@ -78,6 +81,11 @@ impl super::TraceEngine {
             .state
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
-        Ok(state.consumed_seqs.clone())
+        Ok(state
+            .consumed_seqs
+            .iter()
+            .copied()
+            .filter(|seq| handle.contains_seq(*seq))
+            .collect())
     }
 }

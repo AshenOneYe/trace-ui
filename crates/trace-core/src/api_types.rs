@@ -34,6 +34,10 @@ pub struct SessionInfo {
     pub building: bool,
     pub has_slice_result: bool,
     pub trace_format: Option<TraceFormat>,
+    pub parent_session_id: Option<String>,
+    pub segment_index: Option<u32>,
+    pub seq_start: Option<u64>,
+    pub seq_end: Option<u64>,
 }
 
 // ── Build ──

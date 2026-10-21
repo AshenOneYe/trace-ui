@@ -135,10 +135,19 @@ async fn main() -> anyhow::Result<()> {
         let session = engine.create_session(&file)?;
         let sid = session.session_id;
         let build = engine.build_base_index(&sid, false, None)?;
-        let lines =
-            engine.get_lines(&sid, &[start, end.min(build.total_lines.saturating_sub(1))])?;
-        let strings = engine.get_strings(
+        let segment = engine.create_segment_session(
             &sid,
+            start,
+            end.min(build.total_lines.saturating_sub(1)),
+            Some(0),
+        )?;
+        let segment_sid = segment.session_id.clone();
+        let lines = engine.get_lines(
+            &segment_sid,
+            &[start, end.min(build.total_lines.saturating_sub(1))],
+        )?;
+        let strings = engine.get_strings(
+            &segment_sid,
             StringQueryOptions {
                 min_len: 3,
                 offset: 0,
@@ -148,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
                 seq_end: Some(end),
             },
         )?;
-        let tree = engine.get_call_tree_window(&sid, start, end)?;
+        let tree = engine.get_call_tree_window(&segment_sid, start, end)?;
         let segments = engine.get_trace_segments(&sid, 262_144)?;
         let memory = engine.get_memory_status();
         println!(
@@ -156,6 +165,8 @@ async fn main() -> anyhow::Result<()> {
             serde_json::json!({
                 "file": file,
                 "total_lines": build.total_lines,
+                "parent_session_id": sid,
+                "segment_session_id": segment_sid,
                 "window": {"start": start, "end": end},
                 "line_sample_count": lines.len(),
                 "lazy_string_count": strings.total,

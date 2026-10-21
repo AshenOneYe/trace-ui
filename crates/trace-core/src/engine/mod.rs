@@ -112,7 +112,12 @@ impl TraceEngine {
             scanning_strings: AtomicBool::new(false),
             scan_strings_cancel: AtomicBool::new(false),
             search_cache: std::sync::Mutex::new((0, Vec::new())),
-            state: RwLock::new(session_state),
+            local_slice: std::sync::Mutex::new(None),
+            state: Arc::new(RwLock::new(session_state)),
+            parent_session_id: None,
+            segment_index: None,
+            seq_start: None,
+            seq_end: None,
         });
 
         {
@@ -132,7 +137,94 @@ impl TraceEngine {
             building: false,
             has_slice_result: false,
             trace_format: Some(TraceFormat::Unidbg),
+            parent_session_id: None,
+            segment_index: None,
+            seq_start: None,
+            seq_end: None,
         })
+    }
+
+    /// Create a lightweight virtual session over an existing trace mmap/index.
+    /// Segment sessions share the parent's read-only state and isolate range
+    /// defaults in their session metadata.
+    pub fn create_segment_session(
+        &self,
+        parent_session_id: &str,
+        start_seq: u64,
+        end_seq: u64,
+        segment_index: Option<u32>,
+    ) -> Result<SessionInfo> {
+        let parent = self.get_handle(parent_session_id)?;
+        if parent.parent_session_id.is_some() {
+            return Err(TraceError::InvalidArgument(
+                "cannot create a segment from another segment".to_string(),
+            ));
+        }
+        let (total_lines, index_ready, trace_format) = {
+            let state = parent
+                .state
+                .read()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            (
+                state.total_lines,
+                state.lidx_store.is_some(),
+                state.trace_format,
+            )
+        };
+        if !index_ready {
+            return Err(TraceError::IndexNotReady);
+        }
+        if total_lines == 0 {
+            return Err(TraceError::InvalidArgument(
+                "cannot create a segment for an empty trace".to_string(),
+            ));
+        }
+        if start_seq > end_seq || end_seq >= total_lines {
+            return Err(TraceError::InvalidArgument(format!(
+                "segment range must satisfy start <= end < {total_lines}"
+            )));
+        }
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let handle = Arc::new(SessionHandle {
+            file_path: parent.file_path.clone(),
+            file_size: parent.file_size,
+            building: AtomicBool::new(false),
+            build_cancel: AtomicBool::new(false),
+            scanning_strings: AtomicBool::new(false),
+            scan_strings_cancel: AtomicBool::new(false),
+            search_cache: std::sync::Mutex::new((0, Vec::new())),
+            local_slice: std::sync::Mutex::new(None),
+            state: parent.state.clone(),
+            parent_session_id: Some(parent_session_id.to_string()),
+            segment_index,
+            seq_start: Some(start_seq),
+            seq_end: Some(end_seq),
+        });
+        {
+            let mut sessions = self
+                .sessions
+                .write()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            sessions.insert(session_id.clone(), handle);
+        }
+        Ok(SessionInfo {
+            session_id,
+            file_path: parent.file_path.clone(),
+            file_size: parent.file_size,
+            total_lines,
+            index_ready,
+            building: false,
+            has_slice_result: false,
+            trace_format: Some(trace_format),
+            parent_session_id: Some(parent_session_id.to_string()),
+            segment_index,
+            seq_start: Some(start_seq),
+            seq_end: Some(end_seq),
+        })
+    }
+
+    pub fn get_segment_range(&self, session_id: &str) -> Result<Option<(u64, u64)>> {
+        Ok(self.get_handle(session_id)?.segment_range())
     }
 
     pub fn close_session(&self, session_id: &str) -> Result<()> {
@@ -141,7 +233,9 @@ impl TraceEngine {
                 .sessions
                 .write()
                 .map_err(|e| TraceError::Internal(e.to_string()))?;
-            sessions.remove(session_id)
+            let removed = sessions.remove(session_id);
+            sessions.retain(|_, handle| handle.parent_session_id.as_deref() != Some(session_id));
+            removed
         };
         if let Some(handle) = removed {
             std::thread::spawn(move || drop(handle));
@@ -155,6 +249,15 @@ impl TraceEngine {
             .state
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let has_slice_result = if handle.segment_range().is_some() {
+            handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?
+                .is_some()
+        } else {
+            state.slice_result.is_some()
+        };
 
         Ok(SessionInfo {
             session_id: session_id.to_string(),
@@ -163,8 +266,12 @@ impl TraceEngine {
             total_lines: state.total_lines,
             index_ready: state.lidx_store.is_some(),
             building: handle.building.load(Ordering::Relaxed),
-            has_slice_result: state.slice_result.is_some(),
+            has_slice_result,
             trace_format: Some(state.trace_format),
+            parent_session_id: handle.parent_session_id.clone(),
+            segment_index: handle.segment_index,
+            seq_start: handle.seq_start,
+            seq_end: handle.seq_end,
         })
     }
 
@@ -259,6 +366,11 @@ impl TraceEngine {
             .iter()
             .filter_map(|(id, handle)| {
                 let state = handle.state.read().ok()?;
+                let has_slice_result = if handle.segment_range().is_some() {
+                    handle.local_slice.lock().ok()?.is_some()
+                } else {
+                    state.slice_result.is_some()
+                };
                 Some(SessionInfo {
                     session_id: id.clone(),
                     file_path: handle.file_path.clone(),
@@ -266,8 +378,12 @@ impl TraceEngine {
                     total_lines: state.total_lines,
                     index_ready: state.lidx_store.is_some(),
                     building: handle.building.load(Ordering::Relaxed),
-                    has_slice_result: state.slice_result.is_some(),
+                    has_slice_result,
                     trace_format: Some(state.trace_format),
+                    parent_session_id: handle.parent_session_id.clone(),
+                    segment_index: handle.segment_index,
+                    seq_start: handle.seq_start,
+                    seq_end: handle.seq_end,
                 })
             })
             .collect()

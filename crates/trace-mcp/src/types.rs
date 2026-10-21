@@ -206,6 +206,20 @@ pub struct GetTraceSegmentsRequest {
     pub segment_lines: u64,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OpenTraceSegmentRequest {
+    #[schemars(
+        description = "Parent trace session ID (optional if only one root session is open)"
+    )]
+    pub session_id: Option<String>,
+    #[schemars(description = "First inclusive seq in the virtual segment")]
+    pub start_seq: u64,
+    #[schemars(description = "Last inclusive seq in the virtual segment")]
+    pub end_seq: u64,
+    #[schemars(description = "Optional stable segment index returned by get_trace_segments")]
+    pub segment_index: Option<u32>,
+}
+
 fn default_segment_lines() -> u64 {
     262_144
 }

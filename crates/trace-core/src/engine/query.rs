@@ -366,6 +366,11 @@ impl super::TraceEngine {
         length: u32,
     ) -> Result<MemorySnapshot> {
         let handle = self.get_handle(session_id)?;
+        if !handle.contains_seq(seq) {
+            return Err(TraceError::InvalidArgument(format!(
+                "seq {seq} is outside this virtual segment"
+            )));
+        }
         let state = handle
             .state
             .read()
@@ -1032,6 +1037,11 @@ impl super::TraceEngine {
 
     pub fn get_registers_at(&self, session_id: &str, seq: u64) -> Result<HashMap<String, String>> {
         let handle = self.get_handle(session_id)?;
+        if !handle.contains_seq(seq) {
+            return Err(TraceError::InvalidArgument(format!(
+                "seq {seq} is outside this virtual segment"
+            )));
+        }
         let state = handle
             .state
             .read()
@@ -1140,6 +1150,11 @@ impl super::TraceEngine {
 
         let nodes: Vec<CallTreeNodeDto> = call_tree
             .iter()
+            .filter(|node| {
+                handle.segment_range().map_or(true, |(start, end)| {
+                    node.entry_seq() <= end && node.exit_seq() >= start
+                })
+            })
             .map(|n| node_to_dto(&n, line_index.as_ref(), data))
             .collect();
 
@@ -1166,6 +1181,14 @@ impl super::TraceEngine {
         let node = call_tree
             .node(node_id)
             .ok_or_else(|| TraceError::InvalidArgument(format!("节点 {} 不存在", node_id)))?;
+        if handle
+            .segment_range()
+            .is_some_and(|(start, end)| node.entry_seq() > end || node.exit_seq() < start)
+        {
+            return Err(TraceError::InvalidArgument(format!(
+                "node {node_id} is outside this virtual segment"
+            )));
+        }
 
         let mut result = Vec::new();
 
@@ -1191,7 +1214,14 @@ impl super::TraceEngine {
 
         let call_tree = state.call_tree_view().ok_or(TraceError::IndexNotReady)?;
 
-        Ok(call_tree.node_count() as u32)
+        Ok(call_tree
+            .iter()
+            .filter(|node| {
+                handle.segment_range().map_or(true, |(start, end)| {
+                    node.entry_seq() <= end && node.exit_seq() >= start
+                })
+            })
+            .count() as u32)
     }
 
     pub fn get_call_tree_window(
@@ -1201,6 +1231,13 @@ impl super::TraceEngine {
         end_seq: u64,
     ) -> Result<Vec<CallTreeNodeDto>> {
         const MAX_WINDOW_LINES: u64 = 262_144;
+        let handle = self.get_handle(session_id)?;
+        let (start_seq, end_seq) = handle
+            .segment_range()
+            .map(|(segment_start, segment_end)| {
+                (start_seq.max(segment_start), end_seq.min(segment_end))
+            })
+            .unwrap_or((start_seq, end_seq));
         if start_seq > end_seq {
             return Err(TraceError::InvalidArgument(
                 "seq_range start must be <= end".to_string(),
@@ -1214,7 +1251,6 @@ impl super::TraceEngine {
             )));
         }
         let _lease = self.acquire_query_lease()?;
-        let handle = self.get_handle(session_id)?;
         let state = handle
             .state
             .read()
@@ -1274,6 +1310,20 @@ impl super::TraceEngine {
         if total == 0 {
             return Ok(Vec::new());
         }
+        if let Some((start_seq, end_seq)) = handle.segment_range() {
+            return Ok(vec![TraceSegmentDto {
+                index: handle.segment_index.unwrap_or(0),
+                start_seq,
+                end_seq,
+                start_byte: line_index
+                    .line_byte_offset(&state.mmap, start_seq)
+                    .unwrap_or(0),
+                end_byte: line_index
+                    .line_byte_offset(&state.mmap, end_seq.saturating_add(1))
+                    .unwrap_or(state.mmap.len() as u64),
+                line_count: end_seq.saturating_sub(start_seq).saturating_add(1),
+            }]);
+        }
         let mut segments =
             Vec::with_capacity(((total + segment_lines - 1) / segment_lines) as usize);
         let mut start = 0u64;
@@ -1306,9 +1356,13 @@ impl super::TraceEngine {
     pub fn get_strings(
         &self,
         session_id: &str,
-        options: StringQueryOptions,
+        mut options: StringQueryOptions,
     ) -> Result<StringsResult> {
         let handle = self.get_handle(session_id)?;
+        if let Some((start, end)) = handle.segment_range() {
+            options.seq_start = Some(options.seq_start.map_or(start, |value| value.max(start)));
+            options.seq_end = Some(options.seq_end.map_or(end, |value| value.min(end)));
+        }
         let has_string_index = {
             let state = handle
                 .state
@@ -1594,49 +1648,50 @@ impl super::TraceEngine {
 
         // 确保无论成功与否都重置 scanning_strings
         let result = (|| -> Result<()> {
-            // 1. Collect READ+WRITE records and reset cancel flag
-            let mut accesses: Vec<(u64, u64, u8, u64, StringRw)>;
-            {
+            handle.scan_strings_cancel.store(false, Ordering::SeqCst);
+
+            // 1. External-sort READ/WRITE records by seq in bounded runs.
+            let sorted_accesses = {
                 let state = handle
                     .state
                     .read()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
                 let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
-                let estimated = (mem_view.total_records().saturating_mul(40)).max(16 * 1024 * 1024);
                 self.memory_watchdog
-                    .ensure_capacity(estimated as u64)
+                    .ensure_capacity(32 * 1024 * 1024)
                     .map_err(TraceError::ResourceBudgetExceeded)?;
+                crate::query::string_external::external_sort_accesses(
+                    mem_view.iter_all().filter_map(|(addr, rec)| {
+                        (rec.size <= 8).then_some(crate::query::string_external::StringAccess {
+                            addr,
+                            data: rec.data,
+                            size: rec.size,
+                            seq: rec.seq,
+                            rw: u8::from(rec.is_write()),
+                        })
+                    }),
+                    500_000,
+                    &handle.scan_strings_cancel,
+                )?
+            };
 
-                accesses = Vec::new();
-                for (addr, rec) in mem_view.iter_all() {
-                    if rec.size <= 8 {
-                        let rw = if rec.is_write() {
-                            StringRw::Write
-                        } else {
-                            StringRw::Read
-                        };
-                        accesses.push((addr, rec.data, rec.size, rec.seq, rw));
-                    }
-                }
-            }
-
-            // 2. Sort by seq
-            accesses.sort_unstable_by_key(|a| a.3);
-
-            // 3. Reset cancellation flag
-            handle.scan_strings_cancel.store(false, Ordering::SeqCst);
-
-            // 4. Run StringBuilder
-            let estimated_pages = (accesses.len() / 500).max(1024);
+            // 2. Stream the merged access order into the string state machine.
+            let estimated_pages = (sorted_accesses.count() as usize / 500).max(1024);
             let mut sb = StringBuilder::with_capacity(estimated_pages);
-            for (i, &(addr, data, size, seq, rw)) in accesses.iter().enumerate() {
+            for (i, access) in sorted_accesses.iter()?.enumerate() {
+                let access = access?;
                 if i % 10000 == 0 && handle.scan_strings_cancel.load(Ordering::SeqCst) {
                     return Err(TraceError::Cancelled);
                 }
-                sb.process_access(addr, data, size, seq, rw);
+                let rw = if access.rw == 1 {
+                    StringRw::Write
+                } else {
+                    StringRw::Read
+                };
+                sb.process_access(access.addr, access.data, access.size, access.seq, rw);
             }
 
-            // 5. finish + fill_xref_counts
+            // 3. finish + fill_xref_counts
             let mut string_index = sb.finish();
             {
                 let state = handle
@@ -1647,7 +1702,7 @@ impl super::TraceEngine {
                 StringBuilder::fill_xref_counts_view(&mut string_index, &mem_view);
             }
 
-            // 6. Write results and update cache
+            // 4. Write results and update cache
             {
                 let archive = crate::flat::strings::StringIndexArchive::from_index(&string_index);
                 let archive_bytes = archive.to_sections();
@@ -1772,16 +1827,29 @@ impl super::TraceEngine {
         options: DepTreeOptions,
     ) -> Result<crate::query::dep_tree::DependencyGraph> {
         let handle = self.get_handle(session_id)?;
+        let local_origin = if handle.segment_range().is_some() {
+            handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?
+                .as_ref()
+                .map(|(_, origin)| origin.clone())
+        } else {
+            None
+        };
         let state = handle
             .state
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let origin = state.slice_origin.as_ref().ok_or_else(|| {
-            TraceError::InvalidArgument(
-                "No active taint analysis result, please run taint tracking first".to_string(),
-            )
-        })?;
+        let origin = local_origin
+            .as_ref()
+            .or(state.slice_origin.as_ref())
+            .ok_or_else(|| {
+                TraceError::InvalidArgument(
+                    "No active taint analysis result, please run taint tracking first".to_string(),
+                )
+            })?;
         let spec = origin.from_specs.first().ok_or_else(|| {
             TraceError::InvalidArgument("No from_specs in SliceOrigin".to_string())
         })?;
@@ -1816,6 +1884,11 @@ impl super::TraceEngine {
 
     pub fn get_line_def_registers(&self, session_id: &str, seq: u64) -> Result<Vec<String>> {
         let handle = self.get_handle(session_id)?;
+        if !handle.contains_seq(seq) {
+            return Err(TraceError::InvalidArgument(format!(
+                "seq {seq} is outside this virtual segment"
+            )));
+        }
         let state = handle
             .state
             .read()

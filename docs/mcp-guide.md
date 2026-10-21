@@ -259,6 +259,18 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 每段返回 `start_seq/end_seq/start_byte/end_byte`。把 `start_seq-end_seq` 传给 `search_instructions`、`get_strings`、`get_call_tree` 或 `analyze_function` 的 `seq_range` 即可逐段执行并按 seq 合并。
 
+#### open_trace_segment
+
+基于父 trace 的共享 mmap/index 创建一个轻量虚拟段 session。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 否 | 父 trace session |
+| start_seq / end_seq | u64 | 是 | 闭区间段范围 |
+| segment_index | u32 | 否 | `get_trace_segments` 返回的段号 |
+
+段 session 的浏览、`search`、字符串、调用树和污点结果会自动限制在该范围。段 session 复用父索引，因此创建成本接近常数；关闭父 session 会同时清理所有子段 session。
+
 #### get_memory
 
 读取指定地址在指定指令行处的内存内容。显示执行到该指令时的字节值。
@@ -450,6 +462,8 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 | dry_run | bool | 否（默认 true） | 只报告可回收字节，不删除 |
 
 只处理原 trace 已不存在的 manifest 及其对应的 `.p2v2.cache`、`.scan.cache`、`.lidx.cache`、`.strings.cache`、旧格式缓存和 checkpoint 目录。默认先 dry-run，确认报告中 `bytes_reclaimable` 和 `errors` 后再以 `dry_run=false` 执行。
+
+全量字符串构建使用固定大小排序 run 和多路外部归并，不把全部内存访问记录同时保存在堆中。字符串结果仍会生成列式 mmap 档案，重新打开时按需缺页读取。
 
 ## 限制与约束
 

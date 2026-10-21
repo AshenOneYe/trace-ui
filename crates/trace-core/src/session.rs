@@ -132,5 +132,21 @@ pub struct SessionHandle {
     pub(crate) scan_strings_cancel: AtomicBool,
     /// 缓存最近一次搜索的全量匹配序列号及其 generation，供分页拉取
     pub(crate) search_cache: Mutex<(u64, Vec<u64>)>,
-    pub(crate) state: RwLock<SessionState>,
+    pub(crate) local_slice: Mutex<Option<(bitvec::prelude::BitVec, SliceOrigin)>>,
+    pub(crate) state: std::sync::Arc<RwLock<SessionState>>,
+    pub(crate) parent_session_id: Option<String>,
+    pub(crate) segment_index: Option<u32>,
+    pub(crate) seq_start: Option<u64>,
+    pub(crate) seq_end: Option<u64>,
+}
+
+impl SessionHandle {
+    pub(crate) fn segment_range(&self) -> Option<(u64, u64)> {
+        Some((self.seq_start?, self.seq_end?))
+    }
+
+    pub(crate) fn contains_seq(&self, seq: u64) -> bool {
+        self.segment_range()
+            .map_or(true, |(start, end)| seq >= start && seq <= end)
+    }
 }

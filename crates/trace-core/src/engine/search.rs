@@ -289,7 +289,7 @@ impl TraceEngine {
             .unwrap_or(4);
 
         // 从 session 中提取搜索所需数据，并预计算分块边界
-        let (mmap_arc, total_lines, call_search_texts, consumed_seqs, chunks) = {
+        let (mmap_arc, scan_start, scan_end, call_search_texts, consumed_seqs, chunks) = {
             let state = handle
                 .state
                 .read()
@@ -300,34 +300,42 @@ impl TraceEngine {
                 .as_ref()
                 .map(|s| s.total_lines())
                 .unwrap_or(0);
+            let (scan_start, scan_end) = handle
+                .segment_range()
+                .map(|(start, end)| (start.min(total_lines), (end + 1).min(total_lines)))
+                .unwrap_or((0, total_lines));
 
-            let chunks: Option<Vec<(u64, u64, usize)>> = if num_cpus > 1 && total_lines > 10000 {
-                state.line_index_view().map(|li| {
-                    let data: &[u8] = &state.mmap;
-                    let num_chunks = num_cpus.min(16);
-                    let lines_per_chunk = (total_lines as usize + num_chunks - 1) / num_chunks;
-                    let mut result = Vec::with_capacity(num_chunks);
-                    for i in 0..num_chunks {
-                        let start_seq = (i * lines_per_chunk) as u64;
-                        if start_seq >= total_lines {
-                            break;
+            let chunks: Option<Vec<(u64, u64, usize)>> =
+                if num_cpus > 1 && scan_end.saturating_sub(scan_start) > 10000 {
+                    state.line_index_view().map(|li| {
+                        let data: &[u8] = &state.mmap;
+                        let num_chunks = num_cpus.min(16);
+                        let window_lines = scan_end.saturating_sub(scan_start);
+                        let lines_per_chunk = (window_lines as usize + num_chunks - 1) / num_chunks;
+                        let mut result = Vec::with_capacity(num_chunks);
+                        for i in 0..num_chunks {
+                            let start_seq = scan_start + (i * lines_per_chunk) as u64;
+                            if start_seq >= scan_end {
+                                break;
+                            }
+                            let end_seq =
+                                (scan_start + ((i + 1) * lines_per_chunk) as u64).min(scan_end);
+                            let start_offset =
+                                li.line_byte_offset(data, start_seq).unwrap_or(0) as usize;
+                            result.push((start_seq, end_seq, start_offset));
                         }
-                        let end_seq = ((i + 1) * lines_per_chunk).min(total_lines as usize) as u64;
-                        let start_offset =
-                            li.line_byte_offset(data, start_seq).unwrap_or(0) as usize;
-                        result.push((start_seq, end_seq, start_offset));
-                    }
-                    result
-                })
-            } else {
-                None
-            };
+                        result
+                    })
+                } else {
+                    None
+                };
 
             let consumed: HashSet<u64> = state.consumed_seqs.iter().copied().collect();
 
             (
                 state.mmap.clone(),
-                total_lines,
+                scan_start,
+                scan_end,
                 state.call_search_texts.clone(),
                 consumed,
                 chunks,
@@ -366,11 +374,21 @@ impl TraceEngine {
             }
             (merged, tm)
         } else {
+            let start_offset = {
+                let state = handle
+                    .state
+                    .read()
+                    .map_err(|e| TraceError::Internal(e.to_string()))?;
+                state
+                    .line_index_view()
+                    .and_then(|line_index| line_index.line_byte_offset(&state.mmap, scan_start))
+                    .unwrap_or(0) as usize
+            };
             let (match_seqs, total_matches) = search_chunk_seqs(
                 &data,
-                0,
-                total_lines,
-                0,
+                scan_start,
+                scan_end,
+                start_offset,
                 &mode,
                 &consumed_seqs,
                 &call_search_texts,
@@ -391,7 +409,7 @@ impl TraceEngine {
             *cache = (gen, all_seqs); // move, not clone
             Ok(SearchResultLite {
                 match_seqs: first_page,
-                total_scanned: total_lines,
+                total_scanned: scan_end.saturating_sub(scan_start),
                 total_matches,
                 truncated: total_matches as usize > SEARCH_FIRST_PAGE_SIZE,
             })
@@ -399,7 +417,7 @@ impl TraceEngine {
             // 截断模式（GotoOverlay / MCP）：不缓存，按原逻辑返回
             Ok(SearchResultLite {
                 match_seqs: all_seqs,
-                total_scanned: total_lines,
+                total_scanned: scan_end.saturating_sub(scan_start),
                 total_matches,
                 truncated: total_matches > max_results as u64,
             })
@@ -449,6 +467,15 @@ impl TraceEngine {
             });
         }
         let handle = self.get_handle(session_id)?;
+        let (start_seq, end_seq) = handle
+            .segment_range()
+            .map(|(segment_start, segment_end)| {
+                (
+                    start_seq.max(segment_start),
+                    end_seq.min(segment_end.saturating_add(1)),
+                )
+            })
+            .unwrap_or((start_seq, end_seq));
         let mode = parse_search_mode(
             query,
             options.case_sensitive,
