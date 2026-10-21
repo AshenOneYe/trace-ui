@@ -150,6 +150,7 @@ pub struct SearchMatch {
 
 // ── Slice ──
 
+#[derive(Clone)]
 pub struct SliceOptions {
     pub start_seq: Option<u64>,
     pub end_seq: Option<u64>,
@@ -162,6 +163,18 @@ pub struct SliceResult {
     pub marked_count: u64,
     pub total_lines: u64,
     pub percentage: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkedSliceResult {
+    pub marked_count: u64,
+    pub total_lines: u64,
+    pub percentage: f64,
+    pub complete: bool,
+    pub processed_steps: u64,
+    pub pending_nodes: u64,
+    pub checkpoint_id: String,
 }
 
 #[derive(Deserialize)]

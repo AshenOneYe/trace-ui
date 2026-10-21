@@ -59,6 +59,55 @@ pub fn checkpoint_dir(
     cache_dir().map(|dir| dir.join("checkpoints").join(hash))
 }
 
+fn slice_checkpoint_path(
+    file_path: &str,
+    fingerprint: &crate::index_manifest::TraceFingerprint,
+    checkpoint_id: &str,
+) -> Option<PathBuf> {
+    let dir = checkpoint_dir(file_path, fingerprint)?.join("slices");
+    let mut hasher = Sha256::new();
+    hasher.update(checkpoint_id.as_bytes());
+    Some(dir.join(format!("{:x}.bin", hasher.finalize())))
+}
+
+pub fn save_slice_checkpoint(
+    file_path: &str,
+    _data: &[u8],
+    fingerprint: &crate::index_manifest::TraceFingerprint,
+    checkpoint_id: &str,
+    state: &impl serde::Serialize,
+) -> crate::error::Result<()> {
+    let path = slice_checkpoint_path(file_path, fingerprint, checkpoint_id)
+        .ok_or_else(|| crate::error::TraceError::CacheError("cache unavailable".to_string()))?;
+    atomic_write_with(&path, |file| {
+        bincode::serialize_into(file, state)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
+    .map_err(crate::error::TraceError::Io)?;
+    Ok(())
+}
+
+pub fn load_slice_checkpoint<T: serde::de::DeserializeOwned>(
+    file_path: &str,
+    _data: &[u8],
+    fingerprint: &crate::index_manifest::TraceFingerprint,
+    checkpoint_id: &str,
+) -> Option<T> {
+    let path = slice_checkpoint_path(file_path, fingerprint, checkpoint_id)?;
+    let bytes = std::fs::read(path).ok()?;
+    bincode::deserialize(&bytes).ok()
+}
+
+pub fn delete_slice_checkpoint(
+    file_path: &str,
+    fingerprint: &crate::index_manifest::TraceFingerprint,
+    checkpoint_id: &str,
+) {
+    if let Some(path) = slice_checkpoint_path(file_path, fingerprint, checkpoint_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn normalized_cache_key(file_path: &str) -> String {
     std::fs::canonicalize(file_path)
         .map(|path| path.to_string_lossy().into_owned())

@@ -1,11 +1,11 @@
 use std::io::Write;
 
 use super::TraceEngine;
-use crate::api_types::{ExportConfig, SliceOptions, SliceResult};
+use crate::api_types::{ChunkedSliceResult, ExportConfig, SliceOptions, SliceResult};
 use crate::error::{Result, TraceError};
 use crate::flat::line_index::LineIndexView;
 use crate::flat::mem_last_def::MemLastDefView;
-use crate::query::slice::{bfs_slice, bfs_slice_with_options};
+use crate::query::slice::{bfs_advance, bfs_slice, bfs_slice_with_options, BfsState};
 use crate::scanner::{RegLastDef, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
 use crate::session::SliceOrigin;
 use trace_parser::gumtrace as gumtrace_parser;
@@ -282,6 +282,183 @@ impl TraceEngine {
         let stats = Self::slice_stats(&marked);
         let seqs = marked.iter_ones().map(|index| index as u64).collect();
         Ok((stats, seqs))
+    }
+
+    pub fn run_slice_chunked(
+        &self,
+        session_id: &str,
+        from_specs: &[String],
+        options: SliceOptions,
+        max_steps: u64,
+        checkpoint_id: &str,
+    ) -> Result<ChunkedSliceResult> {
+        let _query_lease = self.acquire_query_lease()?;
+        let handle = self.get_handle(session_id)?;
+        let mut checkpoints = handle
+            .slice_checkpoints
+            .lock()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let scan_view = state.scan_view().ok_or(TraceError::IndexNotReady)?;
+        let bounds = handle.segment_range();
+        let fingerprint = crate::index_manifest::TraceFingerprint::from_file(std::path::Path::new(
+            &state.file_path,
+        ))
+        .unwrap_or_else(|_| crate::index_manifest::TraceFingerprint::from_bytes(&state.mmap));
+
+        if !checkpoints.contains_key(checkpoint_id) {
+            if let Some(checkpoint) = crate::cache::load_slice_checkpoint::<BfsState>(
+                &state.file_path,
+                &state.mmap,
+                &fingerprint,
+                checkpoint_id,
+            ) {
+                if checkpoint.schema_version != crate::query::slice::BFS_CHECKPOINT_SCHEMA_VERSION {
+                    return Err(TraceError::CacheError(
+                        "unsupported taint checkpoint schema".to_string(),
+                    ));
+                }
+                checkpoints.insert(checkpoint_id.to_string(), checkpoint);
+            }
+        }
+        if !checkpoints.contains_key(checkpoint_id) {
+            let reg_last_def = state
+                .reg_last_def
+                .as_ref()
+                .ok_or(TraceError::IndexNotReady)?;
+            let mem_last_def = state.mem_last_def_view().ok_or(TraceError::IndexNotReady)?;
+            let lidx_view = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
+            let mut start_indices = Vec::with_capacity(from_specs.len());
+            for spec in from_specs {
+                start_indices.push(
+                    resolve_start_index(
+                        spec,
+                        reg_last_def,
+                        &mem_last_def,
+                        &state.mmap,
+                        &lidx_view,
+                        state.trace_format,
+                    )
+                    .map_err(TraceError::InvalidArgument)?,
+                );
+            }
+            checkpoints.insert(
+                checkpoint_id.to_string(),
+                BfsState::new(
+                    scan_view.line_count,
+                    &start_indices,
+                    options.data_only,
+                    bounds,
+                ),
+            );
+        }
+
+        let checkpoint = checkpoints
+            .get_mut(checkpoint_id)
+            .ok_or_else(|| TraceError::Internal("slice checkpoint disappeared".to_string()))?;
+        if checkpoint.data_only != options.data_only || checkpoint.bounds != bounds {
+            return Err(TraceError::InvalidArgument(
+                "checkpoint options do not match the current slice request".to_string(),
+            ));
+        }
+        let advance = bfs_advance(
+            &scan_view,
+            checkpoint,
+            max_steps.max(1),
+            Some(&handle.build_cancel),
+        )
+        .map_err(|error| {
+            if error.to_string().contains("cancelled") {
+                TraceError::Cancelled
+            } else {
+                TraceError::Internal(error.to_string())
+            }
+        })?;
+        let mut marked = checkpoint.marked.clone();
+        let processed_steps = checkpoint.processed_steps;
+        let pending_nodes = checkpoint.pending_nodes() as u64;
+        let complete = advance.complete;
+        crate::cache::save_slice_checkpoint(
+            &state.file_path,
+            &state.mmap,
+            &fingerprint,
+            checkpoint_id,
+            checkpoint,
+        )?;
+        if complete {
+            checkpoints.remove(checkpoint_id);
+        }
+        drop(checkpoints);
+        drop(state);
+        if complete {
+            crate::cache::delete_slice_checkpoint(&handle.file_path, &fingerprint, checkpoint_id);
+        }
+
+        if let Some(s) = options.start_seq {
+            let end = (s as usize).min(marked.len());
+            marked[..end].fill(false);
+        }
+        if let Some(e) = options.end_seq {
+            let start = ((e as usize) + 1).min(marked.len());
+            marked[start..].fill(false);
+        }
+        if let Some((segment_start, segment_end)) = bounds {
+            let start = (segment_start as usize).min(marked.len());
+            let end = ((segment_end as usize) + 1).min(marked.len());
+            marked[..start].fill(false);
+            marked[end..].fill(false);
+        }
+        let stats = Self::slice_stats(&marked);
+        let origin = SliceOrigin {
+            from_specs: from_specs.to_vec(),
+            data_only: options.data_only,
+            start_seq: options.start_seq.or(handle.seq_start),
+            end_seq: options.end_seq.or(handle.seq_end),
+        };
+        if bounds.is_some() {
+            *handle
+                .local_slice
+                .lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))? = Some((marked, origin));
+        } else {
+            let mut state = handle
+                .state
+                .write()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            state.slice_result = Some(marked);
+            state.slice_origin = Some(origin);
+        }
+        Ok(ChunkedSliceResult {
+            marked_count: stats.marked_count,
+            total_lines: stats.total_lines,
+            percentage: stats.percentage,
+            complete,
+            processed_steps,
+            pending_nodes,
+            checkpoint_id: checkpoint_id.to_string(),
+        })
+    }
+
+    pub fn clear_slice_checkpoint(&self, session_id: &str, checkpoint_id: &str) -> Result<()> {
+        let handle = self.get_handle(session_id)?;
+        handle
+            .slice_checkpoints
+            .lock()
+            .map_err(|e| TraceError::Internal(e.to_string()))?
+            .remove(checkpoint_id);
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let fingerprint = crate::index_manifest::TraceFingerprint::from_file(std::path::Path::new(
+            &state.file_path,
+        ))
+        .unwrap_or_else(|_| crate::index_manifest::TraceFingerprint::from_bytes(&state.mmap));
+        crate::cache::delete_slice_checkpoint(&state.file_path, &fingerprint, checkpoint_id);
+        Ok(())
     }
 
     pub fn clear_slice(&self, session_id: &str) -> Result<()> {

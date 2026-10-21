@@ -350,6 +350,8 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 | data_only | bool | 否（默认 false） | 仅追踪数据依赖，忽略控制流 |
 | addr_range | [string, string] | 否 | 限制分析的地址范围 |
 | ignore_stack_ops | bool | 否（默认 true） | 过滤仅修改栈/帧指针寄存器（sp、x29）的行 |
+| max_steps | u64 | 否 | 单次最多处理的 BFS 节点数；省略时运行至完成 |
+| checkpoint_id | string | 否 | 分块污点的稳定检查点 ID，再次传入即可续跑 |
 
 **from_specs 格式：**
 - `reg:X0@1234` — 追踪第 1234 行的寄存器 X0（寄存器名不区分大小写）
@@ -357,6 +359,15 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 - `reg:X0@last` — 追踪寄存器 X0 最后一次被定义的位置
 
 **返回**：被标记的指令数、总行数、百分比，以及第一页污点结果（内联）。如需更多结果，使用 `get_tainted_lines` 翻页。
+
+使用 `max_steps` 时结果包含 `complete` 和 `checkpoint`。当 `complete=false`，再次调用 `taint_analysis` 并传入相同 `checkpoint_id` 和新一轮 `max_steps` 即可继续。检查点会同时保存在内存和磁盘，重新打开同一 trace 后仍可用；完成后自动删除。
+
+#### clear_taint_checkpoint
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 否 | 会话 ID |
+| checkpoint_id | string | 是 | 分块污点返回的检查点 ID |
 
 #### get_tainted_lines
 

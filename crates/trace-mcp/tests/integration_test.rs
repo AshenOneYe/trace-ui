@@ -230,6 +230,110 @@ fn test_virtual_segment_session_isolates_ranges_and_slice_state() {
 }
 
 #[test]
+fn test_chunked_slice_resumes_until_complete() {
+    let (engine, sid) = setup_session(&get_trace_path());
+    let specs = vec!["reg:X0@last".to_string()];
+    let options = trace_core::SliceOptions {
+        start_seq: None,
+        end_seq: None,
+        data_only: true,
+    };
+    let baseline = engine
+        .run_slice_isolated(
+            &sid,
+            &specs,
+            trace_core::SliceOptions {
+                start_seq: None,
+                end_seq: None,
+                data_only: true,
+            },
+        )
+        .expect("baseline slice");
+
+    let mut chunks = 0;
+    let final_result = loop {
+        chunks += 1;
+        assert!(chunks < 100, "chunked slice did not converge");
+        let result = engine
+            .run_slice_chunked(&sid, &specs, options.clone(), 1000, "resume-test")
+            .expect("chunk");
+        assert_eq!(result.checkpoint_id, "resume-test");
+        if result.complete {
+            break result;
+        }
+        assert!(engine.get_tainted_seqs(&sid).is_ok());
+    };
+    assert_eq!(final_result.marked_count, baseline.0.marked_count);
+    assert_eq!(
+        engine.get_tainted_seqs(&sid).unwrap(),
+        baseline.1,
+        "chunked BFS must match the single-pass traversal"
+    );
+    engine.close_session(&sid).unwrap();
+}
+
+#[test]
+fn test_chunked_slice_checkpoint_survives_engine_recreation() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "trace-ui-slice-checkpoint-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let trace_path = temp_dir.join("trace.log");
+    std::fs::copy(get_trace_path(), &trace_path).unwrap();
+    let trace_str = trace_path.to_str().unwrap();
+    let specs = vec!["reg:X0@last".to_string()];
+    let options = trace_core::SliceOptions {
+        start_seq: None,
+        end_seq: None,
+        data_only: true,
+    };
+
+    let first_engine = Arc::new(TraceEngine::new());
+    let first = first_engine.create_session(trace_str).unwrap();
+    first_engine
+        .build_index(
+            &first.session_id,
+            trace_core::BuildOptions {
+                force_rebuild: true,
+                skip_strings: true,
+            },
+            None,
+        )
+        .unwrap();
+    let partial = first_engine
+        .run_slice_chunked(&first.session_id, &specs, options.clone(), 1, "restart")
+        .unwrap();
+    assert!(!partial.complete);
+    first_engine.close_session(&first.session_id).unwrap();
+    drop(first_engine);
+
+    let second_engine = Arc::new(TraceEngine::new());
+    let second = second_engine.create_session(trace_str).unwrap();
+    second_engine
+        .build_index(
+            &second.session_id,
+            trace_core::BuildOptions {
+                force_rebuild: false,
+                skip_strings: true,
+            },
+            None,
+        )
+        .unwrap();
+    let completed = second_engine
+        .run_slice_chunked(&second.session_id, &specs, options, 10_000, "restart")
+        .unwrap();
+    assert!(completed.complete);
+    second_engine.close_session(&second.session_id).unwrap();
+    second_engine.delete_file_cache(trace_str);
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn test_phase2_index_completes_functions_and_memory_but_not_dependencies() {
     let engine = Arc::new(TraceEngine::new());
     let temp_dir = std::env::temp_dir().join(format!(

@@ -81,7 +81,7 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 | 会话 | `open_trace`、`open_trace_segment` |
 | 浏览 | `get_trace_lines`、`get_memory`、`mem_summary`、`watch_slots`、`get_trace_segments` |
 | 搜索 | `search_instructions` |
-| 污点分析 | `taint_analysis`、`get_tainted_lines` |
+| 污点分析 | `taint_analysis`、`get_tainted_lines`、`clear_taint_checkpoint` |
 | 结构 | `get_call_tree`、`analyze_function`、`get_strings` |
 | 密码识别 | `analyze_crypto` |
 | 索引状态 | `get_index_status` |

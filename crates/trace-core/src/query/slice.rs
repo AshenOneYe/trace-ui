@@ -1,14 +1,18 @@
 use std::collections::VecDeque;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use bitvec::prelude::*;
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::flat::bitvec::BitView;
 use crate::flat::pair_split::PairSplitView;
 use crate::flat::scan_view::ScanView;
 use crate::scanner::{CONTROL_DEP_BIT, LINE_MASK, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
+
+pub const BFS_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
 /// BFS backward slice: given starting line indices, mark all transitively
 /// reachable lines in the dependency graph.
@@ -26,26 +30,94 @@ pub fn bfs_slice(view: &ScanView, start_indices: &[u64]) -> BitVec {
 /// BFS backward slice with options.
 /// When `data_only` is true, control dependency edges (tagged with CONTROL_DEP_BIT) are skipped.
 pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u64], data_only: bool) -> BitVec {
-    let n = view.line_count as usize;
-    let mut marked = bitvec![0; n];
-    let mut queue: VecDeque<u64> = VecDeque::new();
-    // For pair lines: bit 0 = half1 visited, bit 1 = half2 visited, bit 2 = shared visited
-    let mut pair_visited: FxHashMap<u64, u8> = FxHashMap::default();
+    let mut state = BfsState::new(view.line_count, start_indices, data_only, None);
+    let _ =
+        bfs_advance(view, &mut state, u64::MAX, None).expect("unbounded BFS cannot be cancelled");
+    state.marked
+}
 
-    // Seed the BFS (start_indices may carry tag bits)
-    for &raw in start_indices {
-        enqueue_dep(
-            raw,
-            n,
-            &mut queue,
-            &mut marked,
-            &mut pair_visited,
-            &view.pair_split,
-        );
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BfsState {
+    pub schema_version: u32,
+    pub marked: BitVec,
+    pub queue: VecDeque<u64>,
+    pair_visited: FxHashMap<u64, u8>,
+    pub processed_steps: u64,
+    pub data_only: bool,
+    pub bounds: Option<(u64, u64)>,
+}
+
+impl BfsState {
+    pub fn new(
+        line_count: u64,
+        start_indices: &[u64],
+        data_only: bool,
+        bounds: Option<(u64, u64)>,
+    ) -> Self {
+        let mut state = Self {
+            schema_version: BFS_CHECKPOINT_SCHEMA_VERSION,
+            marked: bitvec![0; line_count as usize],
+            queue: VecDeque::new(),
+            pair_visited: FxHashMap::default(),
+            processed_steps: 0,
+            data_only,
+            bounds,
+        };
+        let n = line_count as usize;
+        for &raw in start_indices {
+            let line = raw & LINE_MASK;
+            if (line as usize) >= n || bounds.is_some_and(|(start, end)| line < start || line > end)
+            {
+                continue;
+            }
+            if raw & (PAIR_HALF2_BIT | PAIR_SHARED_BIT) != 0 {
+                let visit_bit = if raw & PAIR_SHARED_BIT != 0 { 4u8 } else { 2u8 };
+                let visited = state.pair_visited.entry(line).or_insert(0);
+                if *visited & visit_bit != 0 {
+                    continue;
+                }
+                *visited |= visit_bit;
+            } else if state.marked[line as usize] {
+                continue;
+            }
+            state.marked.set(line as usize, true);
+            state.queue.push_back(raw);
+        }
+        state
     }
 
-    // BFS: follow dependency edges backward
-    while let Some(raw) = queue.pop_front() {
+    pub fn is_complete(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    pub fn pending_nodes(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+pub struct BfsAdvance {
+    pub processed_steps: u64,
+    pub complete: bool,
+}
+
+pub fn bfs_advance(
+    view: &ScanView,
+    state: &mut BfsState,
+    max_steps: u64,
+    cancel: Option<&AtomicBool>,
+) -> anyhow::Result<BfsAdvance> {
+    let start_steps = state.processed_steps;
+    let n = view.line_count as usize;
+    while state.processed_steps.saturating_sub(start_steps) < max_steps {
+        if state.processed_steps % 4096 == 0
+            && cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            anyhow::bail!("operation cancelled");
+        }
+        let Some(raw) = state.queue.pop_front() else {
+            break;
+        };
+        state.processed_steps = state.processed_steps.saturating_add(1);
         let line = raw & LINE_MASK;
 
         if let Some(split) = view.pair_split.get(&line) {
@@ -53,31 +125,33 @@ pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u64], data_only:
             if (raw & PAIR_SHARED_BIT) != 0 {
                 // Shared arrival (via writeback base): follow only shared deps
                 for &dep in split.shared {
-                    if data_only && (dep & CONTROL_DEP_BIT) != 0 {
+                    if state.data_only && (dep & CONTROL_DEP_BIT) != 0 {
                         continue;
                     }
                     enqueue_dep(
                         dep,
                         n,
-                        &mut queue,
-                        &mut marked,
-                        &mut pair_visited,
+                        &mut state.queue,
+                        &mut state.marked,
+                        &mut state.pair_visited,
                         &view.pair_split,
+                        state.bounds,
                     );
                 }
             } else {
                 // Data arrival: follow shared + relevant half deps
                 for &dep in split.shared {
-                    if data_only && (dep & CONTROL_DEP_BIT) != 0 {
+                    if state.data_only && (dep & CONTROL_DEP_BIT) != 0 {
                         continue;
                     }
                     enqueue_dep(
                         dep,
                         n,
-                        &mut queue,
-                        &mut marked,
-                        &mut pair_visited,
+                        &mut state.queue,
+                        &mut state.marked,
+                        &mut state.pair_visited,
                         &view.pair_split,
+                        state.bounds,
                     );
                 }
                 let half_deps = if (raw & PAIR_HALF2_BIT) != 0 {
@@ -89,10 +163,11 @@ pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u64], data_only:
                     enqueue_dep(
                         dep,
                         n,
-                        &mut queue,
-                        &mut marked,
-                        &mut pair_visited,
+                        &mut state.queue,
+                        &mut state.marked,
+                        &mut state.pair_visited,
                         &view.pair_split,
+                        state.bounds,
                     );
                 }
             }
@@ -104,22 +179,25 @@ pub fn bfs_slice_with_options(view: &ScanView, start_indices: &[u64], data_only:
                 .iter()
                 .chain(view.deps.patch_row(line).iter())
             {
-                if data_only && (dep & CONTROL_DEP_BIT) != 0 {
+                if state.data_only && (dep & CONTROL_DEP_BIT) != 0 {
                     continue;
                 }
                 enqueue_dep(
                     dep,
                     n,
-                    &mut queue,
-                    &mut marked,
-                    &mut pair_visited,
+                    &mut state.queue,
+                    &mut state.marked,
+                    &mut state.pair_visited,
                     &view.pair_split,
+                    state.bounds,
                 );
             }
         }
     }
-
-    marked
+    Ok(BfsAdvance {
+        processed_steps: state.processed_steps.saturating_sub(start_steps),
+        complete: state.queue.is_empty(),
+    })
 }
 
 /// Try to enqueue a (potentially tagged) dependency into the BFS queue.
@@ -133,9 +211,13 @@ fn enqueue_dep(
     marked: &mut BitVec,
     pair_visited: &mut FxHashMap<u64, u8>,
     pair_split: &PairSplitView,
+    bounds: Option<(u64, u64)>,
 ) {
     let line = raw & LINE_MASK;
     if (line as usize) >= n {
+        return;
+    }
+    if bounds.is_some_and(|(start, end)| line < start || line > end) {
         return;
     }
 
@@ -265,6 +347,29 @@ mod tests {
         assert!(marked[0], "mov x8 should be in slice");
         assert!(marked[1], "mov x9 should be in slice");
         assert!(marked[2], "add x0 should be in slice");
+    }
+
+    #[test]
+    fn test_chunked_bfs_matches_single_pass() {
+        let trace = [
+            r#"[00:00:00 001][lib.so 0x100] [d2800108] 0x40000100: "mov x8, #5" => x8=0x5"#,
+            r#"[00:00:00 001][lib.so 0x104] [d2800149] 0x40000104: "mov x9, #10" => x9=0xa"#,
+            r#"[00:00:00 001][lib.so 0x108] [8b090108] 0x40000108: "add x0, x8, x9" x8=0x5 x9=0xa => x0=0xf"#,
+        ]
+        .join("\n");
+        let scan = scanner::scan_from_string(&trace, false).unwrap();
+        let (deps, pair_split, _) = state_to_scan_view(&scan);
+        let view = ScanView {
+            deps: deps.view(),
+            pair_split: pair_split.view(),
+            line_count: scan.line_count,
+        };
+        let starts = vec![*scan.reg_last_def.get(&RegId::X0).unwrap()];
+        let expected = bfs_slice(&view, &starts);
+        let mut chunked = BfsState::new(view.line_count, &starts, false, None);
+        while !bfs_advance(&view, &mut chunked, 1, None).unwrap().complete {}
+        assert_eq!(chunked.marked, expected);
+        assert!(chunked.processed_steps >= 3);
     }
 
     // =========================================================================

@@ -297,6 +297,23 @@ pub struct TaintAnalysisRequest {
         description = "Extra noise registers to filter, comma-separated, e.g. 'x21,x22,x26'. Lines whose ONLY register changes are these (plus sp/x29 if ignore_stack_ops) are dropped. Use this to cut VM dispatcher noise in taint results"
     )]
     pub ignore_regs: Option<String>,
+    #[schemars(
+        description = "Maximum BFS nodes to process in this call. When omitted, the analysis runs to completion. \
+        A partial run returns checkpoint_id for the next chunk."
+    )]
+    pub max_steps: Option<u64>,
+    #[schemars(
+        description = "Optional stable checkpoint ID used to resume a chunked taint analysis"
+    )]
+    pub checkpoint_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClearSliceCheckpointRequest {
+    #[schemars(description = "Session ID (optional if only one root session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Checkpoint ID returned by a chunked taint_analysis call")]
+    pub checkpoint_id: String,
 }
 
 fn default_inline_lines() -> u32 {

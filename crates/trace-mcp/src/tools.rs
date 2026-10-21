@@ -2550,9 +2550,44 @@ impl TraceToolHandler {
                 end_seq: req.end_seq,
                 data_only: req.data_only,
             };
-            let result = engine
-                .run_slice(&sid, &req.from_specs, options)
-                .map_err(|e| e.to_string())?;
+            let checkpoint_id = req
+                .checkpoint_id
+                .clone()
+                .unwrap_or_else(|| format!("taint-{sid}"));
+            let (marked_count, total_lines, percentage, complete, checkpoint) =
+                if let Some(max_steps) = req.max_steps {
+                    let result = engine
+                        .run_slice_chunked(
+                            &sid,
+                            &req.from_specs,
+                            options,
+                            max_steps,
+                            &checkpoint_id,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    (
+                        result.marked_count,
+                        result.total_lines,
+                        result.percentage,
+                        result.complete,
+                        Some(serde_json::json!({
+                            "checkpoint_id": result.checkpoint_id,
+                            "processed_steps": result.processed_steps,
+                            "pending_nodes": result.pending_nodes,
+                        })),
+                    )
+                } else {
+                    let result = engine
+                        .run_slice(&sid, &req.from_specs, options)
+                        .map_err(|e| e.to_string())?;
+                    (
+                        result.marked_count,
+                        result.total_lines,
+                        result.percentage,
+                        true,
+                        None,
+                    )
+                };
 
             // 2. 仅返回统计信息
             let include = req.include_lines.min(200);
@@ -2583,9 +2618,11 @@ impl TraceToolHandler {
                         (all_seqs.len() as u64, 0)
                     };
                 return Ok(json(&serde_json::json!({
-                    "marked_count": result.marked_count,
-                    "total_lines": result.total_lines,
-                    "percentage": format!("{:.2}%", result.percentage),
+                    "marked_count": marked_count,
+                    "total_lines": total_lines,
+                    "percentage": format!("{:.2}%", percentage),
+                    "complete": complete,
+                    "checkpoint": checkpoint,
                     "lines": [],
                     "total_after_filter": total_after_filter,
                     "stack_ops_filtered": stack_ops_filtered,
@@ -2600,9 +2637,11 @@ impl TraceToolHandler {
 
             if all_seqs.is_empty() {
                 return Ok(json(&serde_json::json!({
-                    "marked_count": result.marked_count,
-                    "total_lines": result.total_lines,
-                    "percentage": format!("{:.2}%", result.percentage),
+                    "marked_count": marked_count,
+                    "total_lines": total_lines,
+                    "percentage": format!("{:.2}%", percentage),
+                    "complete": complete,
+                    "checkpoint": checkpoint,
                     "lines": [],
                     "total_after_filter": 0,
                     "stack_ops_filtered": 0,
@@ -2650,15 +2689,19 @@ impl TraceToolHandler {
             let lines: Vec<serde_json::Value> = page.iter().map(|l| compact_line(l)).collect();
 
             Ok(json(&serde_json::json!({
-                "marked_count": result.marked_count,
-                "total_lines": result.total_lines,
-                "percentage": format!("{:.2}%", result.percentage),
+                "marked_count": marked_count,
+                "total_lines": total_lines,
+                "percentage": format!("{:.2}%", percentage),
+                "complete": complete,
+                "checkpoint": checkpoint,
                 "lines": lines,
                 "total_after_filter": total_after_filter,
                 "stack_ops_filtered": stack_filtered,
                 "count": count,
                 "has_more": count < total_after_filter,
-                "hint": if count < total_after_filter {
+                "hint": if !complete {
+                    "Partial BFS checkpoint saved. Call taint_analysis again with the same checkpoint_id and max_steps to continue."
+                } else if count < total_after_filter {
                     "Use get_tainted_lines with offset to see more results."
                 } else {
                     "All tainted lines included."
@@ -2666,6 +2709,25 @@ impl TraceToolHandler {
             })))
         })
         .await
+    }
+
+    #[tool(
+        name = "clear_taint_checkpoint",
+        description = "Delete an in-memory and on-disk chunked taint checkpoint."
+    )]
+    fn clear_taint_checkpoint(
+        &self,
+        Parameters(req): Parameters<ClearSliceCheckpointRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        self.engine
+            .clear_slice_checkpoint(&sid, &req.checkpoint_id)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({
+            "session_id": sid,
+            "checkpoint_id": req.checkpoint_id,
+            "cleared": true,
+        })))
     }
 
     #[tool(

@@ -133,6 +133,7 @@ pub struct SessionHandle {
     /// 缓存最近一次搜索的全量匹配序列号及其 generation，供分页拉取
     pub(crate) search_cache: Mutex<(u64, Vec<u64>)>,
     pub(crate) local_slice: Mutex<Option<(bitvec::prelude::BitVec, SliceOrigin)>>,
+    pub(crate) slice_checkpoints: Mutex<HashMap<String, crate::query::slice::BfsState>>,
     pub(crate) state: std::sync::Arc<RwLock<SessionState>>,
     pub(crate) parent_session_id: Option<String>,
     pub(crate) segment_index: Option<u32>,
