@@ -255,7 +255,7 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | session_id | string | 否 | 会话 ID |
-| segment_lines | u64 | 否 | 每段行数，默认 262144 |
+| segment_lines | u64 | 否 | 每段行数，默认 1048576，便于直接作为懒字符串窗口 |
 
 每段返回 `start_seq/end_seq/start_byte/end_byte`。把 `start_seq-end_seq` 传给 `search_instructions`、`get_strings`、`get_call_tree` 或 `analyze_function` 的 `seq_range` 即可逐段执行并按 seq 合并。
 
@@ -496,6 +496,8 @@ lite session 可以只对目标窗口构建 phase2：
 ```
 
 `start_line` 为 inclusive，`end_line` 为 exclusive。任务按窗口字节范围估算内存，不按整个 trace 文件估算；完成后结果的 `scope` 为 `window`，`session_id` 指向独立 window session。该 session 只包含窗口内的函数/内存/寄存器索引，不会覆盖父 session 的全量 phase2。
+
+`string_index` job 也接受相同的 `start_line/end_line`。它先建立窗口 phase2，再只在窗口内执行字符串提取，返回 `scope="window_strings"` 的 session；窗口字符串索引不会覆盖父 session 的 `.strings.cache`。
 
 ## 限制与约束
 

@@ -1231,7 +1231,7 @@ impl super::TraceEngine {
         start_seq: u64,
         end_seq: u64,
     ) -> Result<Vec<CallTreeNodeDto>> {
-        const MAX_WINDOW_LINES: u64 = 1_048_576;
+        const MAX_WINDOW_LINES: u64 = 262_144;
         let handle = self.get_handle(session_id)?;
         let (start_seq, end_seq) = handle
             .segment_range()
@@ -1438,7 +1438,7 @@ impl super::TraceEngine {
         session_id: &str,
         options: StringQueryOptions,
     ) -> Result<StringsResult> {
-        const MAX_WINDOW_LINES: u64 = 262_144;
+        const MAX_WINDOW_LINES: u64 = 1_048_576;
         let (Some(seq_start), Some(seq_end)) = (options.seq_start, options.seq_end) else {
             return Err(TraceError::InvalidArgument(
                 "this session has no global string index; pass seq_range to get_strings so the \
@@ -1708,7 +1708,7 @@ impl super::TraceEngine {
             let sorted_records = result_sorter.finish(&handle.scan_strings_cancel)?;
 
             // 4. Stream records/content into a validated mmap archive.
-            let mapped = {
+            let string_store = {
                 let state = handle
                     .state
                     .read()
@@ -1736,7 +1736,19 @@ impl super::TraceEngine {
                     writer.push(&record, xref_count).map_err(TraceError::Io)?;
                 }
                 let parts = writer.finish().map_err(TraceError::Io)?;
-                crate::cache::save_string_archive_from_parts(&state.file_path, &state.mmap, &parts)?
+                if handle.segment_range().is_some() || parts.record_count == 0 {
+                    crate::flat::archives::CachedStore::Owned(
+                        crate::flat::strings::StringIndexArchive::from_parts(&parts)
+                            .map_err(TraceError::Io)?,
+                    )
+                } else {
+                    let mapped = crate::cache::save_string_archive_from_parts(
+                        &state.file_path,
+                        &state.mmap,
+                        &parts,
+                    )?;
+                    crate::flat::archives::CachedStore::Mapped(mapped)
+                }
             };
 
             // 5. Publish the mmap-backed string index.
@@ -1745,10 +1757,10 @@ impl super::TraceEngine {
                     .state
                     .write()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
-                state.string_index = Some(crate::flat::archives::CachedStore::Mapped(mapped));
+                state.string_index = Some(string_store);
             }
 
-            {
+            if handle.segment_range().is_none() {
                 let state = handle
                     .state
                     .read()

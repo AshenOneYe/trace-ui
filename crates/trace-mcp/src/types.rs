@@ -201,7 +201,7 @@ pub struct GetCallTreeRequest {
 pub struct GetTraceSegmentsRequest {
     #[schemars(description = "Session ID (optional if only one session is open)")]
     pub session_id: Option<String>,
-    #[schemars(description = "Virtual segment size in trace lines (default: 262144)")]
+    #[schemars(description = "Virtual segment size in trace lines (default: 1048576)")]
     #[serde(default = "default_segment_lines")]
     pub segment_lines: u64,
 }
@@ -221,7 +221,7 @@ pub struct OpenTraceSegmentRequest {
 }
 
 fn default_segment_lines() -> u64 {
-    262_144
+    1_048_576
 }
 
 fn default_depth() -> u32 {
@@ -394,11 +394,11 @@ pub struct StartAnalysisJobRequest {
     #[serde(default)]
     pub skip_strings: bool,
     #[schemars(
-        description = "Inclusive start line for VM analysis or a phase2_index window (default: 0)"
+        description = "Inclusive start line for VM analysis or a phase2_index/string_index window (default: 0)"
     )]
     pub start_line: Option<u64>,
     #[schemars(
-        description = "Exclusive end line for VM analysis or a phase2_index window (default: end of trace)"
+        description = "Exclusive end line for VM analysis or a phase2_index/string_index window (default: end of trace)"
     )]
     pub end_line: Option<u64>,
     #[schemars(description = "Taint sources for kind='taint', e.g. ['reg:X0@1234']")]

@@ -156,6 +156,20 @@ fn test_base_index_builds_window_local_strings_tree_and_segments() {
         .expect("lazy strings");
     assert!(strings.lazy_window);
     assert_eq!(strings.scope, "lazy_seq_window");
+    let large_window = engine
+        .get_strings(
+            &sid,
+            trace_core::StringQueryOptions {
+                min_len: 1,
+                offset: 0,
+                limit: 10,
+                search: None,
+                seq_start: Some(0),
+                seq_end: Some(524_287),
+            },
+        )
+        .expect("524288-line lazy window");
+    assert!(large_window.lazy_window);
 
     let tree = engine
         .get_call_tree_window(&sid, 0, build.total_lines.saturating_sub(1))

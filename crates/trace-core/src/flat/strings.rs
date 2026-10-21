@@ -23,6 +23,33 @@ pub struct StringIndexArchive {
     pub content: Vec<u8>,
 }
 
+impl StringIndexArchive {
+    pub fn from_parts(parts: &StringIndexArchiveParts) -> std::io::Result<Self> {
+        let record_bytes = std::fs::read(&parts.record_path)?;
+        let content = std::fs::read(&parts.content_path)?;
+        if record_bytes.len() % 40 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "string archive record stream is not 40-byte aligned",
+            ));
+        }
+        let records = record_bytes
+            .chunks_exact(40)
+            .map(|bytes| FlatStringRecord {
+                seq: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                addr: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                content_offset: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+                byte_len: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+                xref_count: u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+                encoding: bytes[32],
+                rw: bytes[33],
+                reserved: [0; 6],
+            })
+            .collect();
+        Ok(Self { records, content })
+    }
+}
+
 pub struct StringIndexArchiveWriter {
     temp_dir: PathBuf,
     record_path: PathBuf,

@@ -430,7 +430,9 @@ fn execute_job(
         }
     };
     let mut phase2_window = None;
-    if kind == JobKind::Phase2Index && (input.start_line.is_some() || input.end_line.is_some()) {
+    if matches!(kind, JobKind::Phase2Index | JobKind::StringIndex)
+        && (input.start_line.is_some() || input.end_line.is_some())
+    {
         engine
             .build_base_index(&session_id, created_session, None)
             .map_err(|e| e.to_string())?;
@@ -480,23 +482,31 @@ fn execute_job(
                 .map_err(|e| e.to_string())?;
         }
         JobKind::StringIndex => {
-            let phase2_ready = engine
-                .get_index_status(&session_id)
-                .map(|status| {
-                    status
-                        .stages
-                        .iter()
-                        .any(|stage| stage.stage == "registers_memory" && stage.state == "complete")
-                })
-                .unwrap_or(false);
-            if !phase2_ready {
+            if phase2_window.is_some() {
                 engine
-                    .build_phase2_index(&session_id, false, None)
+                    .build_phase2_window_index(&session_id, true, None)
+                    .map_err(|e| e.to_string())?;
+                engine
+                    .scan_strings(&session_id)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let phase2_ready = engine
+                    .get_index_status(&session_id)
+                    .map(|status| {
+                        status.stages.iter().any(|stage| {
+                            stage.stage == "registers_memory" && stage.state == "complete"
+                        })
+                    })
+                    .unwrap_or(false);
+                if !phase2_ready {
+                    engine
+                        .build_phase2_index(&session_id, false, None)
+                        .map_err(|e| e.to_string())?;
+                }
+                engine
+                    .scan_strings(&session_id)
                     .map_err(|e| e.to_string())?;
             }
-            engine
-                .scan_strings(&session_id)
-                .map_err(|e| e.to_string())?;
         }
         JobKind::BuildIndex
         | JobKind::VmAnalysis
@@ -583,7 +593,9 @@ fn execute_job(
                 "file_size": info.file_size,
                 "total_lines": info.total_lines,
                 "trace_format": info.trace_format.map(|f| format!("{f:?}")),
-                "scope": "strings",
+                "start_line": phase2_window.map(|(start, _)| start),
+                "end_line": phase2_window.map(|(_, end)| end.saturating_add(1)),
+                "scope": if phase2_window.is_some() { "window_strings" } else { "strings" },
             }))
         }
         JobKind::BuildIndex => {
@@ -1002,6 +1014,52 @@ mod tests {
         assert_eq!(completed["result"]["end_line"], 30);
         let session_id = completed["result"]["session_id"].as_str().unwrap();
         assert!(manager.engine.get_registers_at(session_id, 15).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn string_job_honors_line_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "trace-ui-jobs-string-window-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = JobManager::with_path_and_results(
+            Arc::new(TraceEngine::new()),
+            dir.join("jobs.json"),
+            Arc::new(ResultManager::with_dir(dir.join("results"))),
+        );
+        let trace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example-trace-gumtrace.txt");
+        let job = manager
+            .start(
+                JobKind::StringIndex,
+                AnalysisJobInput {
+                    file_path: trace.to_string_lossy().to_string(),
+                    session_id: None,
+                    force_rebuild: true,
+                    skip_strings: false,
+                    start_line: Some(10),
+                    end_line: Some(30),
+                    ranges: Vec::new(),
+                    vm_config: None,
+                    from_specs: Vec::new(),
+                    data_only: false,
+                    include_lines: None,
+                    addr_range: None,
+                    ignore_regs: None,
+                    context_lines: None,
+                    search_query: None,
+                    use_regex: None,
+                    case_sensitive: None,
+                    max_results: None,
+                },
+            )
+            .unwrap();
+        let completed = wait_for_completion(&manager, &job.id).await;
+        assert_eq!(completed["result"]["scope"], "window_strings");
+        assert_eq!(completed["result"]["start_line"], 10);
+        assert_eq!(completed["result"]["end_line"], 30);
         let _ = std::fs::remove_dir_all(dir);
     }
 
