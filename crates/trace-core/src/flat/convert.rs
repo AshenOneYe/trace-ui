@@ -13,6 +13,13 @@ use super::mem_last_def::FlatMemLastDef;
 use super::pair_split::FlatPairSplit;
 use super::reg_checkpoints::{FlatRegCheckpoints, REG_COUNT};
 
+fn append_compact_dep(output: &mut Vec<u8>, compact: u32) {
+    let line = (compact & super::deps::COMPACT_LOCAL_LINE_MASK as u32) as u64;
+    let flags = (compact >> 29) & 0b111;
+    super::varint::encode_u64(line, output);
+    output.push(flags as u8);
+}
+
 /// Convert a `MemAccessIndex` (HashMap-backed) to `FlatMemAccess` (sorted CSR format).
 pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
     // Collect all (addr, record) pairs from iter_all, group by addr
@@ -91,8 +98,7 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
         DepsStorage::Single(cd) => {
             // Single chunk: trivial — chunk starts at line 0, offsets_start=0, data_start=0
             // CompactDeps has N offsets for N rows; DepsView needs N+1 (CSR with sentinel).
-            let mut all_offsets = cd.offsets_slice().to_vec();
-            let all_data: Vec<u32> = cd
+            let compact = cd
                 .data_slice()
                 .iter()
                 .map(|&dep| {
@@ -102,9 +108,22 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
                         )
                     })
                 })
-                .collect::<Result<_, _>>()?;
-            // Add sentinel pointing past the last element
-            all_offsets.push(all_data.len() as u64);
+                .collect::<Result<Vec<u32>, _>>()?;
+            let mut all_data = Vec::new();
+            let mut all_offsets = Vec::with_capacity(cd.offsets_slice().len() + 1);
+            all_offsets.push(0u64);
+            for row in 0..cd.offsets_slice().len() {
+                let start = cd.offsets_slice()[row] as usize;
+                let end = cd
+                    .offsets_slice()
+                    .get(row + 1)
+                    .copied()
+                    .unwrap_or(compact.len() as u64) as usize;
+                for &dep in &compact[start..end] {
+                    append_compact_dep(&mut all_data, dep);
+                }
+                all_offsets.push(all_data.len() as u64);
+            }
             Ok(FlatDeps {
                 chunk_start_lines: vec![0u64],
                 chunk_offsets_start: vec![0u64],
@@ -130,18 +149,30 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
             for (chunk_id, chunk) in chunks.iter().enumerate() {
                 chunk_offsets_start.push(all_offsets.len() as u64);
                 chunk_data_start.push(all_data.len() as u64);
-                all_offsets.extend_from_slice(chunk.offsets_slice());
-                // Add sentinel pointing past the last element (relative to chunk data start)
-                all_offsets.push(chunk.data_slice().len() as u64);
                 let chunk_start = chunk_start_lines[chunk_id];
-                for &dep in chunk.data_slice() {
-                    all_data.push(
+                let compact = chunk
+                    .data_slice()
+                    .iter()
+                    .map(|&dep| {
                         super::deps::encode_compact_dep(dep, chunk_start).ok_or_else(|| {
                             crate::error::TraceError::CacheError(format!(
                                 "chunk {chunk_id} contains a dependency outside the compact local range"
                             ))
-                        })?,
-                    );
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                all_offsets.push(0u64);
+                for row in 0..chunk.offsets_slice().len() {
+                    let start = chunk.offsets_slice()[row] as usize;
+                    let end = chunk
+                        .offsets_slice()
+                        .get(row + 1)
+                        .copied()
+                        .unwrap_or(compact.len() as u64) as usize;
+                    for &dep in &compact[start..end] {
+                        append_compact_dep(&mut all_data, dep);
+                    }
+                    all_offsets.push((all_data.len() - chunk_data_start[chunk_id] as usize) as u64);
                 }
             }
 

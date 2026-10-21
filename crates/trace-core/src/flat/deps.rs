@@ -48,7 +48,7 @@ pub struct FlatDeps {
     pub chunk_offsets_start: Vec<u64>, // where chunk i's offsets begin in all_offsets
     pub chunk_data_start: Vec<u64>,    // where chunk i's data begins in all_data
     pub all_offsets: Vec<u64>,
-    pub all_data: Vec<u32>,
+    pub all_data: Vec<u8>,
     pub patch_lines: Vec<u64>,   // sorted line numbers with patches
     pub patch_offsets: Vec<u64>, // CSR into patch_data
     pub patch_data: Vec<u64>,
@@ -74,7 +74,7 @@ pub struct DepsView<'a> {
     chunk_offsets_start: &'a [u64],
     chunk_data_start: &'a [u64],
     all_offsets: &'a [u64],
-    all_data: &'a [u32],
+    all_data: &'a [u8],
     patch_lines: &'a [u64],
     patch_offsets: &'a [u64],
     patch_data: &'a [u64],
@@ -86,7 +86,7 @@ impl<'a> DepsView<'a> {
         chunk_offsets_start: &'a [u64],
         chunk_data_start: &'a [u64],
         all_offsets: &'a [u64],
-        all_data: &'a [u32],
+        all_data: &'a [u8],
         patch_lines: &'a [u64],
         patch_offsets: &'a [u64],
         patch_data: &'a [u64],
@@ -116,10 +116,23 @@ impl<'a> DepsView<'a> {
         let start = self.all_offsets[offsets_base + local] as usize + data_base;
         let end = self.all_offsets[offsets_base + local + 1] as usize + data_base;
         let chunk_start = self.chunk_start_lines[chunk_idx];
-        self.all_data[start..end]
-            .iter()
-            .map(|&dep| decode_compact_dep(dep, chunk_start))
-            .collect()
+        let mut cursor = start;
+        let mut result = SmallVec::new();
+        while cursor < end {
+            let Some(line) = super::varint::decode_u64(&self.all_data, &mut cursor) else {
+                break;
+            };
+            let Some(&flags) = self.all_data.get(cursor) else {
+                break;
+            };
+            cursor += 1;
+            if line > COMPACT_LOCAL_LINE_MASK || flags > 0b111 {
+                break;
+            }
+            let compact = (line as u32) | ((flags as u32) << 29);
+            result.push(decode_compact_dep(compact, chunk_start));
+        }
+        result
     }
 
     /// Return patch data for a given global line number (empty slice if no patch).
@@ -140,17 +153,31 @@ impl<'a> DepsView<'a> {
 mod tests {
     use super::*;
 
+    fn encode_rows(rows: &[&[u64]]) -> (Vec<u64>, Vec<u8>) {
+        let mut offsets = vec![0u64];
+        let mut data = Vec::new();
+        for row in rows {
+            for &dep in *row {
+                super::super::varint::encode_u64(dep, &mut data);
+                data.push(0);
+            }
+            offsets.push(data.len() as u64);
+        }
+        (offsets, data)
+    }
+
     /// Build a single-chunk FlatDeps covering lines [0, 1, 2].
     /// Line 0 → [10, 20], Line 1 → [30], Line 2 → []
     fn single_chunk() -> FlatDeps {
         // offsets: [0, 2, 3, 3]  (CSR, 4 entries for 3 lines)
         // data:    [10, 20, 30]
+        let (all_offsets, all_data) = encode_rows(&[&[10, 20], &[30], &[]]);
         FlatDeps {
             chunk_start_lines: vec![0],
             chunk_offsets_start: vec![0],
             chunk_data_start: vec![0],
-            all_offsets: vec![0, 2, 3, 3],
-            all_data: vec![10, 20, 30],
+            all_offsets,
+            all_data,
             patch_lines: vec![],
             patch_offsets: vec![],
             patch_data: vec![],
@@ -194,12 +221,19 @@ mod tests {
         //   patch_lines   = [1, 5]
         //   patch_offsets = [0, 1, 3]
         //   patch_data    = [100, 200, 201]
+        let (offsets0, data0) = encode_rows(&[&[1, 2, 3], &[4]]);
+        let (offsets1, data1) = encode_rows(&[&[2, 3], &[4]]);
+        let mut all_offsets = offsets0;
+        all_offsets.extend(offsets1);
+        let mut all_data = data0;
+        let second_data_start = all_data.len() as u64;
+        all_data.extend(data1);
         FlatDeps {
             chunk_start_lines: vec![0, 5],
             chunk_offsets_start: vec![0, 3],
-            chunk_data_start: vec![0, 4],
-            all_offsets: vec![0, 3, 4, 0, 2, 3],
-            all_data: vec![1, 2, 3, 4, 2, 3, 4],
+            chunk_data_start: vec![0, second_data_start],
+            all_offsets,
+            all_data,
             patch_lines: vec![1, 5],
             patch_offsets: vec![0, 1, 3],
             patch_data: vec![100, 200, 201],

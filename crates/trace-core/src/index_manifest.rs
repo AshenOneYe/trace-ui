@@ -346,9 +346,10 @@ where
         .and_then(|name| name.to_str())
         .unwrap_or("artifact");
     let tmp = parent.join(format!(
-        ".{file_name}.tmp-{}-{}",
+        ".{file_name}.tmp-{}-{}-{}",
         std::process::id(),
-        now_ms()
+        now_ms(),
+        uuid::Uuid::new_v4()
     ));
 
     let result = (|| {

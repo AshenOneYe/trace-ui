@@ -50,9 +50,11 @@ where
         writer.push(&record, xref_count).map_err(TraceError::Io)?;
     }
     let parts = writer.finish().map_err(TraceError::Io)?;
-    let has_records = parts.record_count > 0;
+    if parts.record_count == 0 {
+        return Ok((Some(CachedStore::Owned(StringIndexArchive::empty())), false));
+    }
     let mapped = cache::save_string_archive_from_parts(file_path, data, &parts)?;
-    Ok((Some(CachedStore::Mapped(mapped)), has_records))
+    Ok((Some(CachedStore::Mapped(mapped)), true))
 }
 
 /// 内部枚举：区分缓存命中 vs 新鲜扫描结果
@@ -565,7 +567,7 @@ impl super::TraceEngine {
                     budgets.max_index_cache_bytes
                 )));
             }
-            cache::save_sections_raw(&file_path, data, ".scan.cache", &bytes);
+            cache::save_sections_raw(&file_path, data, ".scanv2.cache", &bytes);
             {
                 let mut state = handle
                     .state
@@ -1021,7 +1023,7 @@ impl super::TraceEngine {
                 eprintln!("[index] writing cache files...");
                 let data_for_cache: &[u8] = &mmap_arc;
                 cache::save_sections_raw(&fp, data_for_cache, ".p2v2.cache", &p2_bytes);
-                cache::save_sections_raw(&fp, data_for_cache, ".scan.cache", &scan_bytes);
+                cache::save_sections_raw(&fp, data_for_cache, ".scanv2.cache", &scan_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".lidx.cache", &lidx_bytes);
                 if let Some((ref anns, ref seqs)) = gum_extra {
                     cache::save_gumtrace_extra(&fp, data_for_cache, anns, seqs);

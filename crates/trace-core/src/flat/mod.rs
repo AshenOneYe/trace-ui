@@ -11,3 +11,4 @@ pub mod pair_split;
 pub mod reg_checkpoints;
 pub mod scan_view;
 pub mod strings;
+pub mod varint;

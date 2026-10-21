@@ -84,7 +84,7 @@ impl ScanArchive {
         w.write_slice(&self.deps.chunk_offsets_start); // 1
         w.write_slice(&self.deps.chunk_data_start); // 2
         w.write_slice(&self.deps.all_offsets); // 3
-        w.write_slice(&self.deps.all_data); // 4
+        w.write_bytes(&self.deps.all_data); // 4 (varint stream)
         w.write_slice(&self.deps.patch_lines); // 5
         w.write_slice(&self.deps.patch_offsets); // 6
         w.write_slice(&self.deps.patch_data); // 7
@@ -118,7 +118,7 @@ impl ScanArchive {
                 r.slice(1),
                 r.slice(2),
                 r.slice(3),
-                r.slice(4),
+                r.bytes(4),
                 r.slice(5),
                 r.slice(6),
                 r.slice(7),

@@ -476,6 +476,8 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 字符串扫描和并行全量 index merge 都使用固定大小排序 run 和多路外部归并。并行 chunk 完成时就写出字符串访问 run，checkpoint 保存 run 路径；merge 按 chunk 顺序流式读取并分批写出结果快照，最终通过流式 section writer 直接生成列式 mmap 档案。重新打开时按需缺页读取。
 
+基础依赖边采用新的 varint 列格式：每行保存字节级起止偏移，依赖行号和 pair/control flags 分开编码，保持 mmap 随机读取。旧 `.scan.cache` 不再使用，当前格式写入 `.scanv2.cache`。
+
 ## 限制与约束
 
 ### 数据量限制
