@@ -476,7 +476,7 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 字符串扫描和并行全量 index merge 都使用固定大小排序 run 和多路外部归并。并行 chunk 完成时就写出字符串访问 run，checkpoint 保存 run 路径；merge 按 chunk 顺序流式读取并分批写出结果快照，最终通过流式 section writer 直接生成列式 mmap 档案。重新打开时按需缺页读取。
 
-基础依赖边采用新的 varint 列格式：每行保存 chunk 内 `u32` 字节级起止偏移，依赖行号和 pair/control flags 分开编码，保持 mmap 随机读取；单 chunk 超过 4 GiB 偏移空间时会明确报资源预算错误。当前格式写入 `.scanv3.cache`。
+基础依赖边采用新的 varint 列格式：每行保存 chunk 内 `u32` 字节级起止偏移，依赖行号和 pair/control flags 分开编码，保持 mmap 随机读取；单 chunk 超过 4 GiB 偏移空间时会明确报资源预算错误。mem-last-def 使用 64 条一个块的 varint 流，pair-split 使用 `u32` 字节偏移和依赖 varint。当前格式写入 `.scanv5.cache`。
 
 内存访问索引使用 `.p2v3.cache`：地址表仍可直接二分；每个地址组的记录流中，seq 和指令地址使用 delta varint，data 保持 64 位原值，size/rw/unknown flags 压入 1 字节元数据。查询命中地址组时按需解码，不构造全量记录对象。
 

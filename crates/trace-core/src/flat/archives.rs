@@ -99,12 +99,12 @@ impl ScanArchive {
         w.write_slice(&self.deps.patch_data); // 7
                                               // FlatMemLastDef: sections 8-10
         w.write_slice(&self.mem_last_def.addrs); // 8
-        w.write_slice(&self.mem_last_def.lines); // 9
-        w.write_slice(&self.mem_last_def.values); // 10
-                                                  // FlatPairSplit: sections 11-13
+        w.write_slice(&self.mem_last_def.block_offsets); // 9
+        w.write_bytes(&self.mem_last_def.data); // 10
+                                                // FlatPairSplit: sections 11-13
         w.write_slice(&self.pair_split.keys); // 11
         w.write_slice(&self.pair_split.seg_offsets); // 12
-        w.write_slice(&self.pair_split.data); // 13
+        w.write_bytes(&self.pair_split.data); // 13
                                               // FlatBitVec: sections 14-15
         w.write_slice(&self.init_mem_loads.data); // 14
         w.write_u64(self.init_mem_loads.len); // 15
@@ -132,8 +132,8 @@ impl ScanArchive {
                 r.slice(6),
                 r.slice(7),
             ),
-            mem_last_def: MemLastDefView::from_raw(r.slice(8), r.slice(9), r.slice(10)),
-            pair_split: PairSplitView::from_raw(r.slice(11), r.slice(12), r.slice(13)),
+            mem_last_def: MemLastDefView::from_raw(r.slice(8), r.slice(9), r.bytes(10)),
+            pair_split: PairSplitView::from_raw(r.slice(11), r.slice(12), r.bytes(13)),
             init_mem_loads: BitView::from_raw(r.slice(14), r.u64_val(15)),
             reg_last_def_inner: r.slice(16),
             line_count: r.u64_val(17),

@@ -9,8 +9,8 @@ use super::bitvec::FlatBitVec;
 use super::deps::FlatDeps;
 use super::line_index::LineIndexArchive;
 use super::mem_access::{encode_group, FlatMemAccess};
-use super::mem_last_def::FlatMemLastDef;
-use super::pair_split::FlatPairSplit;
+use super::mem_last_def::{encode_mem_last_def, FlatMemLastDef};
+use super::pair_split::{encode_deps, FlatPairSplit};
 use super::reg_checkpoints::{encode_snapshots, FlatRegCheckpoints};
 
 fn append_compact_dep(output: &mut Vec<u8>, compact: u32) {
@@ -204,18 +204,11 @@ pub fn deps_to_flat(deps: &DepsStorage) -> Result<FlatDeps, crate::error::TraceE
 pub fn mem_last_def_to_flat(mld: &MemLastDef) -> FlatMemLastDef {
     match mld {
         MemLastDef::Sorted(v) => {
-            let mut addrs = Vec::with_capacity(v.len());
-            let mut lines = Vec::with_capacity(v.len());
-            let mut values = Vec::with_capacity(v.len());
-            for (addr, line, val) in v {
-                addrs.push(*addr);
-                lines.push(*line);
-                values.push(*val);
-            }
+            let (addrs, block_offsets, data) = encode_mem_last_def(v);
             FlatMemLastDef {
                 addrs,
-                lines,
-                values,
+                block_offsets,
+                data,
             }
         }
         MemLastDef::Map(_) => {
@@ -225,7 +218,9 @@ pub fn mem_last_def_to_flat(mld: &MemLastDef) -> FlatMemLastDef {
 }
 
 /// Convert `FxHashMap<u32, PairSplitDeps>` to `FlatPairSplit` (sorted CSR).
-pub fn pair_split_to_flat(ps: &FxHashMap<u64, PairSplitDeps>) -> FlatPairSplit {
+pub fn pair_split_to_flat(
+    ps: &FxHashMap<u64, PairSplitDeps>,
+) -> Result<FlatPairSplit, crate::error::TraceError> {
     // Sort entries by key
     let mut sorted: Vec<(u64, &PairSplitDeps)> = ps.iter().map(|(&k, v)| (k, v)).collect();
     sorted.sort_unstable_by_key(|(k, _)| *k);
@@ -234,7 +229,7 @@ pub fn pair_split_to_flat(ps: &FxHashMap<u64, PairSplitDeps>) -> FlatPairSplit {
     let mut keys = Vec::with_capacity(n);
     // seg_offsets: n*3 + 1 entries
     let mut seg_offsets = Vec::with_capacity(n * 3 + 1);
-    let mut data: Vec<u64> = Vec::new();
+    let mut data: Vec<u8> = Vec::new();
 
     for (key, entry) in &sorted {
         keys.push(*key);
@@ -248,21 +243,37 @@ pub fn pair_split_to_flat(ps: &FxHashMap<u64, PairSplitDeps>) -> FlatPairSplit {
         //   half2    = data[seg_offsets[base+2]  .. seg_offsets[base+3]]
         // So we push 3 offsets per entry (start of shared, start of half1, start of half2)
         // and a final sentinel at the end.
-        seg_offsets.push(data.len() as u64); // shared start
-        data.extend_from_slice(entry.shared.as_slice());
-        seg_offsets.push(data.len() as u64); // half1 start
-        data.extend_from_slice(entry.half1_deps.as_slice());
-        seg_offsets.push(data.len() as u64); // half2 start
-        data.extend_from_slice(entry.half2_deps.as_slice());
+        seg_offsets.push(u32::try_from(data.len()).map_err(|_| {
+            crate::error::TraceError::ResourceBudgetExceeded(
+                "pair-split data exceeds 4 GiB offset range".to_string(),
+            )
+        })?);
+        encode_deps(entry.shared.as_slice(), &mut data);
+        seg_offsets.push(u32::try_from(data.len()).map_err(|_| {
+            crate::error::TraceError::ResourceBudgetExceeded(
+                "pair-split data exceeds 4 GiB offset range".to_string(),
+            )
+        })?);
+        encode_deps(entry.half1_deps.as_slice(), &mut data);
+        seg_offsets.push(u32::try_from(data.len()).map_err(|_| {
+            crate::error::TraceError::ResourceBudgetExceeded(
+                "pair-split data exceeds 4 GiB offset range".to_string(),
+            )
+        })?);
+        encode_deps(entry.half2_deps.as_slice(), &mut data);
     }
     // Final sentinel = total data length (the "end" of the last entry's half2)
-    seg_offsets.push(data.len() as u64);
+    seg_offsets.push(u32::try_from(data.len()).map_err(|_| {
+        crate::error::TraceError::ResourceBudgetExceeded(
+            "pair-split data exceeds 4 GiB offset range".to_string(),
+        )
+    })?);
 
-    FlatPairSplit {
+    Ok(FlatPairSplit {
         keys,
         seg_offsets,
         data,
-    }
+    })
 }
 
 /// Convert a `bitvec::BitVec` (Lsb0 order) to `FlatBitVec`.
@@ -565,7 +576,7 @@ mod tests {
     #[test]
     fn test_pair_split_empty() {
         let ps: FxHashMap<u64, PairSplitDeps> = FxHashMap::default();
-        let flat = pair_split_to_flat(&ps);
+        let flat = pair_split_to_flat(&ps).unwrap();
         let view = flat.view();
         assert!(!view.contains_key(&0));
         assert!(view.get(&0).is_none());
@@ -592,18 +603,18 @@ mod tests {
             },
         );
 
-        let flat = pair_split_to_flat(&ps);
+        let flat = pair_split_to_flat(&ps).unwrap();
         let view = flat.view();
 
         let e10 = view.get(&10).unwrap();
-        assert_eq!(e10.shared, &[1u64, 2]);
-        assert_eq!(e10.half1_deps, &[3u64]);
-        assert_eq!(e10.half2_deps, &[4u64, 5]);
+        assert_eq!(e10.shared.as_slice(), &[1u64, 2]);
+        assert_eq!(e10.half1_deps.as_slice(), &[3u64]);
+        assert_eq!(e10.half2_deps.as_slice(), &[4u64, 5]);
 
         let e20 = view.get(&20).unwrap();
-        assert_eq!(e20.shared, &[] as &[u64]);
-        assert_eq!(e20.half1_deps, &[6u64]);
-        assert_eq!(e20.half2_deps, &[] as &[u64]);
+        assert_eq!(e20.shared.as_slice(), &[] as &[u64]);
+        assert_eq!(e20.half1_deps.as_slice(), &[6u64]);
+        assert_eq!(e20.half2_deps.as_slice(), &[] as &[u64]);
 
         assert!(!view.contains_key(&99));
         assert!(view.get(&99).is_none());

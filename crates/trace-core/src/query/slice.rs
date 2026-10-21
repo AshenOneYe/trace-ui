@@ -124,7 +124,7 @@ pub fn bfs_advance(
             // Pair instruction: determine which deps to follow based on arrival tag
             if (raw & PAIR_SHARED_BIT) != 0 {
                 // Shared arrival (via writeback base): follow only shared deps
-                for &dep in split.shared {
+                for dep in split.shared {
                     if state.data_only && (dep & CONTROL_DEP_BIT) != 0 {
                         continue;
                     }
@@ -140,7 +140,7 @@ pub fn bfs_advance(
                 }
             } else {
                 // Data arrival: follow shared + relevant half deps
-                for &dep in split.shared {
+                for dep in split.shared {
                     if state.data_only && (dep & CONTROL_DEP_BIT) != 0 {
                         continue;
                     }
@@ -159,7 +159,7 @@ pub fn bfs_advance(
                 } else {
                     split.half1_deps
                 };
-                for &dep in half_deps {
+                for dep in half_deps {
                     enqueue_dep(
                         dep,
                         n,
@@ -309,7 +309,7 @@ fn state_to_scan_view(
 ) {
     use crate::flat::convert;
     let deps = convert::deps_to_flat(&state.deps).expect("deps should fit compact cache format");
-    let pair_split = convert::pair_split_to_flat(&state.pair_split);
+    let pair_split = convert::pair_split_to_flat(&state.pair_split).unwrap();
     let init_mem_loads = convert::bitvec_to_flat(&state.init_mem_loads);
     (deps, pair_split, init_mem_loads)
 }

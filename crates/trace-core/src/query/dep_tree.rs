@@ -219,14 +219,14 @@ fn collect_deps(raw: u64, view: &ScanView, data_only: bool) -> Vec<u64> {
 
     if let Some(split) = view.pair_split.get(&line) {
         if (raw & PAIR_SHARED_BIT) != 0 {
-            for &dep in split.shared {
+            for dep in split.shared {
                 if data_only && (dep & CONTROL_DEP_BIT) != 0 {
                     continue;
                 }
                 deps.push(dep);
             }
         } else {
-            for &dep in split.shared {
+            for dep in split.shared {
                 if data_only && (dep & CONTROL_DEP_BIT) != 0 {
                     continue;
                 }
@@ -237,7 +237,7 @@ fn collect_deps(raw: u64, view: &ScanView, data_only: bool) -> Vec<u64> {
             } else {
                 split.half1_deps
             };
-            for &dep in half_deps {
+            for dep in half_deps {
                 deps.push(dep);
             }
         }

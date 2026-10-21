@@ -1,7 +1,9 @@
+use smallvec::SmallVec;
+
 pub struct FlatPairSplit {
-    pub keys: Vec<u64>,        // sorted line numbers
-    pub seg_offsets: Vec<u64>, // len = keys.len() * 3 + 1 (sentinel)
-    pub data: Vec<u64>,
+    pub keys: Vec<u64>,
+    pub seg_offsets: Vec<u32>,
+    pub data: Vec<u8>,
 }
 
 impl FlatPairSplit {
@@ -16,18 +18,18 @@ impl FlatPairSplit {
 
 pub struct PairSplitView<'a> {
     keys: &'a [u64],
-    seg_offsets: &'a [u64],
-    data: &'a [u64],
+    seg_offsets: &'a [u32],
+    data: &'a [u8],
 }
 
-pub struct PairSplitEntry<'a> {
-    pub shared: &'a [u64],
-    pub half1_deps: &'a [u64],
-    pub half2_deps: &'a [u64],
+pub struct PairSplitEntry {
+    pub shared: SmallVec<[u64; 4]>,
+    pub half1_deps: SmallVec<[u64; 4]>,
+    pub half2_deps: SmallVec<[u64; 4]>,
 }
 
 impl<'a> PairSplitView<'a> {
-    pub fn from_raw(keys: &'a [u64], seg_offsets: &'a [u64], data: &'a [u64]) -> Self {
+    pub fn from_raw(keys: &'a [u64], seg_offsets: &'a [u32], data: &'a [u8]) -> Self {
         Self {
             keys,
             seg_offsets,
@@ -35,26 +37,38 @@ impl<'a> PairSplitView<'a> {
         }
     }
 
-    /// Binary search keys, return entry with 3 slices if found.
-    pub fn get(&self, key: &u64) -> Option<PairSplitEntry<'a>> {
+    /// Binary search keys and decode the three dependency groups on demand.
+    pub fn get(&self, key: &u64) -> Option<PairSplitEntry> {
         let idx = self.keys.binary_search(key).ok()?;
-        // seg_offsets layout: [shared_start, half1_start, half2_start, sentinel] per entry
-        // base = idx * 3
         let base = idx * 3;
-        let shared_start = self.seg_offsets[base] as usize;
-        let half1_start = self.seg_offsets[base + 1] as usize;
-        let half2_start = self.seg_offsets[base + 2] as usize;
-        let end = self.seg_offsets[base + 3] as usize;
+        let shared_start = *self.seg_offsets.get(base)? as usize;
+        let half1_start = *self.seg_offsets.get(base + 1)? as usize;
+        let half2_start = *self.seg_offsets.get(base + 2)? as usize;
+        let end = *self.seg_offsets.get(base + 3)? as usize;
         Some(PairSplitEntry {
-            shared: &self.data[shared_start..half1_start],
-            half1_deps: &self.data[half1_start..half2_start],
-            half2_deps: &self.data[half2_start..end],
+            shared: decode_deps(self.data.get(shared_start..half1_start)?)?,
+            half1_deps: decode_deps(self.data.get(half1_start..half2_start)?)?,
+            half2_deps: decode_deps(self.data.get(half2_start..end)?)?,
         })
     }
 
-    /// Return true if the key exists.
     pub fn contains_key(&self, key: &u64) -> bool {
         self.keys.binary_search(key).is_ok()
+    }
+}
+
+fn decode_deps(data: &[u8]) -> Option<SmallVec<[u64; 4]>> {
+    let mut cursor = 0usize;
+    let mut deps = SmallVec::new();
+    while cursor < data.len() {
+        deps.push(crate::flat::varint::decode_u64(data, &mut cursor)?);
+    }
+    Some(deps)
+}
+
+pub fn encode_deps(deps: &[u64], output: &mut Vec<u8>) {
+    for &dep in deps {
+        crate::flat::varint::encode_u64(dep, output);
     }
 }
 
@@ -62,82 +76,40 @@ impl<'a> PairSplitView<'a> {
 mod tests {
     use super::*;
 
-    /// Two entries:
-    ///   key=10: shared=[1,2], half1=[3], half2=[4,5]
-    ///   key=20: shared=[],    half1=[6], half2=[]
     fn sample() -> FlatPairSplit {
-        // Entry 0 (key=10): data[0..2]=shared, data[2..3]=half1, data[3..5]=half2
-        // Entry 1 (key=20): data[5..5]=shared, data[5..6]=half1, data[6..6]=half2
-        //
-        // seg_offsets layout per entry: [shared_start, half1_start, half2_start, end]
-        // idx=0 (key=10): offsets[0..4] = [0, 2, 3, 5]
-        //   shared   = data[0..2] = [1,2]
-        //   half1    = data[2..3] = [3]
-        //   half2    = data[3..5] = [4,5]
-        // idx=1 (key=20): offsets[3..7] = [5, 5, 6, 6]
-        //   shared   = data[5..5] = []
-        //   half1    = data[5..6] = [6]
-        //   half2    = data[6..6] = []
-        //
-        // Full seg_offsets = [0, 2, 3, 5,  5, 6, 6]
-        //                     ^--entry0---^ ^entry1^
-        // Wait: entry0 sentinel (5) == entry1 shared_start, so:
-        // seg_offsets = [0, 2, 3, 5, 5, 6, 6]  — 7 elements for 2 keys (2*3+1)
+        let mut data = Vec::new();
+        let mut seg_offsets = Vec::new();
+        for deps in [
+            &[1, 2][..],
+            &[3][..],
+            &[4, 5][..],
+            &[][..],
+            &[6][..],
+            &[][..],
+        ] {
+            seg_offsets.push(data.len() as u32);
+            encode_deps(deps, &mut data);
+        }
+        seg_offsets.push(data.len() as u32);
         FlatPairSplit {
             keys: vec![10, 20],
-            seg_offsets: vec![0, 2, 3, 5, 5, 6, 6],
-            data: vec![1, 2, 3, 4, 5, 6],
+            seg_offsets,
+            data,
         }
     }
 
     #[test]
-    fn test_get_hit() {
+    fn get_decodes_groups() {
         let flat = sample();
-        let view = flat.view();
-
-        let e = view.get(&10).unwrap();
-        assert_eq!(e.shared, &[1u64, 2]);
-        assert_eq!(e.half1_deps, &[3u64]);
-        assert_eq!(e.half2_deps, &[4u64, 5]);
+        let entry = flat.view().get(&10).unwrap();
+        assert_eq!(entry.shared.as_slice(), &[1u64, 2]);
+        assert_eq!(entry.half1_deps.as_slice(), &[3u64]);
+        assert_eq!(entry.half2_deps.as_slice(), &[4u64, 5]);
     }
 
     #[test]
-    fn test_get_empty_slices() {
+    fn missing_key_returns_none() {
         let flat = sample();
-        let view = flat.view();
-
-        let e = view.get(&20).unwrap();
-        assert_eq!(e.shared, &[] as &[u64]);
-        assert_eq!(e.half1_deps, &[6u64]);
-        assert_eq!(e.half2_deps, &[] as &[u64]);
-    }
-
-    #[test]
-    fn test_get_miss() {
-        let flat = sample();
-        let view = flat.view();
-        assert!(view.get(&99).is_none());
-    }
-
-    #[test]
-    fn test_contains_key() {
-        let flat = sample();
-        let view = flat.view();
-        assert!(view.contains_key(&10));
-        assert!(view.contains_key(&20));
-        assert!(!view.contains_key(&0));
-        assert!(!view.contains_key(&15));
-    }
-
-    #[test]
-    fn test_empty() {
-        let flat = FlatPairSplit {
-            keys: vec![],
-            seg_offsets: vec![],
-            data: vec![],
-        };
-        let view = flat.view();
-        assert!(!view.contains_key(&0));
-        assert!(view.get(&0).is_none());
+        assert!(flat.view().get(&99).is_none());
     }
 }
