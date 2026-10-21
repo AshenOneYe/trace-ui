@@ -1,4 +1,7 @@
 use crate::query::strings::{StringEncoding, StringIndex, StringRecord, StringRw};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 
 use super::cache_format::{SectionReader, SectionWriter};
 
@@ -18,6 +21,97 @@ pub struct FlatStringRecord {
 pub struct StringIndexArchive {
     pub records: Vec<FlatStringRecord>,
     pub content: Vec<u8>,
+}
+
+pub struct StringIndexArchiveWriter {
+    temp_dir: PathBuf,
+    record_path: PathBuf,
+    content_path: PathBuf,
+    records: BufWriter<File>,
+    content: BufWriter<File>,
+    pub record_count: u64,
+    pub content_bytes: u64,
+    finished: bool,
+}
+
+impl StringIndexArchiveWriter {
+    pub fn new() -> std::io::Result<Self> {
+        let temp_dir =
+            std::env::temp_dir().join(format!("trace-ui-strings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir)?;
+        let record_path = temp_dir.join("records.bin");
+        let content_path = temp_dir.join("content.bin");
+        Ok(Self {
+            records: BufWriter::new(File::create(&record_path)?),
+            content: BufWriter::new(File::create(&content_path)?),
+            temp_dir,
+            record_path,
+            content_path,
+            record_count: 0,
+            content_bytes: 0,
+            finished: false,
+        })
+    }
+
+    pub fn push(&mut self, record: &StringRecord, xref_count: u32) -> std::io::Result<()> {
+        let bytes = record.content.as_bytes();
+        let content_offset = self.content_bytes;
+        self.content.write_all(bytes)?;
+        self.content_bytes = self.content_bytes.saturating_add(bytes.len() as u64);
+
+        let mut flat = [0u8; 40];
+        flat[0..8].copy_from_slice(&record.seq.to_le_bytes());
+        flat[8..16].copy_from_slice(&record.addr.to_le_bytes());
+        flat[16..24].copy_from_slice(&content_offset.to_le_bytes());
+        flat[24..28].copy_from_slice(&record.byte_len.to_le_bytes());
+        flat[28..32].copy_from_slice(&xref_count.to_le_bytes());
+        flat[32] = match record.encoding {
+            StringEncoding::Ascii => 0,
+            StringEncoding::Utf8 => 1,
+        };
+        flat[33] = match record.rw {
+            StringRw::Read => 0,
+            StringRw::Write => 1,
+        };
+        self.records.write_all(&flat)?;
+        self.record_count = self.record_count.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> std::io::Result<StringIndexArchiveParts> {
+        self.records.flush()?;
+        self.content.flush()?;
+        self.finished = true;
+        Ok(StringIndexArchiveParts {
+            temp_dir: self.temp_dir.clone(),
+            record_path: self.record_path.clone(),
+            content_path: self.content_path.clone(),
+            record_count: self.record_count,
+            content_bytes: self.content_bytes,
+        })
+    }
+}
+
+impl Drop for StringIndexArchiveWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_dir_all(&self.temp_dir);
+        }
+    }
+}
+
+pub struct StringIndexArchiveParts {
+    temp_dir: PathBuf,
+    pub record_path: PathBuf,
+    pub content_path: PathBuf,
+    pub record_count: u64,
+    pub content_bytes: u64,
+}
+
+impl Drop for StringIndexArchiveParts {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
 }
 
 impl StringIndexArchive {

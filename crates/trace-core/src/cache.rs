@@ -300,6 +300,47 @@ pub fn load_string_index_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>
     Some(mmap)
 }
 
+pub fn save_string_archive_from_parts(
+    file_path: &str,
+    data: &[u8],
+    parts: &crate::flat::strings::StringIndexArchiveParts,
+) -> crate::error::Result<Arc<Mmap>> {
+    let path = cache_path_ext(file_path, ".strings.cache")
+        .ok_or_else(|| crate::error::TraceError::CacheError("cache unavailable".to_string()))?;
+    let record_bytes = parts.record_count.saturating_mul(40);
+    let table_size = 40u64;
+    let content_offset = table_size.saturating_add(record_bytes);
+    let mut header = Vec::with_capacity(HEADER_LEN_V4);
+    header.extend_from_slice(MAGIC_V4);
+    header.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    header.extend_from_slice(&head_hash(data));
+    header.resize(HEADER_LEN_V4, 0);
+
+    atomic_write_with(&path, |file| {
+        use std::io::copy;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(&header)?;
+        writer.write_all(&2u32.to_le_bytes())?;
+        writer.write_all(&table_size.to_le_bytes())?;
+        writer.write_all(&record_bytes.to_le_bytes())?;
+        writer.write_all(&content_offset.to_le_bytes())?;
+        writer.write_all(&parts.content_bytes.to_le_bytes())?;
+        let table_written = 4 + 2 * 16;
+        for _ in table_written..table_size as usize {
+            writer.write_all(&[0])?;
+        }
+        copy(&mut std::fs::File::open(&parts.record_path)?, &mut writer)?;
+        copy(&mut std::fs::File::open(&parts.content_path)?, &mut writer)?;
+        writer.flush()
+    })
+    .map_err(crate::error::TraceError::Io)?;
+    load_string_index_cache(file_path, data).ok_or_else(|| {
+        crate::error::TraceError::CacheError(
+            "streamed string archive failed validation".to_string(),
+        )
+    })
+}
+
 /// Drop resident file-backed trace pages after bulk indexing.
 ///
 /// The immutable mmap remains valid and pages fault back in on demand, while the

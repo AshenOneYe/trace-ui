@@ -466,7 +466,15 @@ impl StringBuilder {
         }
     }
 
-    pub fn finish(mut self) -> StringIndex {
+    pub fn take_results(&mut self) -> Vec<StringRecord> {
+        std::mem::take(&mut self.results)
+    }
+
+    pub fn pending_result_count(&self) -> usize {
+        self.results.len()
+    }
+
+    pub fn finish_unsorted(mut self) -> Vec<StringRecord> {
         for (_, s) in self.active.drain() {
             if s.byte_len >= MIN_CACHE_LEN {
                 self.results.push(StringRecord {
@@ -480,11 +488,14 @@ impl StringBuilder {
                 });
             }
         }
+        self.results
+    }
+
+    pub fn finish(self) -> StringIndex {
+        let mut records = self.finish_unsorted();
         use rayon::prelude::*;
-        self.results.par_sort_unstable_by_key(|r| r.seq);
-        StringIndex {
-            strings: self.results,
-        }
+        records.par_sort_unstable_by_key(|r| r.seq);
+        StringIndex { strings: records }
     }
 
     pub fn fill_xref_counts(

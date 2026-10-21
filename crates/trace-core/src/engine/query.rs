@@ -1678,6 +1678,8 @@ impl super::TraceEngine {
             // 2. Stream the merged access order into the string state machine.
             let estimated_pages = (sorted_accesses.count() as usize / 500).max(1024);
             let mut sb = StringBuilder::with_capacity(estimated_pages);
+            let mut result_sorter =
+                crate::query::string_external::StringRecordExternalSorter::new()?;
             for (i, access) in sorted_accesses.iter()?.enumerate() {
                 let access = access?;
                 if i % 10000 == 0 && handle.scan_strings_cancel.load(Ordering::SeqCst) {
@@ -1689,34 +1691,54 @@ impl super::TraceEngine {
                     StringRw::Read
                 };
                 sb.process_access(access.addr, access.data, access.size, access.seq, rw);
+                if sb.pending_result_count() >= 50_000 {
+                    result_sorter.add_records(sb.take_results())?;
+                }
             }
 
-            // 3. finish + fill_xref_counts
-            let mut string_index = sb.finish();
-            {
+            // 3. External-sort result snapshots by first-observed seq.
+            result_sorter.add_records(sb.finish_unsorted())?;
+            let sorted_records = result_sorter.finish(&handle.scan_strings_cancel)?;
+
+            // 4. Stream records/content into a validated mmap archive.
+            let mapped = {
                 let state = handle
                     .state
                     .read()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
                 let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
-                StringBuilder::fill_xref_counts_view(&mut string_index, &mem_view);
-            }
+                let mut writer = crate::flat::strings::StringIndexArchiveWriter::new()
+                    .map_err(TraceError::Io)?;
+                for (index, record) in sorted_records.iter()?.enumerate() {
+                    let record = record?;
+                    if index % 10_000 == 0 && handle.scan_strings_cancel.load(Ordering::SeqCst) {
+                        return Err(TraceError::Cancelled);
+                    }
+                    let xref_count = (0..record.byte_len as u64)
+                        .map(|offset| {
+                            mem_view
+                                .query(record.addr.saturating_add(offset))
+                                .map(|records| {
+                                    records.iter().filter(|access| access.is_read()).count()
+                                })
+                                .unwrap_or(0)
+                        })
+                        .fold(0u32, |total, count| {
+                            total.saturating_add(count.min(u32::MAX as usize) as u32)
+                        });
+                    writer.push(&record, xref_count).map_err(TraceError::Io)?;
+                }
+                let parts = writer.finish().map_err(TraceError::Io)?;
+                crate::cache::save_string_archive_from_parts(&state.file_path, &state.mmap, &parts)?
+            };
 
-            // 4. Write results and update cache
+            // 5. Publish the mmap-backed string index.
             {
-                let archive = crate::flat::strings::StringIndexArchive::from_index(&string_index);
-                let archive_bytes = archive.to_sections();
                 let mut state = handle
                     .state
                     .write()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
-                crate::cache::save_sections_raw(
-                    &state.file_path,
-                    &state.mmap,
-                    ".strings.cache",
-                    &archive_bytes,
-                );
-                state.string_index = Some(crate::flat::archives::CachedStore::Owned(archive));
+                state.string_index = Some(crate::flat::archives::CachedStore::Mapped(mapped));
             }
 
             {
