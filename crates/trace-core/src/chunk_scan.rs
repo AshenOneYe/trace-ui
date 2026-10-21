@@ -866,6 +866,7 @@ pub fn scan_chunk(
         reg_checkpoints: reg_ckpts,
         string_index,
         string_accesses,
+        string_access_path: None,
 
         unresolved_loads,
         partial_unresolved_loads,

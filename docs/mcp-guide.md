@@ -474,7 +474,7 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 只处理原 trace 已不存在的 manifest 及其对应的 `.p2v2.cache`、`.scan.cache`、`.lidx.cache`、`.strings.cache`、旧格式缓存和 checkpoint 目录。默认先 dry-run，确认报告中 `bytes_reclaimable` 和 `errors` 后再以 `dry_run=false` 执行。
 
-字符串扫描和并行全量 index merge 都使用固定大小排序 run 和多路外部归并。内存访问记录和结果快照分批落盘，最终通过流式 section writer 直接生成列式 mmap 档案，不需要同时持有全部结果记录、文本和完整缓存字节。重新打开时按需缺页读取。
+字符串扫描和并行全量 index merge 都使用固定大小排序 run 和多路外部归并。并行 chunk 完成时就写出字符串访问 run，checkpoint 保存 run 路径；merge 按 chunk 顺序流式读取并分批写出结果快照，最终通过流式 section writer 直接生成列式 mmap 档案。重新打开时按需缺页读取。
 
 ## 限制与约束
 

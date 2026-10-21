@@ -21,6 +21,28 @@ pub(crate) struct StringAccess {
     pub rw: u8,
 }
 
+pub(crate) fn write_string_access_run(path: &Path, accesses: &[StringAccess]) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    writer.write_all(&(accesses.len() as u64).to_le_bytes())?;
+    for access in accesses {
+        write_access(&mut writer, access)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+pub(crate) fn string_access_run_count(path: &Path) -> Result<u64> {
+    read_run_count(path)
+}
+
+pub(crate) fn read_string_access_run(path: &Path) -> Result<StringAccessIter> {
+    let (count, reader) = open_run(path)?;
+    Ok(StringAccessIter {
+        reader,
+        remaining: count,
+    })
+}
+
 pub(crate) struct SortedStringAccesses {
     path: PathBuf,
     temp_dir: PathBuf,

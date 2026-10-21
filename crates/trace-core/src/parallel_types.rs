@@ -167,6 +167,9 @@ pub struct ChunkResult {
     /// 内存访问记录 (addr, value, size, seq, rw)，按 seq 顺序。
     /// 用于 merge 阶段精确构建字符串索引。
     pub string_accesses: Vec<(u64, u64, u8, u64, crate::query::strings::StringRw)>,
+    /// On-disk replacement for `string_accesses` produced by parallel scans.
+    #[serde(default)]
+    pub string_access_path: Option<String>,
 
     // Unresolved items
     pub unresolved_loads: Vec<UnresolvedLoad>,

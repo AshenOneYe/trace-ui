@@ -666,6 +666,7 @@ pub fn merge_all_chunks(
     let mut chunk_mem_indices = Vec::with_capacity(num_chunks);
     let mut chunk_string_accesses: Vec<Vec<(u64, u64, u8, u64, crate::query::strings::StringRw)>> =
         Vec::with_capacity(num_chunks);
+    let mut chunk_string_access_paths: Vec<Option<String>> = Vec::with_capacity(num_chunks);
     let mut all_consumed_seqs = Vec::new();
     let mut chunk_start_lines = Vec::with_capacity(num_chunks);
     let mut total_parsed_count = 0u64;
@@ -681,6 +682,7 @@ pub fn merge_all_chunks(
         chunk_line_indices.push(chunk.line_index);
         chunk_mem_indices.push(chunk.mem_access_index);
         chunk_string_accesses.push(chunk.string_accesses);
+        chunk_string_access_paths.push(chunk.string_access_path);
         all_consumed_seqs.extend(chunk.consumed_seqs);
 
         // Move events (not clone) — saves ~20GB for large files
@@ -826,38 +828,33 @@ pub fn merge_all_chunks(
     let (string_index, external_string_records) = if !skip_strings {
         let local_cancel = std::sync::atomic::AtomicBool::new(false);
         let cancel = cancel_flag.unwrap_or(&local_cancel);
-        let total_accesses: usize = chunk_string_accesses.iter().map(|w| w.len()).sum();
+        let mut total_accesses = chunk_string_accesses.iter().map(|w| w.len()).sum::<usize>();
+        for path in chunk_string_access_paths.iter().flatten() {
+            total_accesses = total_accesses
+                .saturating_add(crate::query::string_external::string_access_run_count(
+                    std::path::Path::new(path),
+                )? as usize);
+        }
         let report_interval = (total_accesses / 100).max(1);
         let mut processed = 0usize;
 
-        let estimated_pages = {
-            let mut min_addr = u64::MAX;
-            let mut max_addr = 0u64;
-            for chunk in &chunk_string_accesses {
-                for &(addr, _, _, _, _) in chunk {
-                    min_addr = min_addr.min(addr);
-                    max_addr = max_addr.max(addr);
-                }
-            }
-            if max_addr > min_addr {
-                // 上限 1M 页（~4GB 地址范围），避免稀疏地址空间导致 OOM
-                (((max_addr - min_addr) / 4096 + 1) as usize).min(1_000_000)
-            } else {
-                1024
-            }
-        };
+        let estimated_pages = mem_accesses.total_addresses().min(1_000_000).max(1024);
         let mut sb = crate::query::strings::StringBuilder::with_capacity(estimated_pages);
         let mut result_sorter = crate::query::string_external::StringRecordExternalSorter::new()?;
-        for chunk_accesses in chunk_string_accesses.into_iter() {
-            for &(addr, data, size, seq, rw) in &chunk_accesses {
+        let mut process_access =
+            |sb: &mut crate::query::strings::StringBuilder,
+             result_sorter: &mut crate::query::string_external::StringRecordExternalSorter,
+             addr: u64,
+             data: u64,
+             size: u8,
+             seq: u64,
+             rw: crate::query::strings::StringRw|
+             -> crate::error::Result<()> {
                 sb.process_access(addr, data, size, seq, rw);
                 processed += 1;
                 if processed % report_interval == 0 {
-                    // Check cancellation
-                    if let Some(flag) = cancel_flag {
-                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Err(crate::error::TraceError::Cancelled);
-                        }
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(crate::error::TraceError::Cancelled);
                     }
                     if let Some(ref cb) = progress_fn {
                         cb(0.85 + 0.12 * (processed as f64 / total_accesses as f64));
@@ -866,8 +863,40 @@ pub fn merge_all_chunks(
                 if sb.pending_result_count() >= 50_000 {
                     result_sorter.add_records(sb.take_results())?;
                 }
+                Ok(())
+            };
+        for (path, chunk_accesses) in chunk_string_access_paths
+            .into_iter()
+            .zip(chunk_string_accesses.into_iter())
+        {
+            if let Some(path) = path {
+                let reader = crate::query::string_external::read_string_access_run(
+                    std::path::Path::new(&path),
+                )?;
+                for access in reader {
+                    let access = access?;
+                    let rw = if access.rw == 1 {
+                        crate::query::strings::StringRw::Write
+                    } else {
+                        crate::query::strings::StringRw::Read
+                    };
+                    process_access(
+                        &mut sb,
+                        &mut result_sorter,
+                        access.addr,
+                        access.data,
+                        access.size,
+                        access.seq,
+                        rw,
+                    )?;
+                }
+            } else {
+                for &(addr, data, size, seq, rw) in &chunk_accesses {
+                    process_access(&mut sb, &mut result_sorter, addr, data, size, seq, rw)?;
+                }
             }
         }
+        drop(process_access);
 
         if let Some(ref cb) = progress_fn {
             cb(0.97);

@@ -1,14 +1,24 @@
 use memchr::memchr_iter;
 use rayon::prelude::*;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::chunk_scan;
 use crate::merge;
 use crate::parallel_types::ChunkResult;
 use crate::scan_unified::{self as taint, ProgressFn, ScanResult};
 
-const CHUNK_CHECKPOINT_SCHEMA: u32 = 1;
+const CHUNK_CHECKPOINT_SCHEMA: u32 = 2;
+
+struct TempDirGuard(Option<PathBuf>);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ChunkCheckpoint {
@@ -90,6 +100,15 @@ pub fn scan_unified_parallel_with_checkpoints(
     if let Some(dir) = checkpoint_dir {
         std::fs::create_dir_all(dir)?;
     }
+    let owned_temp_dir = checkpoint_dir.is_none().then(|| {
+        std::env::temp_dir().join(format!("trace-ui-chunk-access-{}", uuid::Uuid::new_v4()))
+    });
+    let cleanup = TempDirGuard(owned_temp_dir.clone());
+    let string_access_dir = checkpoint_dir
+        .map(|dir| dir.join("string-access"))
+        .or_else(|| owned_temp_dir.clone())
+        .expect("string access directory");
+    std::fs::create_dir_all(&string_access_dir)?;
 
     let chunk_results: Vec<anyhow::Result<ChunkResult>> = chunks_meta
         .par_iter()
@@ -107,6 +126,11 @@ pub fn scan_unified_parallel_with_checkpoints(
                             && checkpoint.start_byte == meta.start_byte
                             && checkpoint.end_byte == meta.end_byte
                             && checkpoint.start_line == meta.start_line
+                            && checkpoint
+                                .result
+                                .string_access_path
+                                .as_ref()
+                                .is_none_or(|path| Path::new(path).exists())
                         {
                             eprintln!(
                                 "[index] resumed chunk {}/{} from checkpoint",
@@ -131,7 +155,7 @@ pub fn scan_unified_parallel_with_checkpoints(
                     }) as Arc<dyn Fn(usize) + Send + Sync>
                 });
 
-            let result = chunk_scan::scan_chunk(
+            let mut result = chunk_scan::scan_chunk(
                 data,
                 meta.start_byte,
                 meta.end_byte,
@@ -142,6 +166,25 @@ pub fn scan_unified_parallel_with_checkpoints(
                 true, // 并行扫描始终跳过字符串：跨 chunk 边界会断裂，改由 MemAccessIndex 构建后用路径 1 精确构建
                 chunk_cb,
             );
+            if !result.string_accesses.is_empty() {
+                let access_path = string_access_dir.join(format!("chunk-{chunk_id:06}.access.bin"));
+                let accesses = result
+                    .string_accesses
+                    .iter()
+                    .map(|&(addr, data, size, seq, rw)| {
+                        crate::query::string_external::StringAccess {
+                            addr,
+                            data,
+                            size,
+                            seq,
+                            rw: u8::from(rw == crate::query::strings::StringRw::Write),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                crate::query::string_external::write_string_access_run(&access_path, &accesses)?;
+                result.string_accesses.clear();
+                result.string_access_path = Some(access_path.to_string_lossy().into_owned());
+            }
             if let Some(path) = checkpoint_path {
                 let checkpoint = ChunkCheckpoint {
                     schema_version: CHUNK_CHECKPOINT_SCHEMA,
@@ -196,6 +239,7 @@ pub fn scan_unified_parallel_with_checkpoints(
         cb(data.len(), data.len());
     }
 
+    drop(cleanup);
     Ok(result)
 }
 
@@ -360,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_chunk_checkpoints_are_written_and_reused() {
-        let line = "[00:00:00 001][lib.so 0x100] [d2800000] 0x40000100: \"mov x8, #1\" => x8=0x1\n";
+        let line = "[00:00:00 001][lib.so 0x100] [f9000008] 0x40000100: \"str x8, [x0]\" ; mem[WRITE] abs=0x41000000 x8=0x41424344 x0=0x41000000 => x8=0x41424344\n";
         let target_bytes = 10 * 1024 * 1024 + 4096;
         let count = target_bytes / line.len() + 1;
         let data = line.repeat(count);
@@ -384,6 +428,13 @@ mod tests {
             None,
         )
         .unwrap();
+        let string_access_dir = dir.join("string-access");
+        assert!(
+            std::fs::read_dir(&string_access_dir)
+                .map(|entries| entries.count() > 0)
+                .unwrap_or(false),
+            "chunk string access runs should be persisted"
+        );
         let checkpoint_count = std::fs::read_dir(&dir).unwrap().count();
         assert!(checkpoint_count >= 2);
 
