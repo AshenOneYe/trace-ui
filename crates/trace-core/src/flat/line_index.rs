@@ -34,6 +34,13 @@ impl<'a> LineIndexView<'a> {
         self.total
     }
 
+    pub fn to_archive(&self) -> LineIndexArchive {
+        LineIndexArchive {
+            sampled_offsets: self.sampled_offsets.to_vec(),
+            total: self.total,
+        }
+    }
+
     /// Return the byte offset of the given line in `data`, or None if out of range.
     pub fn line_byte_offset(&self, data: &[u8], seq: impl Into<u64>) -> Option<u64> {
         let seq = seq.into();

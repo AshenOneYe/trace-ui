@@ -334,6 +334,38 @@ fn test_chunked_slice_checkpoint_survives_engine_recreation() {
 }
 
 #[test]
+fn test_phase2_window_session_builds_local_memory_and_registers() {
+    let engine = Arc::new(TraceEngine::new());
+    let parent = engine.create_session(&get_trace_path()).unwrap();
+    let parent_sid = parent.session_id;
+    let base = engine
+        .build_base_index(&parent_sid, true, None)
+        .expect("base index");
+    let start = 20u64;
+    let end = 40u64.min(base.total_lines.saturating_sub(1));
+    let window = engine
+        .create_phase2_window_session(&parent_sid, start, end)
+        .expect("window session");
+    let built = engine
+        .build_phase2_window_index(&window.session_id, true, None)
+        .expect("window phase2");
+    assert_eq!(built.total_lines, base.total_lines);
+    assert!(engine.get_memory_at(&parent_sid, 0, start, 16).is_err());
+
+    let registers = engine
+        .get_registers_at(&window.session_id, start + 5)
+        .expect("window registers");
+    assert!(!registers.is_empty());
+    let tree = engine
+        .get_call_tree_window(&window.session_id, start, end)
+        .expect("window call tree");
+    assert!(!tree.is_empty());
+
+    engine.close_session(&parent_sid).unwrap();
+    assert!(engine.get_session_info(&window.session_id).is_err());
+}
+
+#[test]
 fn test_phase2_index_completes_functions_and_memory_but_not_dependencies() {
     let engine = Arc::new(TraceEngine::new());
     let temp_dir = std::env::temp_dir().join(format!(

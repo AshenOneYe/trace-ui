@@ -68,10 +68,18 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
 
 /// Convert `RegCheckpoints` to `FlatRegCheckpoints` (flattened u64 array).
 pub fn reg_checkpoints_to_flat(ckpts: &RegCheckpoints) -> FlatRegCheckpoints {
+    reg_checkpoints_to_flat_with_start(ckpts, 0)
+}
+
+pub fn reg_checkpoints_to_flat_with_start(
+    ckpts: &RegCheckpoints,
+    first_seq: u64,
+) -> FlatRegCheckpoints {
     let (offsets, data) = encode_snapshots(&ckpts.snapshots);
     FlatRegCheckpoints {
         interval: ckpts.interval,
         count: ckpts.snapshots.len() as u64,
+        first_seq,
         offsets,
         data,
     }

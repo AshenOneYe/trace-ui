@@ -34,12 +34,13 @@ impl Phase2Archive {
         w.write_slice(&self.mem_accesses.offsets); // 1
         w.write_bytes(&self.mem_accesses.records); // 2
         w.write_u64(self.mem_accesses.record_count); // 3
-                                                     // RegCheckpoints: sections 4-7
+                                                     // RegCheckpoints: sections 4-8
         w.write_u64(self.reg_checkpoints.interval); // 4
         w.write_u64(self.reg_checkpoints.count); // 5
         w.write_slice(&self.reg_checkpoints.offsets); // 6
         w.write_bytes(&self.reg_checkpoints.data); // 7
-                                                   // CallTree: section 8
+        w.write_u64(self.reg_checkpoints.first_seq); // 8
+                                                     // CallTree: section 9
         w.write_bytes(&self.call_tree.to_sections());
         w.finish()
     }
@@ -48,7 +49,7 @@ impl Phase2Archive {
     /// `data` = &mmap[HEADER_LEN..] (after 64-byte cache header)
     pub fn views_from_sections(data: &[u8]) -> Option<Phase2Views<'_>> {
         let r = SectionReader::new(data)?;
-        if r.num_sections() < 9 {
+        if r.num_sections() < 10 {
             return None;
         }
         let mem_accesses =
@@ -58,10 +59,11 @@ impl Phase2Archive {
             reg_checkpoints: RegCheckpointsView::from_raw(
                 r.u64_val(4),
                 r.u64_val(5),
+                r.u64_val(8),
                 r.slice(6),
                 r.bytes(7),
             ),
-            call_tree: CallTreeArchive::views_from_sections(r.bytes(8))?,
+            call_tree: CallTreeArchive::views_from_sections(r.bytes(9))?,
         })
     }
 }

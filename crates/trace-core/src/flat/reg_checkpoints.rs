@@ -4,6 +4,7 @@ const KEYFRAME_INTERVAL: usize = 64;
 pub struct FlatRegCheckpoints {
     pub interval: u64,
     pub count: u64,
+    pub first_seq: u64,
     pub offsets: Vec<u64>,
     pub data: Vec<u8>,
 }
@@ -13,6 +14,7 @@ impl FlatRegCheckpoints {
         RegCheckpointsView {
             interval: self.interval,
             count: self.count,
+            first_seq: self.first_seq,
             offsets: &self.offsets,
             data: &self.data,
         }
@@ -22,15 +24,23 @@ impl FlatRegCheckpoints {
 pub struct RegCheckpointsView<'a> {
     pub interval: u64,
     count: u64,
+    first_seq: u64,
     offsets: &'a [u64],
     data: &'a [u8],
 }
 
 impl<'a> RegCheckpointsView<'a> {
-    pub fn from_raw(interval: u64, count: u64, offsets: &'a [u64], data: &'a [u8]) -> Self {
+    pub fn from_raw(
+        interval: u64,
+        count: u64,
+        first_seq: u64,
+        offsets: &'a [u64],
+        data: &'a [u8],
+    ) -> Self {
         Self {
             interval,
             count,
+            first_seq,
             offsets,
             data,
         }
@@ -41,7 +51,11 @@ impl<'a> RegCheckpointsView<'a> {
         if self.count == 0 || self.interval == 0 {
             return None;
         }
-        let target = ((seq / self.interval) as usize).min(self.count as usize - 1);
+        if seq < self.first_seq {
+            return None;
+        }
+        let target =
+            (((seq - self.first_seq) / self.interval) as usize).min(self.count as usize - 1);
         let keyframe = target / KEYFRAME_INTERVAL * KEYFRAME_INTERVAL;
         let mut values = [u64::MAX; REG_COUNT];
         for snapshot in keyframe..=target {
@@ -53,7 +67,7 @@ impl<'a> RegCheckpointsView<'a> {
                 snapshot % KEYFRAME_INTERVAL == 0,
             )?;
         }
-        Some((target as u64 * self.interval, values))
+        Some((self.first_seq + target as u64 * self.interval, values))
     }
 }
 
@@ -125,6 +139,7 @@ mod tests {
         let flat = FlatRegCheckpoints {
             interval: 100,
             count: snapshots.len() as u64,
+            first_seq: 0,
             offsets,
             data,
         };
@@ -144,6 +159,7 @@ mod tests {
         let flat = FlatRegCheckpoints {
             interval: reg_checkpoints.interval,
             count: 3,
+            first_seq: 0,
             offsets,
             data,
         };
@@ -157,9 +173,27 @@ mod tests {
         let flat = FlatRegCheckpoints {
             interval: 100,
             count: 0,
+            first_seq: 0,
             offsets: vec![],
             data: vec![],
         };
         assert!(flat.view().nearest_before(0).is_none());
+    }
+
+    #[test]
+    fn window_keyframes_use_first_seq() {
+        let snapshots = checkpoints(3);
+        let (offsets, data) = encode_snapshots(&snapshots);
+        let flat = FlatRegCheckpoints {
+            interval: 100,
+            count: 3,
+            first_seq: 1000,
+            offsets,
+            data,
+        };
+        let (seq, values) = flat.view().nearest_before(1250).unwrap();
+        assert_eq!(seq, 1200);
+        assert_eq!(values[0], 2000);
+        assert!(flat.view().nearest_before(999).is_none());
     }
 }

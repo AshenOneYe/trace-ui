@@ -472,7 +472,7 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 |------|------|------|------|
 | dry_run | bool | 否（默认 true） | 只报告可回收字节，不删除 |
 
-只处理原 trace 已不存在的 manifest 及其对应的 `.p2v2.cache`、`.scan.cache`、`.lidx.cache`、`.strings.cache`、旧格式缓存和 checkpoint 目录。默认先 dry-run，确认报告中 `bytes_reclaimable` 和 `errors` 后再以 `dry_run=false` 执行。
+只处理原 trace 已不存在的 manifest 及其对应的 phase2/scan/line/string 缓存、旧格式缓存和 checkpoint 目录。默认先 dry-run，确认报告中 `bytes_reclaimable` 和 `errors` 后再以 `dry_run=false` 执行。
 
 字符串扫描和并行全量 index merge 都使用固定大小排序 run 和多路外部归并。并行 chunk 完成时就写出字符串访问 run，checkpoint 保存 run 路径；merge 按 chunk 顺序流式读取并分批写出结果快照，最终通过流式 section writer 直接生成列式 mmap 档案。重新打开时按需缺页读取。
 
@@ -480,7 +480,22 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 内存访问索引使用 `.p2v3.cache`：地址表仍可直接二分；每个地址组的记录流中，seq 和指令地址使用 delta varint，data 保持 64 位原值，size/rw/unknown flags 压入 1 字节元数据。查询命中地址组时按需解码，不构造全量记录对象。
 
-寄存器 checkpoint 使用 `.p2v4.cache`：每 64 个 snapshot 写入一个 keyframe；普通 snapshot 只保存相对前一份发生变化的寄存器，值以 XOR varint 编码。随机查询从最近 keyframe 恢复，最多重放 63 个 snapshot。
+寄存器 checkpoint 使用 `.p2v5.cache`：每 64 个 snapshot 写入一个 keyframe；普通 snapshot 只保存相对前一份发生变化的寄存器，值以 XOR varint 编码。随机查询从最近 keyframe 恢复，最多重放 63 个 snapshot。窗口索引同时记录 checkpoint 的全局起始 seq。
+
+#### phase2 窗口索引任务
+
+lite session 可以只对目标窗口构建 phase2：
+
+```json
+{
+  "kind": "phase2_index",
+  "file_path": "/path/to/trace.log",
+  "start_line": 758000000,
+  "end_line": 758655321
+}
+```
+
+`start_line` 为 inclusive，`end_line` 为 exclusive。任务按窗口字节范围估算内存，不按整个 trace 文件估算；完成后结果的 `scope` 为 `window`，`session_id` 指向独立 window session。该 session 只包含窗口内的函数/内存/寄存器索引，不会覆盖父 session 的全量 phase2。
 
 ## 限制与约束
 
@@ -493,7 +508,8 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 | 内存读取长度 | 最多 256 字节 | `get_memory` 的 length 上限 |
 | 污点结果分页 | 最多 200 行 | `get_tainted_lines` 的 limit 上限 |
 | 字符串分页 | 最多 200 条 | `get_strings` 的 limit 上限 |
-| 懒字符串/调用树窗口 | 最多 262144 行 | 无完整索引时的单次窗口上限 |
+| 懒字符串窗口 | 最多 1048576 行 | 无完整字符串索引时的单次窗口上限，按可用内存预检 |
+| 懒调用树窗口 | 最多 262144 行 | 无完整函数索引时的单次窗口上限 |
 
 超出限制时使用分页参数（offset/limit）获取更多数据。
 

@@ -429,7 +429,7 @@ Vite HMR + Rust 热重载，修改前端代码即时生效。
 
 **Q: 首次打开大文件很慢？**
 
-首次打开会建立行检查点；超出内存预算时自动进入 lite 模式。完整依赖索引可由 `start_analysis_job(kind="build_index")` 在后台续建。构建完成后会自动缓存，再次打开同一文件通常为毫秒级。
+首次打开会建立行检查点；超出内存预算时自动进入 lite 模式。完整依赖索引可由 `start_analysis_job(kind="build_index")` 在后台续建。lite 模式下可通过 `start_analysis_job(kind="phase2_index", start_line=..., end_line=...)` 只对目标窗口构建函数、内存访问和寄存器 checkpoint，预算按窗口字节数计算并返回独立 window session。构建完成后会自动缓存，再次打开同一文件通常为毫秒级。
 
 **Q: 如何清除缓存？**
 

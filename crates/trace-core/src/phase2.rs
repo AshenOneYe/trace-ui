@@ -15,6 +15,14 @@ pub fn build_phase2(
     data: &[u8],
     progress_fn: Option<Box<dyn Fn(usize, usize) + Send>>,
 ) -> Phase2State {
+    build_phase2_with_start(data, 0, progress_fn)
+}
+
+pub fn build_phase2_with_start(
+    data: &[u8],
+    start_seq: u64,
+    progress_fn: Option<Box<dyn Fn(usize, usize) + Send>>,
+) -> Phase2State {
     let mut ct_builder = CallTreeBuilder::new();
     let mut mem_idx = MemAccessIndex::new();
     let mut reg_ckpts = RegCheckpoints::new(CHECKPOINT_INTERVAL);
@@ -27,7 +35,7 @@ pub fn build_phase2(
     let mut last_report = 0usize;
 
     let mut pos = 0usize;
-    let mut seq: u64 = 0;
+    let mut seq: u64 = start_seq;
     // BLR 后需要检测：如果下一行地址 = BLR的PC+4，说明是 unidbg 拦截调用（无函数体）
     let mut blr_pending_pc: Option<u64> = None; // Some(BLR指令的PC地址)
     let mut root_addr_set = false;
@@ -206,7 +214,7 @@ pub fn build_phase2(
         }
 
         seq += 1;
-        if seq % CHECKPOINT_INTERVAL == 0 {
+        if seq.saturating_sub(start_seq) % CHECKPOINT_INTERVAL == 0 {
             reg_ckpts.save_checkpoint(&reg_values);
         }
 

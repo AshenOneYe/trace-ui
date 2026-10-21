@@ -419,7 +419,7 @@ fn execute_job(
     if token.is_cancelled() || cancellation_flag.load(Ordering::Relaxed) {
         return Err("cancelled".to_string());
     }
-    let (session_id, created_session) = match input.session_id.clone() {
+    let (mut session_id, created_session) = match input.session_id.clone() {
         Some(id) if engine.get_session_info(&id).is_ok() => (id, false),
         _ => {
             let session = engine
@@ -429,6 +429,29 @@ fn execute_job(
             (id, true)
         }
     };
+    let mut phase2_window = None;
+    if kind == JobKind::Phase2Index && (input.start_line.is_some() || input.end_line.is_some()) {
+        engine
+            .build_base_index(&session_id, created_session, None)
+            .map_err(|e| e.to_string())?;
+        let info = engine
+            .get_session_info(&session_id)
+            .map_err(|e| e.to_string())?;
+        let start = input.start_line.unwrap_or(0);
+        let end_exclusive = input.end_line.unwrap_or(info.total_lines);
+        if start >= end_exclusive || start >= info.total_lines {
+            return Err(format!(
+                "invalid phase2_index window: [{start}, {end_exclusive}) for {} lines",
+                info.total_lines
+            ));
+        }
+        let end = end_exclusive.min(info.total_lines).saturating_sub(1);
+        let window_session = engine
+            .create_phase2_window_session(&session_id, start, end)
+            .map_err(|e| e.to_string())?;
+        session_id = window_session.session_id;
+        phase2_window = Some((start, end));
+    }
     let index_complete = engine
         .get_index_status(&session_id)
         .map(|status| status.complete)
@@ -440,9 +463,16 @@ fn execute_job(
                 .map_err(|e| e.to_string())?;
         }
         JobKind::Phase2Index => {
-            engine
-                .build_phase2_index(&session_id, input.force_rebuild || created_session, None)
-                .map_err(|e| e.to_string())?;
+            let force = input.force_rebuild || created_session;
+            if phase2_window.is_some() {
+                engine
+                    .build_phase2_window_index(&session_id, force, None)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                engine
+                    .build_phase2_index(&session_id, force, None)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         JobKind::DependencyIndex => {
             engine
@@ -523,7 +553,9 @@ fn execute_job(
                 "file_size": info.file_size,
                 "total_lines": info.total_lines,
                 "trace_format": info.trace_format.map(|f| format!("{f:?}")),
-                "scope": "phase2",
+                "start_line": phase2_window.map(|(start, _)| start),
+                "end_line": phase2_window.map(|(_, end)| end.saturating_add(1)),
+                "scope": if phase2_window.is_some() { "window" } else { "full" },
             }))
         }
         JobKind::DependencyIndex => {
@@ -565,6 +597,7 @@ fn execute_job(
                 "file_size": info.file_size,
                 "total_lines": info.total_lines,
                 "trace_format": info.trace_format.map(|f| format!("{f:?}")),
+                "scope": "full",
             }))
         }
         JobKind::VmAnalysis => {
@@ -921,6 +954,54 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(finished, "job did not complete in time");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn phase2_job_honors_line_window() {
+        let dir = std::env::temp_dir().join(format!(
+            "trace-ui-jobs-phase2-window-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = JobManager::with_path_and_results(
+            Arc::new(TraceEngine::new()),
+            dir.join("jobs.json"),
+            Arc::new(ResultManager::with_dir(dir.join("results"))),
+        );
+        let trace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example-trace-gumtrace.txt");
+        let job = manager
+            .start(
+                JobKind::Phase2Index,
+                AnalysisJobInput {
+                    file_path: trace.to_string_lossy().to_string(),
+                    session_id: None,
+                    force_rebuild: true,
+                    skip_strings: true,
+                    start_line: Some(10),
+                    end_line: Some(30),
+                    ranges: Vec::new(),
+                    vm_config: None,
+                    from_specs: Vec::new(),
+                    data_only: false,
+                    include_lines: None,
+                    addr_range: None,
+                    ignore_regs: None,
+                    context_lines: None,
+                    search_query: None,
+                    use_regex: None,
+                    case_sensitive: None,
+                    max_results: None,
+                },
+            )
+            .unwrap();
+        let completed = wait_for_completion(&manager, &job.id).await;
+        assert_eq!(completed["result"]["scope"], "window");
+        assert_eq!(completed["result"]["start_line"], 10);
+        assert_eq!(completed["result"]["end_line"], 30);
+        let session_id = completed["result"]["session_id"].as_str().unwrap();
+        assert!(manager.engine.get_registers_at(session_id, 15).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 

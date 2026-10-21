@@ -229,6 +229,100 @@ impl TraceEngine {
         Ok(self.get_handle(session_id)?.segment_range())
     }
 
+    /// Create an independent lightweight window session for a local phase-2
+    /// index. It shares only the immutable trace mmap and a copied line index.
+    pub fn create_phase2_window_session(
+        &self,
+        parent_session_id: &str,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> Result<SessionInfo> {
+        let parent = self.get_handle(parent_session_id)?;
+        let (mmap, file_path, file_size, total_lines, format, line_index, annotations, consumed) = {
+            let state = parent
+                .state
+                .read()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            let line_index = state
+                .line_index_view()
+                .ok_or(TraceError::IndexNotReady)?
+                .to_archive();
+            (
+                state.mmap.clone(),
+                state.file_path.clone(),
+                state.file_size,
+                state.total_lines,
+                state.trace_format,
+                line_index,
+                state.call_annotations.clone(),
+                state.consumed_seqs.clone(),
+            )
+        };
+        if start_seq > end_seq || end_seq >= total_lines {
+            return Err(TraceError::InvalidArgument(format!(
+                "window must satisfy start <= end < {total_lines}"
+            )));
+        }
+        let mut state = SessionState {
+            mmap,
+            file_path: file_path.clone(),
+            total_lines,
+            file_size,
+            trace_format: format,
+            phase2_store: None,
+            string_index: None,
+            scan_store: None,
+            reg_last_def: None,
+            lidx_store: Some(crate::flat::archives::CachedStore::Owned(line_index)),
+            slice_result: None,
+            slice_origin: None,
+            scan_strings_cancelled: Arc::new(AtomicBool::new(false)),
+            call_annotations: annotations,
+            consumed_seqs: consumed,
+            call_search_texts: HashMap::new(),
+            crypto_cache: None,
+        };
+        state.rebuild_call_search_texts();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let handle = Arc::new(SessionHandle {
+            file_path: file_path.clone(),
+            file_size,
+            building: AtomicBool::new(false),
+            build_cancel: AtomicBool::new(false),
+            scanning_strings: AtomicBool::new(false),
+            scan_strings_cancel: AtomicBool::new(false),
+            search_cache: std::sync::Mutex::new((0, Vec::new())),
+            local_slice: std::sync::Mutex::new(None),
+            slice_checkpoints: std::sync::Mutex::new(HashMap::new()),
+            state: Arc::new(RwLock::new(state)),
+            parent_session_id: Some(parent_session_id.to_string()),
+            segment_index: None,
+            seq_start: Some(start_seq),
+            seq_end: Some(end_seq),
+        });
+        {
+            let mut sessions = self
+                .sessions
+                .write()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            sessions.insert(session_id.clone(), handle);
+        }
+        Ok(SessionInfo {
+            session_id,
+            file_path,
+            file_size,
+            total_lines,
+            index_ready: true,
+            building: false,
+            has_slice_result: false,
+            trace_format: Some(format),
+            parent_session_id: Some(parent_session_id.to_string()),
+            segment_index: None,
+            seq_start: Some(start_seq),
+            seq_end: Some(end_seq),
+        })
+    }
+
     pub fn close_session(&self, session_id: &str) -> Result<()> {
         let removed = {
             let mut sessions = self

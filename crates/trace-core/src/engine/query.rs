@@ -1231,7 +1231,7 @@ impl super::TraceEngine {
         start_seq: u64,
         end_seq: u64,
     ) -> Result<Vec<CallTreeNodeDto>> {
-        const MAX_WINDOW_LINES: u64 = 262_144;
+        const MAX_WINDOW_LINES: u64 = 1_048_576;
         let handle = self.get_handle(session_id)?;
         let (start_seq, end_seq) = handle
             .segment_range()
@@ -1459,6 +1459,12 @@ impl super::TraceEngine {
             )));
         }
         let _lease = self.acquire_query_lease()?;
+        let estimated_memory = (seq_end.saturating_sub(seq_start) + 1)
+            .saturating_mul(32)
+            .saturating_add(64 * 1024 * 1024);
+        self.memory_watchdog
+            .ensure_capacity(estimated_memory)
+            .map_err(TraceError::ResourceBudgetExceeded)?;
         let handle = self.get_handle(session_id)?;
         let state = handle
             .state

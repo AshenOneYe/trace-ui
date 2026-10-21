@@ -393,9 +393,13 @@ pub struct StartAnalysisJobRequest {
     pub force_rebuild: bool,
     #[serde(default)]
     pub skip_strings: bool,
-    #[schemars(description = "Inclusive VM analysis start line (default: 0)")]
+    #[schemars(
+        description = "Inclusive start line for VM analysis or a phase2_index window (default: 0)"
+    )]
     pub start_line: Option<u64>,
-    #[schemars(description = "Exclusive VM analysis end line (default: end of trace)")]
+    #[schemars(
+        description = "Exclusive end line for VM analysis or a phase2_index window (default: end of trace)"
+    )]
     pub end_line: Option<u64>,
     #[schemars(description = "Taint sources for kind='taint', e.g. ['reg:X0@1234']")]
     #[serde(default)]

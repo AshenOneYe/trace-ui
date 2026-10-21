@@ -276,9 +276,42 @@ impl super::TraceEngine {
         force_rebuild: bool,
         on_progress: Option<ProgressCallback>,
     ) -> Result<BuildResult> {
+        self.build_phase2_index_inner(session_id, force_rebuild, on_progress, None)
+    }
+
+    pub fn build_phase2_window_index(
+        &self,
+        session_id: &str,
+        force_rebuild: bool,
+        on_progress: Option<ProgressCallback>,
+    ) -> Result<BuildResult> {
         let handle = self.get_handle(session_id)?;
-        let current_status = self.get_index_status(session_id)?;
-        if current_status.complete && !force_rebuild {
+        let range = handle.segment_range().ok_or_else(|| {
+            TraceError::InvalidArgument(
+                "window phase-2 build requires a window session".to_string(),
+            )
+        })?;
+        self.build_phase2_index_inner(session_id, force_rebuild, on_progress, Some(range))
+    }
+
+    fn build_phase2_index_inner(
+        &self,
+        session_id: &str,
+        force_rebuild: bool,
+        on_progress: Option<ProgressCallback>,
+        window: Option<(u64, u64)>,
+    ) -> Result<BuildResult> {
+        let handle = self.get_handle(session_id)?;
+        let current_status = window
+            .is_none()
+            .then(|| self.get_index_status(session_id))
+            .transpose()?;
+        if current_status
+            .as_ref()
+            .is_some_and(|status| status.complete)
+            && !force_rebuild
+        {
+            let current_status = current_status.expect("checked above");
             return Ok(BuildResult {
                 total_lines: current_status.total_lines,
                 has_string_index: current_status
@@ -307,11 +340,28 @@ impl super::TraceEngine {
         handle.build_cancel.store(false, Ordering::SeqCst);
 
         let result = (|| {
-            let (mmap, file_path, total_lines, format) = {
+            let (mmap, file_path, total_lines, format, byte_range) = {
                 let state = handle
                     .state
                     .read()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
+                let line_index = state.line_index_view();
+                let byte_range = if let Some((start, end)) = window {
+                    let start_byte = line_index
+                        .as_ref()
+                        .and_then(|index| index.line_byte_offset(&state.mmap, start))
+                        .unwrap_or(0) as usize;
+                    let end_byte = line_index
+                        .as_ref()
+                        .and_then(|index| {
+                            index.line_byte_offset(&state.mmap, end.saturating_add(1))
+                        })
+                        .map(|offset| offset as usize)
+                        .unwrap_or(state.mmap.len());
+                    (start_byte, end_byte)
+                } else {
+                    (0, state.mmap.len())
+                };
                 (
                     state.mmap.clone(),
                     state.file_path.clone(),
@@ -321,15 +371,17 @@ impl super::TraceEngine {
                         .map(|store| store.total_lines())
                         .unwrap_or(0),
                     trace_parser::gumtrace::detect_format(&state.mmap),
+                    byte_range,
                 )
             };
             let data: &[u8] = &mmap;
+            let phase2_data = &data[byte_range.0..byte_range.1];
             let budgets = self.get_resource_budgets()?;
             let memory_limit = budgets.effective_memory_limit_bytes();
-            if budgets.estimated_index_memory(data.len()) > memory_limit {
+            if budgets.estimated_index_memory(phase2_data.len()) > memory_limit {
                 return Err(TraceError::ResourceBudgetExceeded(format!(
                     "estimated phase-2 memory {} exceeds effective budget {}",
-                    budgets.estimated_index_memory(data.len()),
+                    budgets.estimated_index_memory(phase2_data.len()),
                     memory_limit
                 )));
             }
@@ -356,7 +408,8 @@ impl super::TraceEngine {
                     });
                 }) as Box<dyn Fn(usize, usize) + Send>
             });
-            let phase2 = crate::phase2::build_phase2(data, progress);
+            let start_seq = window.map_or(0, |(start, _)| start);
+            let phase2 = crate::phase2::build_phase2_with_start(phase2_data, start_seq, progress);
             if self.memory_watchdog.pressure() {
                 return Err(TraceError::ResourceBudgetExceeded(
                     "memory watchdog stopped phase-2 allocation".to_string(),
@@ -364,7 +417,10 @@ impl super::TraceEngine {
             }
             let archive = Phase2Archive {
                 mem_accesses: convert::mem_access_to_flat(&phase2.mem_accesses),
-                reg_checkpoints: convert::reg_checkpoints_to_flat(&phase2.reg_checkpoints),
+                reg_checkpoints: convert::reg_checkpoints_to_flat_with_start(
+                    &phase2.reg_checkpoints,
+                    start_seq,
+                ),
                 call_tree: CallTreeArchive::from_tree(&phase2.call_tree),
             };
             let bytes = archive.to_sections();
@@ -377,7 +433,9 @@ impl super::TraceEngine {
                     budgets.max_index_cache_bytes
                 )));
             }
-            cache::save_sections_raw(&file_path, data, ".p2v4.cache", &bytes);
+            if window.is_none() {
+                cache::save_sections_raw(&file_path, data, ".p2v5.cache", &bytes);
+            }
 
             {
                 let mut state = handle
@@ -390,33 +448,35 @@ impl super::TraceEngine {
                 state.string_index = Some(CachedStore::Owned(StringIndexArchive::empty()));
             }
 
-            if let Some(path) = cache::index_manifest_path(&file_path) {
-                let fingerprint = TraceFingerprint::from_file(std::path::Path::new(&file_path))
-                    .map_err(TraceError::Io)?;
-                let mut manifest = IndexManifest::load(&path).unwrap_or_else(|_| {
-                    IndexManifest::new(
-                        fingerprint.clone(),
-                        file_path.clone(),
-                        format!("{:?}", format),
-                    )
-                });
-                manifest.total_lines = total_lines;
-                let end = GlobalLine(total_lines);
-                for stage in [
-                    IndexStage::Metadata,
-                    IndexStage::Lines,
-                    IndexStage::Functions,
-                    IndexStage::RegistersAndMemory,
-                ] {
-                    *manifest.stage_mut(stage) =
-                        crate::index_manifest::StageStatus::mark_complete(1, end);
+            if window.is_none() {
+                if let Some(path) = cache::index_manifest_path(&file_path) {
+                    let fingerprint = TraceFingerprint::from_file(std::path::Path::new(&file_path))
+                        .map_err(TraceError::Io)?;
+                    let mut manifest = IndexManifest::load(&path).unwrap_or_else(|_| {
+                        IndexManifest::new(
+                            fingerprint.clone(),
+                            file_path.clone(),
+                            format!("{:?}", format),
+                        )
+                    });
+                    manifest.total_lines = total_lines;
+                    let end = GlobalLine(total_lines);
+                    for stage in [
+                        IndexStage::Metadata,
+                        IndexStage::Lines,
+                        IndexStage::Functions,
+                        IndexStage::RegistersAndMemory,
+                    ] {
+                        *manifest.stage_mut(stage) =
+                            crate::index_manifest::StageStatus::mark_complete(1, end);
+                    }
+                    let deps = manifest.stage_mut(IndexStage::Dependencies);
+                    deps.state = StageState::Pending;
+                    deps.message = Some("dependency index has not been built".to_string());
+                    manifest
+                        .save_atomic(&path)
+                        .map_err(|e| TraceError::CacheError(e.to_string()))?;
                 }
-                let deps = manifest.stage_mut(IndexStage::Dependencies);
-                deps.state = StageState::Pending;
-                deps.message = Some("dependency index has not been built".to_string());
-                manifest
-                    .save_atomic(&path)
-                    .map_err(|e| TraceError::CacheError(e.to_string()))?;
             }
             Ok(BuildResult {
                 total_lines,
@@ -1022,7 +1082,7 @@ impl super::TraceEngine {
                 // 4. 同步写缓存
                 eprintln!("[index] writing cache files...");
                 let data_for_cache: &[u8] = &mmap_arc;
-                cache::save_sections_raw(&fp, data_for_cache, ".p2v4.cache", &p2_bytes);
+                cache::save_sections_raw(&fp, data_for_cache, ".p2v5.cache", &p2_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".scanv5.cache", &scan_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".lidx.cache", &lidx_bytes);
                 if let Some((ref anns, ref seqs)) = gum_extra {
