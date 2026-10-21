@@ -27,6 +27,16 @@ pub fn decode_u64(data: &[u8], cursor: &mut usize) -> Option<u64> {
     }
 }
 
+pub fn encode_i64(value: i64, output: &mut Vec<u8>) {
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    encode_u64(zigzag, output);
+}
+
+pub fn decode_i64(data: &[u8], cursor: &mut usize) -> Option<i64> {
+    let zigzag = decode_u64(data, cursor)?;
+    Some(((zigzag >> 1) as i64) ^ (-((zigzag & 1) as i64)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +56,15 @@ mod tests {
     fn rejects_truncated_values() {
         let mut cursor = 0;
         assert_eq!(decode_u64(&[0x80], &mut cursor), None);
+    }
+
+    #[test]
+    fn signed_round_trip() {
+        for value in [i64::MIN, -16_384, -1, 0, 1, 16_384, i64::MAX] {
+            let mut bytes = Vec::new();
+            encode_i64(value, &mut bytes);
+            let mut cursor = 0;
+            assert_eq!(decode_i64(&bytes, &mut cursor), Some(value));
+        }
     }
 }

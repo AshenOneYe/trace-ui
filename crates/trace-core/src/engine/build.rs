@@ -377,7 +377,7 @@ impl super::TraceEngine {
                     budgets.max_index_cache_bytes
                 )));
             }
-            cache::save_sections_raw(&file_path, data, ".p2v2.cache", &bytes);
+            cache::save_sections_raw(&file_path, data, ".p2v3.cache", &bytes);
 
             {
                 let mut state = handle
@@ -1022,7 +1022,7 @@ impl super::TraceEngine {
                 // 4. 同步写缓存
                 eprintln!("[index] writing cache files...");
                 let data_for_cache: &[u8] = &mmap_arc;
-                cache::save_sections_raw(&fp, data_for_cache, ".p2v2.cache", &p2_bytes);
+                cache::save_sections_raw(&fp, data_for_cache, ".p2v3.cache", &p2_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".scanv2.cache", &scan_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".lidx.cache", &lidx_bytes);
                 if let Some((ref anns, ref seqs)) = gum_extra {

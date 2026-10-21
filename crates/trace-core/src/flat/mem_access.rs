@@ -1,25 +1,17 @@
+use smallvec::SmallVec;
+
 pub const MEM_RW_READ: u8 = 0;
 pub const MEM_RW_WRITE: u8 = 1;
-
-/// flags 位定义（FlatMemAccessRecord.flags）
-/// bit0: 数据值未知（trace 未打印寄存器值，如 NEON/SIMD）。
-/// 旧缓存文件中该字节为 0（原 _pad），自动视为 data_known=true，向后兼容。
 pub const FLAG_DATA_UNKNOWN: u8 = 0x01;
 
-/// A single memory access record.
-///
-/// Layout is explicit `repr(C)` with manual padding to 32 bytes.
-/// Archive type is Self — valid for same-endian (little-endian only) cache files.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
 pub struct FlatMemAccessRecord {
-    pub insn_addr: u64, // u64 first to avoid padding
+    pub insn_addr: u64,
     pub data: u64,
     pub seq: u64,
     pub size: u8,
-    pub rw: u8,        // 0=Read, 1=Write
-    pub flags: u8,     // bit0 = data unknown (was _pad[0]; zero in old caches = known)
-    pub _pad: [u8; 5], // explicit pad to reach 32 bytes total
+    pub rw: u8,
+    pub flags: u8,
 }
 
 impl FlatMemAccessRecord {
@@ -40,9 +32,11 @@ impl FlatMemAccessRecord {
 }
 
 pub struct FlatMemAccess {
-    pub addrs: Vec<u64>,   // sorted unique addresses
-    pub offsets: Vec<u64>, // CSR: records for addrs[i] = records[offsets[i]..offsets[i+1]]
-    pub records: Vec<FlatMemAccessRecord>,
+    pub addrs: Vec<u64>,
+    /// Byte offsets into the compact record stream, with one sentinel.
+    pub offsets: Vec<u64>,
+    pub records: Vec<u8>,
+    pub record_count: u64,
 }
 
 impl FlatMemAccess {
@@ -51,6 +45,7 @@ impl FlatMemAccess {
             addrs: &self.addrs,
             offsets: &self.offsets,
             records: &self.records,
+            record_count: self.record_count,
         }
     }
 }
@@ -58,176 +53,201 @@ impl FlatMemAccess {
 pub struct MemAccessView<'a> {
     addrs: &'a [u64],
     offsets: &'a [u64],
-    records: &'a [FlatMemAccessRecord],
+    records: &'a [u8],
+    record_count: u64,
 }
 
 impl<'a> MemAccessView<'a> {
     pub fn from_raw(
         addrs: &'a [u64],
         offsets: &'a [u64],
-        records: &'a [FlatMemAccessRecord],
+        records: &'a [u8],
+        record_count: u64,
     ) -> Self {
         Self {
             addrs,
             offsets,
             records,
+            record_count,
         }
     }
 
-    /// Binary search addrs, return records slice for the given address.
-    pub fn query(&self, addr: u64) -> Option<&'a [FlatMemAccessRecord]> {
+    pub fn query(&self, addr: u64) -> Option<SmallVec<[FlatMemAccessRecord; 8]>> {
         let idx = self.addrs.binary_search(&addr).ok()?;
-        let start = self.offsets[idx] as usize;
-        let end = self.offsets[idx + 1] as usize;
-        Some(&self.records[start..end])
+        let start = *self.offsets.get(idx)? as usize;
+        let end = *self.offsets.get(idx + 1)? as usize;
+        decode_group(self.records.get(start..end)?).ok()
     }
 
-    /// Iterate all (addr, record) pairs.
-    pub fn iter_all(&self) -> impl Iterator<Item = (u64, &FlatMemAccessRecord)> {
-        self.addrs.iter().enumerate().flat_map(move |(i, &addr)| {
-            let start = self.offsets[i] as usize;
-            let end = self.offsets[i + 1] as usize;
-            self.records[start..end].iter().map(move |rec| (addr, rec))
+    pub fn iter_all(&self) -> impl Iterator<Item = (u64, FlatMemAccessRecord)> + '_ {
+        (0..self.addrs.len()).flat_map(move |idx| {
+            let addr = self.addrs[idx];
+            let start = self.offsets[idx] as usize;
+            let end = self.offsets[idx + 1] as usize;
+            decode_group(&self.records[start..end])
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |record| (addr, record))
         })
     }
 
-    /// Number of unique addresses (for partitioning)
     pub fn addr_count(&self) -> usize {
         self.addrs.len()
     }
 
-    /// Iterate (addr, records_slice) for a range of address indices.
-    /// Used for parallel partitioning.
     pub fn iter_addr_range(
         &self,
         start_idx: usize,
         end_idx: usize,
-    ) -> impl Iterator<Item = (u64, &[FlatMemAccessRecord])> {
-        let addrs = &self.addrs[start_idx..end_idx];
-        let offsets = &self.offsets[start_idx..=end_idx]; // inclusive end for CSR
-        addrs.iter().zip(offsets.windows(2)).map(|(&addr, window)| {
-            let start = window[0] as usize;
-            let end = window[1] as usize;
-            (addr, &self.records[start..end])
+    ) -> impl Iterator<Item = (u64, SmallVec<[FlatMemAccessRecord; 8]>)> + '_ {
+        let start_idx = start_idx.min(self.addrs.len());
+        let end_idx = end_idx.min(self.addrs.len()).max(start_idx);
+        (start_idx..end_idx).map(move |idx| {
+            let addr = self.addrs[idx];
+            let start = self.offsets[idx] as usize;
+            let end = self.offsets[idx + 1] as usize;
+            (
+                addr,
+                decode_group(&self.records[start..end]).unwrap_or_default(),
+            )
         })
     }
 
-    /// Iterate `(addr, records)` for addresses in `[start_addr, end_addr)`.
-    /// Uses binary search over the sorted address table, so callers can bound
-    /// the scan to a hot address window instead of walking the whole trace.
     pub fn iter_range(
         &self,
         start_addr: u64,
         end_addr: u64,
-    ) -> impl Iterator<Item = (u64, &[FlatMemAccessRecord])> {
+    ) -> impl Iterator<Item = (u64, SmallVec<[FlatMemAccessRecord; 8]>)> + '_ {
         let start_idx = self.addrs.partition_point(|&addr| addr < start_addr);
         let end_idx = self.addrs.partition_point(|&addr| addr < end_addr);
         self.iter_addr_range(start_idx, end_idx)
     }
 
-    #[allow(dead_code)]
     pub fn total_records(&self) -> usize {
-        self.records.len()
+        self.record_count as usize
     }
 
-    #[allow(dead_code)]
     pub fn total_addresses(&self) -> usize {
         self.addrs.len()
     }
 }
 
+pub fn encode_group(records: &[crate::query::mem_access::MemAccessRecord], output: &mut Vec<u8>) {
+    let mut previous_seq = 0u64;
+    let mut previous_insn = 0u64;
+    for record in records {
+        crate::flat::varint::encode_u64(record.seq.saturating_sub(previous_seq), output);
+        previous_seq = record.seq;
+        crate::flat::varint::encode_i64(record.insn_addr as i64 - previous_insn as i64, output);
+        previous_insn = record.insn_addr;
+        output.extend_from_slice(&record.data.to_le_bytes());
+        let rw = match record.rw {
+            crate::query::mem_access::MemRw::Read => MEM_RW_READ,
+            crate::query::mem_access::MemRw::Write => MEM_RW_WRITE,
+        };
+        let flags = if record.data_known {
+            0
+        } else {
+            FLAG_DATA_UNKNOWN
+        };
+        output.push((record.size & 0x0f) | (rw << 4) | (flags << 5));
+    }
+}
+
+fn decode_group(data: &[u8]) -> Result<SmallVec<[FlatMemAccessRecord; 8]>, ()> {
+    let mut cursor = 0usize;
+    let mut previous_seq = 0u64;
+    let mut previous_insn = 0u64;
+    let mut records = SmallVec::new();
+    while cursor < data.len() {
+        let seq_delta = crate::flat::varint::decode_u64(data, &mut cursor).ok_or(())?;
+        let insn_delta = crate::flat::varint::decode_i64(data, &mut cursor).ok_or(())?;
+        let data_end = cursor.checked_add(8).ok_or(())?;
+        let value = u64::from_le_bytes(data.get(cursor..data_end).ok_or(())?.try_into().unwrap());
+        cursor = data_end;
+        let meta = *data.get(cursor).ok_or(())?;
+        cursor += 1;
+        previous_seq = previous_seq.checked_add(seq_delta).ok_or(())?;
+        previous_insn = (previous_insn as i64).checked_add(insn_delta).ok_or(())? as u64;
+        records.push(FlatMemAccessRecord {
+            insn_addr: previous_insn,
+            data: value,
+            seq: previous_seq,
+            size: meta & 0x0f,
+            rw: (meta >> 4) & 0x01,
+            flags: (meta >> 5) & 0x01,
+        });
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::mem_access::{MemAccessIndex, MemAccessRecord, MemRw};
 
-    fn sample_data() -> FlatMemAccess {
-        FlatMemAccess {
-            addrs: vec![0x1000, 0x2000],
-            offsets: vec![0, 2, 3],
-            records: vec![
-                FlatMemAccessRecord {
-                    insn_addr: 0x100,
-                    data: 0x42,
-                    seq: 0,
-                    size: 4,
-                    rw: 1,
-                    flags: 0,
-                    _pad: [0; 5],
-                },
-                FlatMemAccessRecord {
-                    insn_addr: 0x104,
-                    data: 0x43,
-                    seq: 5,
-                    size: 4,
-                    rw: 0,
-                    flags: 0,
-                    _pad: [0; 5],
-                },
-                FlatMemAccessRecord {
-                    insn_addr: 0x200,
-                    data: 0xFF,
+    #[test]
+    fn compact_records_round_trip() {
+        let mut records = Vec::new();
+        encode_group(
+            &[
+                MemAccessRecord {
                     seq: 10,
-                    size: 1,
-                    rw: 1,
-                    flags: 0,
-                    _pad: [0; 5],
+                    insn_addr: 0x40001000,
+                    data: 0x11223344,
+                    size: 4,
+                    rw: MemRw::Write,
+                    data_known: true,
+                },
+                MemAccessRecord {
+                    seq: 18,
+                    insn_addr: 0x40001008,
+                    data: 0x55667788,
+                    size: 4,
+                    rw: MemRw::Read,
+                    data_known: false,
                 },
             ],
-        }
+            &mut records,
+        );
+        let decoded = decode_group(&records).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1].seq, 18);
+        assert_eq!(decoded[1].insn_addr, 0x40001008);
+        assert!(decoded[1].is_read());
+        assert!(!decoded[1].is_data_known());
     }
 
     #[test]
-    fn test_query_hit() {
-        let flat = sample_data();
+    fn record_index_queries_compact_groups() {
+        let mut idx = MemAccessIndex::new();
+        idx.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 1,
+                insn_addr: 0x10,
+                data: 1,
+                size: 8,
+                rw: MemRw::Write,
+                data_known: true,
+            },
+        );
+        idx.add(
+            0x1000,
+            MemAccessRecord {
+                seq: 5,
+                insn_addr: 0x20,
+                data: 2,
+                size: 8,
+                rw: MemRw::Read,
+                data_known: true,
+            },
+        );
+        let flat = super::super::convert::mem_access_to_flat(&idx);
         let view = flat.view();
-        let recs = view.query(0x1000).unwrap();
-        assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0].seq, 0);
-        assert_eq!(recs[1].seq, 5);
-    }
-
-    #[test]
-    fn test_query_miss() {
-        let flat = sample_data();
-        assert!(flat.view().query(0x9999).is_none());
-    }
-
-    #[test]
-    fn test_iter_all() {
-        let flat = sample_data();
-        let view = flat.view();
-        let all: Vec<_> = view.iter_all().collect();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].0, 0x1000);
-        assert_eq!(all[2].0, 0x2000);
-    }
-
-    #[test]
-    fn test_is_read_write() {
-        let r = FlatMemAccessRecord {
-            insn_addr: 0,
-            data: 0,
-            seq: 0,
-            size: 1,
-            rw: 0,
-            flags: 0,
-            _pad: [0; 5],
-        };
-        assert!(r.is_read());
-        let w = FlatMemAccessRecord {
-            insn_addr: 0,
-            data: 0,
-            seq: 0,
-            size: 1,
-            rw: 1,
-            flags: 0,
-            _pad: [0; 5],
-        };
-        assert!(w.is_write());
-    }
-
-    #[test]
-    fn test_record_size() {
-        assert_eq!(std::mem::size_of::<FlatMemAccessRecord>(), 32);
+        let records = view.query(0x1000).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].data, 1);
+        assert!(view.query(0x2000).is_none());
     }
 }

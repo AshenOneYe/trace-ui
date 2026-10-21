@@ -683,7 +683,7 @@ impl super::TraceEngine {
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
         let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
-        let records = mem_view.query(addr).unwrap_or(&[]);
+        let records = mem_view.query(addr).unwrap_or_default();
         let mask = if width >= 8 {
             u64::MAX
         } else {
@@ -819,7 +819,7 @@ impl super::TraceEngine {
         let format = state.trace_format;
 
         let want_read = options.read_filter;
-        let mut per_slot: Vec<(u32, Vec<&crate::flat::mem_access::FlatMemAccessRecord>)> =
+        let mut per_slot: Vec<(u32, Vec<crate::flat::mem_access::FlatMemAccessRecord>)> =
             Vec::with_capacity(options.slots.len());
         let mut total = 0u64;
         for slot in &options.slots {
@@ -830,11 +830,12 @@ impl super::TraceEngine {
                 .base_addr
                 .checked_add(offset)
                 .ok_or_else(|| TraceError::InvalidArgument("slot address overflow".into()))?;
-            let records = mem_view.query(addr).unwrap_or(&[]);
+            let records = mem_view.query(addr).unwrap_or_default();
             let filtered: Vec<_> = records
                 .iter()
                 .filter(|rec| rec.seq >= options.start_seq && rec.seq <= options.end_seq)
                 .filter(|rec| want_read.map_or(true, |wr| rec.is_read() == wr))
+                .copied()
                 .collect();
             total += filtered.len() as u64;
             per_slot.push((*slot, filtered));
@@ -858,7 +859,7 @@ impl super::TraceEngine {
             if seen >= options.offset as u64 && rows.len() < options.limit {
                 let rec = per_slot[slot_index].1[rec_index];
                 let addr = options.base_addr + (slot as u64) * options.slot_stride;
-                let dto = mem_rec_to_dto(rec, seq, &line_index, data, format);
+                let dto = mem_rec_to_dto(&rec, seq, &line_index, data, format);
                 rows.push(SlotWatchRecord {
                     seq,
                     slot,
@@ -968,7 +969,7 @@ impl super::TraceEngine {
 
         // ── 扫描全部记录（字节对齐任意偏移匹配）──
         let mut matched: Vec<(u64, u64)> = Vec::new(); // (addr, seq)
-        let mut matched_recs: Vec<&crate::flat::mem_access::FlatMemAccessRecord> = Vec::new();
+        let mut matched_recs: Vec<crate::flat::mem_access::FlatMemAccessRecord> = Vec::new();
         for (addr, rec) in mem_view.iter_all() {
             if !rec.is_data_known() {
                 continue;

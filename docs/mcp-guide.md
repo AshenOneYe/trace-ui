@@ -478,6 +478,8 @@ lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和
 
 基础依赖边采用新的 varint 列格式：每行保存字节级起止偏移，依赖行号和 pair/control flags 分开编码，保持 mmap 随机读取。旧 `.scan.cache` 不再使用，当前格式写入 `.scanv2.cache`。
 
+内存访问索引使用 `.p2v3.cache`：地址表仍可直接二分；每个地址组的记录流中，seq 和指令地址使用 delta varint，data 保持 64 位原值，size/rw/unknown flags 压入 1 字节元数据。查询命中地址组时按需解码，不构造全量记录对象。
+
 ## 限制与约束
 
 ### 数据量限制

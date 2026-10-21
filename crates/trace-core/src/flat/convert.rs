@@ -1,14 +1,14 @@
 use rustc_hash::FxHashMap;
 
 use crate::line_index::LineIndex;
-use crate::query::mem_access::{MemAccessIndex, MemRw};
+use crate::query::mem_access::MemAccessIndex;
 use crate::query::registers::RegCheckpoints;
 use crate::scanner::{DepsStorage, MemLastDef, PairSplitDeps};
 
 use super::bitvec::FlatBitVec;
 use super::deps::FlatDeps;
 use super::line_index::LineIndexArchive;
-use super::mem_access::{FlatMemAccess, FlatMemAccessRecord, MEM_RW_READ, MEM_RW_WRITE};
+use super::mem_access::{encode_group, FlatMemAccess};
 use super::mem_last_def::FlatMemLastDef;
 use super::pair_split::FlatPairSplit;
 use super::reg_checkpoints::{FlatRegCheckpoints, REG_COUNT};
@@ -44,30 +44,17 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
 
     let mut addrs = Vec::with_capacity(total_addrs);
     let mut offsets = Vec::with_capacity(total_addrs + 1);
-    let mut records = Vec::with_capacity(total_records);
+    let mut records = Vec::new();
 
     offsets.push(0u64);
 
     for (addr, recs) in &grouped {
         addrs.push(*addr);
-        for rec in recs {
-            records.push(FlatMemAccessRecord {
-                insn_addr: rec.insn_addr,
-                data: rec.data,
-                seq: rec.seq,
-                size: rec.size,
-                rw: match rec.rw {
-                    MemRw::Read => MEM_RW_READ,
-                    MemRw::Write => MEM_RW_WRITE,
-                },
-                flags: if rec.data_known {
-                    0
-                } else {
-                    crate::flat::mem_access::FLAG_DATA_UNKNOWN
-                },
-                _pad: [0; 5],
-            });
-        }
+        let refs = recs
+            .iter()
+            .map(|record| (**record).clone())
+            .collect::<Vec<_>>();
+        encode_group(&refs, &mut records);
         offsets.push(records.len() as u64);
     }
 
@@ -75,6 +62,7 @@ pub fn mem_access_to_flat(idx: &MemAccessIndex) -> FlatMemAccess {
         addrs,
         offsets,
         records,
+        record_count: total_records as u64,
     }
 }
 

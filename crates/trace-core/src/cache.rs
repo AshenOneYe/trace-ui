@@ -277,7 +277,7 @@ fn load_cache_mmap(file_path: &str, data: &[u8], suffix: &str) -> Option<Arc<Mma
 // ── Section-based cache load ──
 
 pub fn load_phase2_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
-    let mmap = load_cache_mmap(file_path, data, ".p2v2.cache")?;
+    let mmap = load_cache_mmap(file_path, data, ".p2v3.cache")?;
     crate::flat::archives::Phase2Archive::views_from_sections(&mmap[HEADER_LEN_V4..])?;
     Some(mmap)
 }
@@ -458,6 +458,7 @@ pub fn delete_cache(file_path: &str) {
     for suffix in [
         ".p2.cache",
         ".p2v2.cache",
+        ".p2v3.cache",
         ".scan.cache",
         ".scanv2.cache",
         ".lidx.cache",
@@ -530,6 +531,7 @@ fn known_cache_paths_in(dir: &std::path::Path, hash: &str) -> Vec<PathBuf> {
     for suffix in [
         ".p2.cache",
         ".p2v2.cache",
+        ".p2v3.cache",
         ".scan.cache",
         ".scanv2.cache",
         ".lidx.cache",
