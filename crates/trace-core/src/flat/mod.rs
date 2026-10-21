@@ -1,6 +1,7 @@
 pub mod archives;
 pub mod bitvec;
 pub mod cache_format;
+pub mod call_tree;
 pub mod convert;
 pub mod deps;
 pub mod line_index;
@@ -9,3 +10,4 @@ pub mod mem_last_def;
 pub mod pair_split;
 pub mod reg_checkpoints;
 pub mod scan_view;
+pub mod strings;

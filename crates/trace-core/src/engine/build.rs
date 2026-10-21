@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::api_types::{BuildOptions, BuildResult, Phase, Progress, ProgressCallback};
 use crate::cache;
 use crate::error::{Result, TraceError};
 use crate::flat::archives::{CachedStore, Phase2Archive, ScanArchive};
+use crate::flat::call_tree::CallTreeArchive;
 use crate::flat::convert;
 use crate::flat::line_index::LineIndexArchive;
+use crate::flat::strings::StringIndexArchive;
 use crate::index_manifest::{
     IndexManifest, IndexStage, StageState, TraceFingerprint, INDEX_SCHEMA_VERSION,
 };
@@ -18,8 +21,7 @@ use crate::scan_unified::{ProgressFn, ScanResult};
 enum IndexResult {
     CacheHit {
         phase2_store: CachedStore<Phase2Archive>,
-        call_tree: crate::query::call_tree::CallTree,
-        string_index: Option<crate::query::strings::StringIndex>,
+        string_index: Option<CachedStore<StringIndexArchive>>,
         scan_store: CachedStore<ScanArchive>,
         reg_last_def: crate::scanner::RegLastDef,
         lidx_store: CachedStore<LineIndexArchive>,
@@ -54,7 +56,8 @@ impl super::TraceEngine {
                 (state.mmap.clone(), state.file_path.clone())
             };
             let data: &[u8] = &mmap;
-            let fingerprint = TraceFingerprint::from_bytes(data);
+            let fingerprint = TraceFingerprint::from_file(std::path::Path::new(&file_path))
+                .map_err(TraceError::Io)?;
             let manifest_path = cache::index_manifest_path(&file_path);
 
             if !force_rebuild {
@@ -129,8 +132,31 @@ impl super::TraceEngine {
                     });
                 }
             };
-            let line_index =
-                crate::line_index::LineIndex::build_with_progress(data, Some(&progress_cb));
+            const LINE_SCAN_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+            let mut line_builder =
+                crate::line_index::LineIndexBuilder::with_capacity_hint(data.len() / 80);
+            line_builder.add_line(0);
+            let mut chunk_start = 0usize;
+            while chunk_start < data.len() {
+                let chunk_end = chunk_start
+                    .saturating_add(LINE_SCAN_CHUNK_BYTES)
+                    .min(data.len());
+                for relative in memchr::memchr_iter(b'\n', &data[chunk_start..chunk_end]) {
+                    let pos = chunk_start + relative;
+                    if pos + 1 < data.len() {
+                        line_builder.add_line((pos + 1) as u64);
+                    }
+                }
+                progress_cb(chunk_end, data.len());
+                cache::release_mapped_file_range(&mmap, chunk_start, chunk_end);
+                if self.memory_watchdog.pressure() {
+                    return Err(TraceError::ResourceBudgetExceeded(
+                        "memory watchdog stopped line-index construction".to_string(),
+                    ));
+                }
+                chunk_start = chunk_end;
+            }
+            let line_index = line_builder.finish();
             let total_lines = line_index.total_lines();
             let archive = convert::line_index_to_archive(&line_index);
             let bytes = archive.to_sections();
@@ -145,6 +171,7 @@ impl super::TraceEngine {
                 state.trace_format = format;
                 state.lidx_store = Some(CachedStore::Owned(archive));
             }
+            cache::release_mapped_file_pages(&mmap);
 
             if let Some(path) = manifest_path {
                 let mut manifest =
@@ -258,13 +285,12 @@ impl super::TraceEngine {
             };
             let data: &[u8] = &mmap;
             let budgets = self.get_resource_budgets()?;
-            if budgets.max_memory_bytes > 0
-                && budgets.estimated_index_memory(data.len()) > budgets.max_memory_bytes
-            {
+            let memory_limit = budgets.effective_memory_limit_bytes();
+            if budgets.estimated_index_memory(data.len()) > memory_limit {
                 return Err(TraceError::ResourceBudgetExceeded(format!(
-                    "estimated phase-2 memory {} exceeds configured budget {}",
+                    "estimated phase-2 memory {} exceeds effective budget {}",
                     budgets.estimated_index_memory(data.len()),
-                    budgets.max_memory_bytes
+                    memory_limit
                 )));
             }
             if let Some(cb) = &on_progress {
@@ -291,10 +317,15 @@ impl super::TraceEngine {
                 }) as Box<dyn Fn(usize, usize) + Send>
             });
             let phase2 = crate::phase2::build_phase2(data, progress);
+            if self.memory_watchdog.pressure() {
+                return Err(TraceError::ResourceBudgetExceeded(
+                    "memory watchdog stopped phase-2 allocation".to_string(),
+                ));
+            }
             let archive = Phase2Archive {
                 mem_accesses: convert::mem_access_to_flat(&phase2.mem_accesses),
                 reg_checkpoints: convert::reg_checkpoints_to_flat(&phase2.reg_checkpoints),
-                call_tree: phase2.call_tree.clone(),
+                call_tree: CallTreeArchive::from_tree(&phase2.call_tree),
             };
             let bytes = archive.to_sections();
             if budgets.max_index_cache_bytes > 0
@@ -306,7 +337,7 @@ impl super::TraceEngine {
                     budgets.max_index_cache_bytes
                 )));
             }
-            cache::save_sections_raw(&file_path, data, ".p2.cache", &bytes);
+            cache::save_sections_raw(&file_path, data, ".p2v2.cache", &bytes);
 
             {
                 let mut state = handle
@@ -315,13 +346,13 @@ impl super::TraceEngine {
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
                 state.total_lines = total_lines;
                 state.trace_format = format;
-                state.call_tree = Some(phase2.call_tree);
                 state.phase2_store = Some(CachedStore::Owned(archive));
-                state.string_index = Some(Default::default());
+                state.string_index = Some(CachedStore::Owned(StringIndexArchive::empty()));
             }
 
             if let Some(path) = cache::index_manifest_path(&file_path) {
-                let fingerprint = TraceFingerprint::from_bytes(data);
+                let fingerprint = TraceFingerprint::from_file(std::path::Path::new(&file_path))
+                    .map_err(TraceError::Io)?;
                 let mut manifest = IndexManifest::load(&path).unwrap_or_else(|_| {
                     IndexManifest::new(
                         fingerprint.clone(),
@@ -402,16 +433,16 @@ impl super::TraceEngine {
                 (state.mmap.clone(), state.file_path.clone())
             };
             let data: &[u8] = &mmap;
-            let fingerprint = TraceFingerprint::from_bytes(data);
+            let fingerprint = TraceFingerprint::from_file(std::path::Path::new(&file_path))
+                .map_err(TraceError::Io)?;
             let checkpoint_dir = cache::checkpoint_dir(&file_path, &fingerprint);
             let budgets = self.get_resource_budgets()?;
-            if budgets.max_memory_bytes > 0
-                && budgets.estimated_index_memory(data.len()) > budgets.max_memory_bytes
-            {
+            let memory_limit = budgets.effective_memory_limit_bytes();
+            if budgets.estimated_index_memory(data.len()) > memory_limit {
                 return Err(TraceError::ResourceBudgetExceeded(format!(
-                    "estimated dependency-index memory {} exceeds configured budget {}",
+                    "estimated dependency-index memory {} exceeds effective budget {}",
                     budgets.estimated_index_memory(data.len()),
-                    budgets.max_memory_bytes
+                    memory_limit
                 )));
             }
             if let Some(cb) = &on_progress {
@@ -422,21 +453,29 @@ impl super::TraceEngine {
                     message: Some("building dependency graph".to_string()),
                 });
             }
-            let progress = on_progress.map(|cb| {
-                let sid = session_id.to_string();
+            let progress_handle = handle.clone();
+            let progress_watchdog = self.memory_watchdog.clone();
+            let sid = session_id.to_string();
+            let user_progress: Option<std::sync::Arc<dyn Fn(Progress) + Send + Sync>> =
+                on_progress.map(std::sync::Arc::from);
+            let progress: crate::scan_unified::ProgressFn =
                 Box::new(move |processed: usize, total: usize| {
-                    cb(Progress {
-                        session_id: sid.clone(),
-                        phase: Phase::Scanning,
-                        fraction: if total == 0 {
-                            0.0
-                        } else {
-                            processed as f64 / total as f64
-                        },
-                        message: Some("building dependency graph".to_string()),
-                    });
-                }) as crate::scan_unified::ProgressFn
-            });
+                    if progress_watchdog.pressure() {
+                        progress_handle.build_cancel.store(true, Ordering::Relaxed);
+                    }
+                    if let Some(cb) = &user_progress {
+                        cb(Progress {
+                            session_id: sid.clone(),
+                            phase: Phase::Scanning,
+                            fraction: if total == 0 {
+                                0.0
+                            } else {
+                                processed as f64 / total as f64
+                            },
+                            message: Some("building dependency graph".to_string()),
+                        });
+                    }
+                });
             let num_chunks = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
@@ -446,14 +485,20 @@ impl super::TraceEngine {
                 false,
                 false,
                 true,
-                progress,
+                Some(progress),
                 num_chunks,
                 checkpoint_dir.as_deref(),
                 Some(&handle.build_cancel),
             )
             .map_err(|e| {
                 if handle.build_cancel.load(Ordering::Relaxed) {
-                    TraceError::Cancelled
+                    if self.memory_watchdog.pressure() {
+                        TraceError::ResourceBudgetExceeded(
+                            "memory watchdog stopped dependency scan".to_string(),
+                        )
+                    } else {
+                        TraceError::Cancelled
+                    }
                 } else {
                     TraceError::Internal(format!("dependency scan failed: {e}"))
                 }
@@ -534,7 +579,7 @@ impl super::TraceEngine {
     fn build_index_inner(
         &self,
         session_id: &str,
-        handle: &crate::session::SessionHandle,
+        handle: &Arc<crate::session::SessionHandle>,
         options: BuildOptions,
         on_progress: Option<ProgressCallback>,
     ) -> Result<BuildResult> {
@@ -549,16 +594,16 @@ impl super::TraceEngine {
         let data: &[u8] = &mmap_arc;
         let force = options.force_rebuild;
         let skip_strings = options.skip_strings;
-        let trace_fingerprint = TraceFingerprint::from_bytes(data);
+        let trace_fingerprint = TraceFingerprint::from_file(std::path::Path::new(&file_path))
+            .map_err(TraceError::Io)?;
         let checkpoint_dir = cache::checkpoint_dir(&file_path, &trace_fingerprint);
         let budgets = self.get_resource_budgets()?;
-        if budgets.max_memory_bytes > 0
-            && budgets.estimated_index_memory(data.len()) > budgets.max_memory_bytes
-        {
+        let memory_limit = budgets.effective_memory_limit_bytes();
+        if budgets.estimated_index_memory(data.len()) > memory_limit {
             return Err(TraceError::ResourceBudgetExceeded(format!(
-                "estimated indexing memory {} exceeds configured budget {}",
+                "estimated indexing memory {} exceeds effective budget {}",
                 budgets.estimated_index_memory(data.len()),
-                budgets.max_memory_bytes
+                memory_limit
             )));
         }
 
@@ -622,7 +667,13 @@ impl super::TraceEngine {
                         });
                     }
 
-                    let string_index = cache::load_string_cache(&file_path, data);
+                    let string_index = cache::load_string_index_cache(&file_path, data)
+                        .map(CachedStore::Mapped)
+                        .or_else(|| {
+                            cache::load_string_cache(&file_path, data).map(|index| {
+                                CachedStore::Owned(StringIndexArchive::from_index(&index))
+                            })
+                        });
 
                     let (call_annotations, consumed_seqs) =
                         if detected_format == trace_parser::types::TraceFormat::Gumtrace {
@@ -633,7 +684,6 @@ impl super::TraceEngine {
                         };
 
                     let phase2_store = CachedStore::Mapped(p2_mmap);
-                    let call_tree = phase2_store.deserialize_call_tree();
 
                     let scan_store = CachedStore::Mapped(scan_mmap);
                     let reg_last_def = scan_store.deserialize_reg_last_def();
@@ -648,7 +698,6 @@ impl super::TraceEngine {
 
                     let result = IndexResult::CacheHit {
                         phase2_store,
-                        call_tree,
                         string_index,
                         scan_store,
                         reg_last_def,
@@ -678,23 +727,29 @@ impl super::TraceEngine {
         // ProgressCallback 已是 Box<dyn Fn(Progress) + Send + Sync + 'static>，
         // 将其包在 Arc 里即可跨线程共享、并满足 ProgressFn 的 'static 约束。
         let sid = session_id.to_string();
-        let progress_fn: Option<ProgressFn> = on_progress.map(|cb| {
-            let cb_arc: std::sync::Arc<dyn Fn(Progress) + Send + Sync> = std::sync::Arc::from(cb);
-            let progress_box: ProgressFn = Box::new(move |processed: usize, total: usize| {
+        let progress_handle = handle.clone();
+        let progress_watchdog = self.memory_watchdog.clone();
+        let user_progress: Option<std::sync::Arc<dyn Fn(Progress) + Send + Sync>> =
+            on_progress.map(std::sync::Arc::from);
+        let progress_fn: Option<ProgressFn> =
+            Some(Box::new(move |processed: usize, total: usize| {
+                if progress_watchdog.pressure() {
+                    progress_handle.build_cancel.store(true, Ordering::Relaxed);
+                }
                 let fraction = if total == 0 {
                     0.0
                 } else {
                     processed as f64 / total as f64
                 };
-                cb_arc(Progress {
-                    session_id: sid.clone(),
-                    phase: Phase::Scanning,
-                    fraction,
-                    message: None,
-                });
-            });
-            progress_box
-        });
+                if let Some(cb) = &user_progress {
+                    cb(Progress {
+                        session_id: sid.clone(),
+                        phase: Phase::Scanning,
+                        fraction,
+                        message: None,
+                    });
+                }
+            }));
 
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -713,7 +768,13 @@ impl super::TraceEngine {
         )
         .map_err(|e| {
             if handle.build_cancel.load(Ordering::Relaxed) {
-                TraceError::Cancelled
+                if self.memory_watchdog.pressure() {
+                    TraceError::ResourceBudgetExceeded(
+                        "memory watchdog stopped full index scan".to_string(),
+                    )
+                } else {
+                    TraceError::Cancelled
+                }
             } else {
                 TraceError::Internal(format!("统一扫描失败: {}", e))
             }
@@ -764,7 +825,6 @@ impl super::TraceEngine {
         match result {
             IndexResult::CacheHit {
                 phase2_store,
-                call_tree,
                 string_index,
                 scan_store,
                 reg_last_def,
@@ -780,7 +840,7 @@ impl super::TraceEngine {
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
                 let has_string_index = string_index
                     .as_ref()
-                    .map(|si| !si.strings.is_empty())
+                    .map(|si| !si.string_index_view().is_empty())
                     .unwrap_or(false);
 
                 state.total_lines = total_lines;
@@ -789,7 +849,6 @@ impl super::TraceEngine {
                 state.consumed_seqs = consumed_seqs;
                 state.rebuild_call_search_texts();
 
-                state.call_tree = Some(call_tree);
                 state.string_index = string_index;
                 state.reg_last_def = Some(reg_last_def);
                 state.phase2_store = Some(phase2_store);
@@ -808,13 +867,12 @@ impl super::TraceEngine {
             IndexResult::ScanResult(scan_result) => {
                 // 1. 在 write lock 外构建 archives
                 let phase2 = scan_result.phase2;
-                let call_tree = phase2.call_tree.clone();
                 let string_index = phase2.string_index;
 
                 let phase2_archive = Phase2Archive {
                     mem_accesses: convert::mem_access_to_flat(&phase2.mem_accesses),
                     reg_checkpoints: convert::reg_checkpoints_to_flat(&phase2.reg_checkpoints),
-                    call_tree: phase2.call_tree,
+                    call_tree: CallTreeArchive::from_tree(&phase2.call_tree),
                 };
 
                 // fill_xref_counts：Phase2Archive 构建完成后，使用 flat view 计算 xref
@@ -851,7 +909,9 @@ impl super::TraceEngine {
                 let p2_bytes = phase2_archive.to_sections();
                 let scan_bytes = scan_archive.to_sections();
                 let lidx_bytes = lidx_archive.to_sections();
-                let si_bytes = bincode::serialize(&string_index).ok();
+                let string_archive = StringIndexArchive::from_index(&string_index);
+                let si_bytes = string_archive.to_sections();
+                let has_string_index = !string_archive.view().is_empty();
                 eprintln!(
                     "[index] serialization done: p2={}B scan={}B lidx={}B",
                     p2_bytes.len(),
@@ -877,13 +937,10 @@ impl super::TraceEngine {
                         .map_err(|e| TraceError::Internal(e.to_string()))?;
 
                     let total_lines = scan_result.line_index.total_lines();
-                    let has_string_index = !string_index.strings.is_empty();
-
                     state.total_lines = total_lines;
                     state.trace_format = scan_result.format;
 
-                    state.call_tree = Some(call_tree);
-                    state.string_index = Some(string_index);
+                    state.string_index = Some(CachedStore::Owned(string_archive));
                     state.reg_last_def = Some(reg_last_def);
                     state.phase2_store = Some(CachedStore::Owned(phase2_archive));
                     state.scan_store = Some(CachedStore::Owned(scan_archive));
@@ -915,19 +972,21 @@ impl super::TraceEngine {
                 // 4. 同步写缓存
                 eprintln!("[index] writing cache files...");
                 let data_for_cache: &[u8] = &mmap_arc;
-                cache::save_sections_raw(&fp, data_for_cache, ".p2.cache", &p2_bytes);
+                cache::save_sections_raw(&fp, data_for_cache, ".p2v2.cache", &p2_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".scan.cache", &scan_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".lidx.cache", &lidx_bytes);
-                if let Some(ref si_b) = si_bytes {
-                    cache::save_bincode_raw(&fp, data_for_cache, ".strings", si_b);
+                if has_string_index {
+                    cache::save_sections_raw(&fp, data_for_cache, ".strings.cache", &si_bytes);
                 }
                 if let Some((ref anns, ref seqs)) = gum_extra {
                     cache::save_gumtrace_extra(&fp, data_for_cache, anns, seqs);
                 }
 
+                let final_fingerprint = TraceFingerprint::from_file(std::path::Path::new(&fp))
+                    .map_err(TraceError::Io)?;
                 if let Some(path) = cache::index_manifest_path(&fp) {
                     let mut manifest = IndexManifest::new(
-                        TraceFingerprint::from_bytes(data_for_cache),
+                        final_fingerprint.clone(),
                         fp.clone(),
                         format!("{:?}", scan_result.format),
                     );
@@ -955,11 +1014,10 @@ impl super::TraceEngine {
                         eprintln!("[index] failed to save manifest atomically: {}", e);
                     }
                 }
-                if let Some(dir) =
-                    cache::checkpoint_dir(&fp, &TraceFingerprint::from_bytes(data_for_cache))
-                {
+                if let Some(dir) = cache::checkpoint_dir(&fp, &final_fingerprint) {
                     let _ = std::fs::remove_dir_all(dir);
                 }
+                cache::release_mapped_file_pages(&mmap_arc);
                 eprintln!("[index] cache save complete");
 
                 Ok(BuildResult {

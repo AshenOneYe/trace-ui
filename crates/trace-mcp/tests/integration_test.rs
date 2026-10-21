@@ -120,6 +120,58 @@ fn test_base_index_supports_browse_with_explicit_partial_stages() {
 }
 
 #[test]
+fn test_base_index_builds_window_local_strings_tree_and_segments() {
+    let engine = Arc::new(TraceEngine::new());
+    let temp_dir = std::env::temp_dir().join(format!(
+        "trace-ui-lazy-window-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let temp_trace = temp_dir.join("trace.log");
+    std::fs::copy(get_trace_path(), &temp_trace).unwrap();
+    let session = engine
+        .create_session(temp_trace.to_str().unwrap())
+        .expect("create_session");
+    let sid = session.session_id;
+    let build = engine
+        .build_base_index(&sid, true, None)
+        .expect("base index");
+
+    let strings = engine
+        .get_strings(
+            &sid,
+            trace_core::StringQueryOptions {
+                min_len: 2,
+                offset: 0,
+                limit: 50,
+                search: None,
+                seq_start: Some(0),
+                seq_end: Some(build.total_lines.saturating_sub(1)),
+            },
+        )
+        .expect("lazy strings");
+    assert!(strings.lazy_window);
+    assert_eq!(strings.scope, "lazy_seq_window");
+
+    let tree = engine
+        .get_call_tree_window(&sid, 0, build.total_lines.saturating_sub(1))
+        .expect("lazy call tree");
+    assert!(!tree.is_empty());
+
+    let segments = engine.get_trace_segments(&sid, 16).expect("segments");
+    assert_eq!(segments.first().unwrap().start_seq, 0);
+    assert!(segments.last().unwrap().end_seq + 1 >= build.total_lines);
+
+    engine.close_session(&sid).unwrap();
+    engine.delete_file_cache(temp_trace.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn test_phase2_index_completes_functions_and_memory_but_not_dependencies() {
     let engine = Arc::new(TraceEngine::new());
     let temp_dir = std::env::temp_dir().join(format!(

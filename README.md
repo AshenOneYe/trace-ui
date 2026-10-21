@@ -79,7 +79,7 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 | 类别 | 工具 |
 |------|------|
 | 会话 | `open_trace` |
-| 浏览 | `get_trace_lines`、`get_memory`、`mem_summary`、`watch_slots` |
+| 浏览 | `get_trace_lines`、`get_memory`、`mem_summary`、`watch_slots`、`get_trace_segments` |
 | 搜索 | `search_instructions` |
 | 污点分析 | `taint_analysis`、`get_tainted_lines` |
 | 结构 | `get_call_tree`、`analyze_function`、`get_strings` |
@@ -91,7 +91,8 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 | VM 分析 | `detect_vm_regions`、`get_vm_handlers`、`vm_trace`、`cluster_vm_handlers`、`get_vm_artifacts`、`compare_vm_traces` |
 | 假设修正 | `get_vm_hypotheses`、`validate_vm_hypothesis`、`set_vm_override`、`undo_vm_override`、`redo_vm_override`、`get_analysis_conflicts`、`reanalyze_affected` |
 | Agent 工作区 | `get_analysis_workspace`、`add_analysis_note`、`add_open_question`、`resolve_open_question`、`add_verified_conclusion` |
-| 资源预算 | `get_resource_budgets`、`set_resource_budgets` |
+| 资源预算 | `get_resource_budgets`、`set_resource_budgets`、`memory_status` |
+| 缓存维护 | `cleanup_cache` |
 
 > 详细的工具说明、实战场景和使用指南请参考 [MCP 使用指南](docs/mcp-guide.md)
 >
@@ -101,7 +102,9 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 
 ### 大规模 Trace 浏览
 
-基于 mmap 内存映射 + 虚拟滚动实现，仅渲染可见区域的数十行，无论 trace 文件有多大，内存占用和渲染性能保持恒定。首次打开 2400 万行 trace 索引构建约 15 秒，构建完成后自动缓存，再次打开同一文件秒级加载。
+基于 mmap 内存映射 + 虚拟滚动实现，仅渲染可见区域的数十行。默认内存预算为 2 GiB，并会继续受当前可用内存和安全余量约束。超出完整索引预算时，`open_trace` 默认进入 lite 模式：只建立分段行检查点，不预先构建字符串和函数树；窗口级字符串、调用树和虚拟分段查询可按需构建。
+
+字符串与调用树缓存使用列式 section 数据和 mmap 查询，常驻堆内存不再随索引条目数线性增长。大文件行检查点按 32 MiB 分块扫描并及时释放映射页，使冷构建的峰值 RSS 与 trace 文件大小解耦。索引构建完成后自动缓存，再次打开同一文件通常为毫秒级。
 
 支持文本搜索和正则表达式搜索（`/pattern/` 语法），搜索结果列表可点击跳转，支持导航历史前进/后退（macOS: `Ctrl+⌘+←/→`，Windows: `Ctrl+Alt+←/→`）。
 
@@ -309,7 +312,7 @@ claude mcp add trace-ui --transport http http://127.0.0.1:19821/mcp
 | `trace-mcp` | MCP 协议层，将 trace-core 的能力通过 10 个 MCP 工具暴露，支持 HTTP/SSE 和 Stdio 两种传输 |
 | `trace-cli` | 独立 MCP Server 入口，供 AI 客户端直接调用 |
 
-**后端**：通过 mmap 零拷贝映射 trace 文件，一遍扫描生成依赖图、调用树、内存访问索引和寄存器检查点，全部通过 bincode 持久化缓存。污点切片采用 BFS 反向传播算法，在预构建的依赖图上完成。
+**后端**：通过 mmap 零拷贝映射 trace 文件，一遍扫描生成依赖图、调用树、内存访问索引和寄存器检查点。主要索引使用定长 flat section + mmap；版本化 manifest 同时校验内容指纹、文件大小、mtime 和 inode。污点切片采用 BFS 反向传播算法，在预构建的依赖图上完成。
 
 **前端**：基于 @tanstack/react-virtual 实现虚拟滚动，Canvas 原生渲染实现 ARM64 语法高亮和 DEF→USE 箭头连线。多会话隔离设计，每个打开的文件拥有独立的分析状态。
 
@@ -424,11 +427,11 @@ Vite HMR + Rust 热重载，修改前端代码即时生效。
 
 **Q: 首次打开大文件很慢？**
 
-首次打开需要等待构建索引，构建完成后会自动缓存。再次打开同一文件可秒级加载。
+首次打开会建立行检查点；超出内存预算时自动进入 lite 模式。完整依赖索引可由 `start_analysis_job(kind="build_index")` 在后台续建。构建完成后会自动缓存，再次打开同一文件通常为毫秒级。
 
 **Q: 如何清除缓存？**
 
-通过菜单 `Settings → Clear Cache...` 清空所有缓存，或在 `Settings → Preferences → Cache` 中管理缓存目录和查看占用空间。也可通过 `Settings → Open Cache Directory` 在文件管理器中手动管理。
+通过菜单 `Settings → Clear Cache...` 清空所有缓存，或在 `Settings → Preferences → Cache` 中管理缓存目录和查看占用空间。也可通过 `Settings → Open Cache Directory` 在文件管理器中手动管理。MCP 的 `cleanup_cache` 默认只做 dry-run 并报告失效 trace 对应的孤儿缓存；确认后再以 `dry_run=false` 删除。
 
 **Q: 支持哪些平台？**
 

@@ -562,12 +562,37 @@ impl TraceToolHandler {
                 .map_err(|e| format!("Failed to open trace: {}", e))?;
 
             let session_id = session.session_id.clone();
-            let options = BuildOptions {
-                force_rebuild: req.force_rebuild,
-                skip_strings: req.skip_strings,
+            let budgets = engine
+                .get_resource_budgets()
+                .map_err(|e| e.to_string())?;
+            let estimated_index_memory =
+                budgets.estimated_index_memory_bytes(session.file_size);
+            let memory_status = engine.get_memory_status();
+            let memory_budget = memory_status.effective_memory_limit_bytes;
+            let lite_mode = budgets.should_use_lite_index(session.file_size)
+                || estimated_index_memory > memory_budget;
+            if lite_mode && !req.allow_lite {
+                let _ = engine.close_session(&session_id);
+                return Err(format!(
+                    "estimated index memory {} exceeds budget {}; set allow_lite=true or raise resource budgets",
+                    estimated_index_memory, memory_budget
+                ));
+            }
+
+            let build_result = if lite_mode {
+                engine.build_base_index(&session_id, req.force_rebuild, None)
+            } else {
+                engine.build_index(
+                    &session_id,
+                    BuildOptions {
+                        force_rebuild: req.force_rebuild,
+                        skip_strings: req.skip_strings,
+                    },
+                    None,
+                )
             };
 
-            match engine.build_index(&session_id, options, None) {
+            match build_result {
                 Ok(build) => {
                     // Extract additional info (graceful fallback on failure)
                     let module_name = engine
@@ -587,6 +612,7 @@ impl TraceToolHandler {
 
                     let call_tree_nodes = engine.get_call_tree_node_count(&session_id).ok();
                     let function_count = call_tree_nodes;
+                    let memory_after = engine.get_memory_status();
 
                     Ok(json(&serde_json::json!({
                         "session_id": session_id,
@@ -601,6 +627,16 @@ impl TraceToolHandler {
                         "function_count": function_count,
                         "call_tree_nodes": call_tree_nodes,
                         "function_count_semantics": "call_tree_nodes",
+                        "lite_mode": lite_mode,
+                        "estimated_index_memory": estimated_index_memory,
+                        "memory_budget": memory_budget,
+                        "configured_memory_budget": budgets.max_memory_bytes,
+                        "process_rss_bytes": memory_after.process_rss_bytes,
+                        "peak_rss_bytes": memory_after.process_peak_rss_bytes,
+                        "available_memory_bytes": memory_after.available_memory_bytes,
+                        "lite_reason": lite_mode.then_some(
+                            "estimated index memory exceeds the effective memory budget; only base checkpoints/lines were built"
+                        ),
                     })))
                 }
                 Err(e) => {
@@ -627,6 +663,18 @@ impl TraceToolHandler {
             .get_index_status(&sid)
             .map_err(|e| e.to_string())?;
         Ok(json(&status))
+    }
+
+    #[tool(
+        name = "cleanup_cache",
+        description = "Remove cache files, manifests and checkpoint directories whose original trace \
+            no longer exists. Defaults to dry_run=true and reports reclaimable bytes first."
+    )]
+    async fn cleanup_cache(
+        &self,
+        Parameters(req): Parameters<CleanupCacheRequest>,
+    ) -> Result<String, String> {
+        blocking(move || Ok(json(&trace_core::cache::cleanup_orphan_caches(req.dry_run)))).await
     }
 
     #[tool(
@@ -836,12 +884,23 @@ impl TraceToolHandler {
             queries and background priority."
     )]
     fn get_resource_budgets(&self) -> Result<String, String> {
-        Ok(json(
-            &self
+        Ok(json(&serde_json::json!({
+            "budgets": self
                 .engine
                 .get_resource_budgets()
                 .map_err(|e| e.to_string())?,
-        ))
+            "memory": self.engine.get_memory_status(),
+            "cache": self.engine.get_cache_dir(),
+        })))
+    }
+
+    #[tool(
+        name = "memory_status",
+        description = "Return current RSS, peak RSS, reclaimable system memory, effective memory cap, \
+            safety reserve and memory-pressure state. The watchdog samples every 500 ms."
+    )]
+    fn memory_status(&self) -> Result<String, String> {
+        Ok(json(&self.engine.get_memory_status()))
     }
 
     #[tool(
@@ -2326,6 +2385,7 @@ impl TraceToolHandler {
         name = "get_call_tree",
         description = "Get the function call tree rooted at a specific node. \
             Use node_id=0 to start from the root. depth controls expansion levels (1-3). \
+            In lite mode, pass seq_range to build a bounded window-local tree. \
             Returns nodes array, count, total_node_count (full tree size), and depth used. \
             Each node contains: function address, name, entry/exit line numbers, and child node IDs."
     )]
@@ -2334,6 +2394,26 @@ impl TraceToolHandler {
         Parameters(req): Parameters<GetCallTreeRequest>,
     ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
+        if let Some(ref range) = req.seq_range {
+            let (start, end) = parse_seq_range(range)?;
+            let nodes = self
+                .engine
+                .get_call_tree_window(&sid, start, end)
+                .map_err(|e| e.to_string())?;
+            let total_count = nodes.len();
+            let page: Vec<_> = nodes.into_iter().take(500).collect();
+            let count = page.len();
+            return Ok(json(&serde_json::json!({
+                "nodes": page,
+                "count": count,
+                "total_node_count": total_count,
+                "depth": req.depth.min(3).max(1),
+                "scope": "lazy_seq_window",
+                "seq_start": start,
+                "seq_end": end,
+                "hint": "This is a window-local call tree. Calls crossing the window boundary may be incomplete; narrow the window or build the full index for exact global topology.",
+            })));
+        }
         let depth = req.depth.min(3).max(1);
         let max_nodes: u32 = 500;
         let nodes = self.collect_tree_to_depth(&sid, req.node_id, depth, max_nodes)?;
@@ -2348,10 +2428,35 @@ impl TraceToolHandler {
     }
 
     #[tool(
+        name = "get_trace_segments",
+        description = "List stable virtual seq/byte segments for a trace. Segments are views over the \
+            same mmap session, so callers can query windows independently with get_trace_lines, \
+            search_instructions, get_strings or get_call_tree and merge results by seq."
+    )]
+    fn get_trace_segments(
+        &self,
+        Parameters(req): Parameters<GetTraceSegmentsRequest>,
+    ) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let segments = self
+            .engine
+            .get_trace_segments(&sid, req.segment_lines)
+            .map_err(|e| e.to_string())?;
+        Ok(json(&serde_json::json!({
+            "session_id": sid,
+            "segment_lines": req.segment_lines.max(1),
+            "count": segments.len(),
+            "segments": segments,
+            "hint": "Pass each segment's start_seq-end_seq as seq_range to windowed string/call-tree queries or search_instructions.",
+        })))
+    }
+
+    #[tool(
         name = "get_strings",
         description = "List runtime strings found in the trace. \
             These are strings observed in memory during execution. \
             Supports filtering by minimum length and search query. \
+            Lite sessions build strings only for the requested seq_range window. \
             Each string includes its memory address, content, encoding, and access type."
     )]
     fn get_strings(
@@ -2385,6 +2490,10 @@ impl TraceToolHandler {
             "total": result.total,
             "offset": req.offset,
             "has_more": (req.offset as u64 + result.strings.len() as u64) < result.total,
+            "scope": result.scope,
+            "lazy_window": result.lazy_window,
+            "seq_start": result.seq_start,
+            "seq_end": result.seq_end,
         });
         if has_results {
             response["hint"] = serde_json::json!("Use search_instructions with the string's memory address to find which instructions access it.");
@@ -2538,20 +2647,46 @@ impl TraceToolHandler {
         description = "Analyze functions. Three modes: \
             (1) node_id: detailed analysis of one call with entry args (X0-X7) and return value (X0). \
             (2) func_name: search call tree nodes by name substring or hex address substring. \
-            (3) No arguments: list call tree nodes with pagination, sorted by line_count descending."
+            (3) No arguments: list call tree nodes with pagination, sorted by line_count descending. \
+            In lite mode, pass seq_range to operate on a bounded window-local tree."
     )]
     fn analyze_function(
         &self,
         Parameters(req): Parameters<AnalyzeFunctionRequest>,
     ) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
+        let lazy_nodes = req
+            .seq_range
+            .as_ref()
+            .map(|range| {
+                let (start, end) = parse_seq_range(range)?;
+                self.engine
+                    .get_call_tree_window(&sid, start, end)
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()?;
 
         if let Some(node_id) = req.node_id {
             // Mode 1: 按 node_id 分析函数调用详情
-            let nodes = self
-                .engine
-                .get_call_tree_children(&sid, node_id, true)
-                .map_err(|e| e.to_string())?;
+            let nodes = if let Some(local) = lazy_nodes.as_ref() {
+                let mut nodes = local
+                    .iter()
+                    .find(|node| node.id == node_id)
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                nodes.extend(
+                    local
+                        .iter()
+                        .filter(|node| node.parent_id == Some(node_id))
+                        .cloned(),
+                );
+                nodes
+            } else {
+                self.engine
+                    .get_call_tree_children(&sid, node_id, true)
+                    .map_err(|e| e.to_string())?
+            };
             let node = nodes
                 .first()
                 .ok_or_else(|| format!("Node {} not found", node_id))?;
@@ -2609,7 +2744,11 @@ impl TraceToolHandler {
             })))
         } else if let Some(ref func_name) = req.func_name {
             // Mode 2: 按名称或地址搜索调用树节点
-            let nodes = self.engine.get_call_tree(&sid).map_err(|e| e.to_string())?;
+            let nodes = if let Some(local) = lazy_nodes.as_ref() {
+                local.clone()
+            } else {
+                self.engine.get_call_tree(&sid).map_err(|e| e.to_string())?
+            };
 
             let mut matched: Vec<_> = nodes
                 .iter()
@@ -2649,7 +2788,11 @@ impl TraceToolHandler {
             })))
         } else {
             // Mode 3: list call tree nodes, hottest functions first
-            let nodes = self.engine.get_call_tree(&sid).map_err(|e| e.to_string())?;
+            let nodes = if let Some(local) = lazy_nodes.as_ref() {
+                local.clone()
+            } else {
+                self.engine.get_call_tree(&sid).map_err(|e| e.to_string())?
+            };
             let mut entries: Vec<_> = nodes.iter().filter(|node| node.id != 0).collect();
             entries.sort_by(|a, b| {
                 b.line_count

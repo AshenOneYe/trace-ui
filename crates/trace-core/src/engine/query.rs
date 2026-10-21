@@ -7,9 +7,9 @@ use rustc_hash::FxHashSet;
 use crate::api_types::*;
 use crate::browse::{parse_trace_line, parse_trace_line_gumtrace};
 use crate::error::{Result, TraceError};
+use crate::flat::call_tree::CallTreeNodeView;
 use crate::flat::line_index::LineIndexView;
 use crate::phase2::extract_insn_offset;
-use crate::query::call_tree::CallTreeNode;
 use crate::query::crypto::CryptoScanResult;
 use crate::query::strings::{StringBuilder, StringEncoding, StringRw};
 use trace_parser::types::{parse_reg, RegId, TraceFormat};
@@ -84,37 +84,37 @@ struct MemBucketAcc {
 
 /// 将 CallTreeNode 转为 DTO
 fn node_to_dto(
-    n: &CallTreeNode,
+    n: &CallTreeNodeView<'_>,
     line_index: Option<&LineIndexView<'_>>,
     data: &[u8],
 ) -> CallTreeNodeDto {
     let func_addr = {
         if let Some(li) = line_index {
-            if let Some(line_bytes) = li.get_line(data, n.entry_seq) {
+            if let Some(line_bytes) = li.get_line(data, n.entry_seq()) {
                 if let Ok(line_str) = std::str::from_utf8(line_bytes) {
                     let offset = extract_insn_offset(line_str);
                     if offset != 0 {
                         format!("0x{:x}", offset)
                     } else {
-                        format!("0x{:x}", n.func_addr)
+                        format!("0x{:x}", n.func_addr())
                     }
                 } else {
-                    format!("0x{:x}", n.func_addr)
+                    format!("0x{:x}", n.func_addr())
                 }
             } else {
-                format!("0x{:x}", n.func_addr)
+                format!("0x{:x}", n.func_addr())
             }
         } else {
-            format!("0x{:x}", n.func_addr)
+            format!("0x{:x}", n.func_addr())
         }
     };
 
-    let func_name = n.func_name.clone().or_else(|| {
-        if n.func_addr == 0 {
+    let func_name = n.func_name.map(str::to_string).or_else(|| {
+        if n.func_addr() == 0 {
             None
         } else {
             let address = if func_addr == "0x0" {
-                format!("{:x}", n.func_addr)
+                format!("{:x}", n.func_addr())
             } else {
                 func_addr.trim_start_matches("0x").to_string()
             };
@@ -126,12 +126,12 @@ fn node_to_dto(
         id: n.id,
         func_addr,
         func_name,
-        entry_seq: n.entry_seq,
-        exit_seq: n.exit_seq,
-        parent_id: n.parent_id,
-        children_ids: n.children_ids.clone(),
-        line_count: n.exit_seq.saturating_sub(n.entry_seq) + 1,
-        call_count: n.call_count,
+        entry_seq: n.entry_seq(),
+        exit_seq: n.exit_seq(),
+        parent_id: n.parent_id(),
+        children_ids: n.children_ids.to_vec(),
+        line_count: n.exit_seq().saturating_sub(n.entry_seq()) + 1,
+        call_count: n.call_count(),
     }
 }
 
@@ -1133,15 +1133,14 @@ impl super::TraceEngine {
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let call_tree = state.call_tree.as_ref().ok_or(TraceError::IndexNotReady)?;
+        let call_tree = state.call_tree_view().ok_or(TraceError::IndexNotReady)?;
 
         let data: &[u8] = &state.mmap;
         let line_index = state.line_index_view();
 
         let nodes: Vec<CallTreeNodeDto> = call_tree
-            .nodes
             .iter()
-            .map(|n| node_to_dto(n, line_index.as_ref(), data))
+            .map(|n| node_to_dto(&n, line_index.as_ref(), data))
             .collect();
 
         Ok(nodes)
@@ -1159,25 +1158,24 @@ impl super::TraceEngine {
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let call_tree = state.call_tree.as_ref().ok_or(TraceError::IndexNotReady)?;
+        let call_tree = state.call_tree_view().ok_or(TraceError::IndexNotReady)?;
 
         let data: &[u8] = &state.mmap;
         let line_index = state.line_index_view();
 
         let node = call_tree
-            .nodes
-            .get(node_id as usize)
+            .node(node_id)
             .ok_or_else(|| TraceError::InvalidArgument(format!("节点 {} 不存在", node_id)))?;
 
         let mut result = Vec::new();
 
         if include_self {
-            result.push(node_to_dto(node, line_index.as_ref(), data));
+            result.push(node_to_dto(&node, line_index.as_ref(), data));
         }
 
-        for &child_id in &node.children_ids {
-            if let Some(child) = call_tree.nodes.get(child_id as usize) {
-                result.push(node_to_dto(child, line_index.as_ref(), data));
+        for &child_id in node.children_ids {
+            if let Some(child) = call_tree.node(child_id) {
+                result.push(node_to_dto(&child, line_index.as_ref(), data));
             }
         }
 
@@ -1191,9 +1189,116 @@ impl super::TraceEngine {
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let call_tree = state.call_tree.as_ref().ok_or(TraceError::IndexNotReady)?;
+        let call_tree = state.call_tree_view().ok_or(TraceError::IndexNotReady)?;
 
-        Ok(call_tree.nodes.len() as u32)
+        Ok(call_tree.node_count() as u32)
+    }
+
+    pub fn get_call_tree_window(
+        &self,
+        session_id: &str,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> Result<Vec<CallTreeNodeDto>> {
+        const MAX_WINDOW_LINES: u64 = 262_144;
+        if start_seq > end_seq {
+            return Err(TraceError::InvalidArgument(
+                "seq_range start must be <= end".to_string(),
+            ));
+        }
+        if end_seq.saturating_sub(start_seq) + 1 > MAX_WINDOW_LINES {
+            return Err(TraceError::ResourceBudgetExceeded(format!(
+                "call-tree window spans {} lines; maximum is {}",
+                end_seq.saturating_sub(start_seq) + 1,
+                MAX_WINDOW_LINES
+            )));
+        }
+        let _lease = self.acquire_query_lease()?;
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        if let Some(tree) = state.call_tree_view() {
+            let data: &[u8] = &state.mmap;
+            let line_index = state.line_index_view();
+            return Ok(tree
+                .iter()
+                .filter(|node| node.entry_seq() <= end_seq && node.exit_seq() >= start_seq)
+                .map(|node| node_to_dto(&node, line_index.as_ref(), data))
+                .collect());
+        }
+        let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
+        let start_seq = start_seq.min(line_index.total_lines().saturating_sub(1));
+        let end_seq = end_seq.min(line_index.total_lines().saturating_sub(1));
+        let start_byte = line_index
+            .line_byte_offset(&state.mmap, start_seq)
+            .ok_or_else(|| TraceError::InvalidArgument("invalid seq_range".to_string()))?
+            as usize;
+        let end_byte = line_index
+            .line_byte_offset(&state.mmap, end_seq.saturating_add(1))
+            .map(|offset| offset as usize)
+            .unwrap_or(state.mmap.len());
+        let estimate = (end_byte.saturating_sub(start_byte)).saturating_mul(2);
+        self.memory_watchdog
+            .ensure_capacity(estimate as u64)
+            .map_err(TraceError::ResourceBudgetExceeded)?;
+        let mut phase2 = crate::phase2::build_phase2(&state.mmap[start_byte..end_byte], None);
+        for node in &mut phase2.call_tree.nodes {
+            node.entry_seq = node.entry_seq.saturating_add(start_seq);
+            if node.exit_seq != u64::MAX {
+                node.exit_seq = node.exit_seq.saturating_add(start_seq);
+            }
+        }
+        let archive = crate::flat::call_tree::CallTreeArchive::from_tree(&phase2.call_tree);
+        let view = archive.view();
+        Ok(view
+            .iter()
+            .map(|node| node_to_dto(&node, Some(&line_index), &state.mmap))
+            .collect())
+    }
+
+    pub fn get_trace_segments(
+        &self,
+        session_id: &str,
+        segment_lines: u64,
+    ) -> Result<Vec<TraceSegmentDto>> {
+        let segment_lines = segment_lines.max(1);
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
+        let total = line_index.total_lines();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+        let mut segments =
+            Vec::with_capacity(((total + segment_lines - 1) / segment_lines) as usize);
+        let mut start = 0u64;
+        while start < total {
+            let end = start
+                .saturating_add(segment_lines)
+                .min(total)
+                .saturating_sub(1);
+            let start_byte = line_index
+                .line_byte_offset(&state.mmap, start)
+                .unwrap_or(state.mmap.len() as u64);
+            let end_byte = line_index
+                .line_byte_offset(&state.mmap, end.saturating_add(1))
+                .unwrap_or(state.mmap.len() as u64);
+            segments.push(TraceSegmentDto {
+                index: segments.len() as u32,
+                start_seq: start,
+                end_seq: end,
+                start_byte,
+                end_byte,
+                line_count: end.saturating_sub(start).saturating_add(1),
+            });
+            start = end.saturating_add(1);
+        }
+        Ok(segments)
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━ Strings ━━━━━━━━━━━━━━━━━━━━━━
@@ -1204,29 +1309,38 @@ impl super::TraceEngine {
         options: StringQueryOptions,
     ) -> Result<StringsResult> {
         let handle = self.get_handle(session_id)?;
+        let has_string_index = {
+            let state = handle
+                .state
+                .read()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            state
+                .string_index_view()
+                .is_some_and(|index| !index.is_empty())
+        };
+        if !has_string_index {
+            return self.get_strings_lazy_window(session_id, options);
+        }
         let state = handle
             .state
             .read()
             .map_err(|e| TraceError::Internal(e.to_string()))?;
 
-        let string_index = state
-            .string_index
-            .as_ref()
-            .ok_or(TraceError::IndexNotReady)?;
+        let string_index = state.string_index_view().ok_or(TraceError::IndexNotReady)?;
 
         let search_lower = options.search.as_ref().map(|s| s.to_lowercase());
 
-        let filtered: Vec<(usize, &crate::query::strings::StringRecord)> = string_index
-            .strings
+        let filtered: Vec<_> = string_index
             .iter()
-            .enumerate()
-            .filter(|(_, r)| r.byte_len >= options.min_len)
-            .filter(|(_, r)| {
-                options.seq_start.map_or(true, |start| r.seq >= start)
-                    && options.seq_end.map_or(true, |end| r.seq <= end)
+            .filter(|record| record.byte_len() >= options.min_len)
+            .filter(|record| {
+                options
+                    .seq_start
+                    .map_or(true, |start| record.seq() >= start)
+                    && options.seq_end.map_or(true, |end| record.seq() <= end)
             })
-            .filter(|(_, r)| match &search_lower {
-                Some(q) => r.content.to_lowercase().contains(q.as_str()),
+            .filter(|record| match &search_lower {
+                Some(q) => record.content.to_lowercase().contains(q.as_str()),
                 None => true,
             })
             .collect();
@@ -1236,18 +1350,18 @@ impl super::TraceEngine {
             .into_iter()
             .skip(options.offset as usize)
             .take(options.limit as usize)
-            .map(|(idx, r)| StringRecordDto {
-                idx: idx as u64,
-                addr: format!("0x{:x}", r.addr),
-                content: r.content.clone(),
-                encoding: match r.encoding {
+            .map(|record| StringRecordDto {
+                idx: record.index as u64,
+                addr: format!("0x{:x}", record.addr()),
+                content: record.content.to_string(),
+                encoding: match record.encoding() {
                     StringEncoding::Ascii => "ASCII".to_string(),
                     StringEncoding::Utf8 => "UTF-8".to_string(),
                 },
-                byte_len: r.byte_len,
-                seq: r.seq,
-                xref_count: r.xref_count,
-                rw: match r.rw {
+                byte_len: record.byte_len(),
+                seq: record.seq(),
+                xref_count: record.xref_count(),
+                rw: match record.rw() {
                     StringRw::Read => "R".to_string(),
                     StringRw::Write => "W".to_string(),
                 },
@@ -1257,6 +1371,147 @@ impl super::TraceEngine {
         Ok(StringsResult {
             strings: page,
             total,
+            scope: "full_index".to_string(),
+            lazy_window: false,
+            seq_start: None,
+            seq_end: None,
+        })
+    }
+
+    fn get_strings_lazy_window(
+        &self,
+        session_id: &str,
+        options: StringQueryOptions,
+    ) -> Result<StringsResult> {
+        const MAX_WINDOW_LINES: u64 = 262_144;
+        let (Some(seq_start), Some(seq_end)) = (options.seq_start, options.seq_end) else {
+            return Err(TraceError::InvalidArgument(
+                "this session has no global string index; pass seq_range to get_strings so the \
+                 window-local string index can be built on demand"
+                    .to_string(),
+            ));
+        };
+        if seq_start > seq_end {
+            return Err(TraceError::InvalidArgument(
+                "seq_range start must be <= end".to_string(),
+            ));
+        }
+        if seq_end.saturating_sub(seq_start) + 1 > MAX_WINDOW_LINES {
+            return Err(TraceError::ResourceBudgetExceeded(format!(
+                "lazy string window spans {} lines; maximum is {}",
+                seq_end.saturating_sub(seq_start) + 1,
+                MAX_WINDOW_LINES
+            )));
+        }
+        let _lease = self.acquire_query_lease()?;
+        let handle = self.get_handle(session_id)?;
+        let state = handle
+            .state
+            .read()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let line_index = state.line_index_view().ok_or(TraceError::IndexNotReady)?;
+        let data: &[u8] = &state.mmap;
+        let end = seq_end.min(line_index.total_lines().saturating_sub(1));
+        let mut builder = StringBuilder::new();
+        let mut read_counts: rustc_hash::FxHashMap<u64, u32> = rustc_hash::FxHashMap::default();
+
+        for seq in seq_start..=end {
+            let Some(raw) = line_index.get_line(data, seq) else {
+                continue;
+            };
+            let Ok(line) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            let Some(parsed) = parser::parse_line(line) else {
+                continue;
+            };
+            let Some(mem_op) = parsed.mem_op.as_ref() else {
+                continue;
+            };
+            let rw = if mem_op.is_write {
+                StringRw::Write
+            } else {
+                StringRw::Read
+            };
+            let mut feed = |addr: u64, value: Option<u64>, size: u8| {
+                let Some(value) = value else {
+                    return;
+                };
+                if !mem_op.is_write {
+                    *read_counts.entry(addr).or_default() += 1;
+                }
+                if size <= 8 {
+                    builder.process_access(addr, value, size, seq, rw);
+                }
+            };
+            if mem_op.elem_width <= 8 {
+                feed(mem_op.abs, mem_op.value, mem_op.elem_width);
+                if let Some(value2) = mem_op.value2 {
+                    feed(
+                        mem_op.abs + mem_op.elem_width as u64,
+                        Some(value2),
+                        mem_op.elem_width,
+                    );
+                }
+            } else if mem_op.elem_width == 16 {
+                feed(mem_op.abs, mem_op.value_lo, 8);
+                feed(mem_op.abs + 8, mem_op.value_hi, 8);
+                feed(mem_op.abs + 16, mem_op.value2_lo, 8);
+                feed(mem_op.abs + 24, mem_op.value2_hi, 8);
+            }
+        }
+
+        let mut index = builder.finish();
+        for record in &mut index.strings {
+            record.xref_count = (0..record.byte_len as u64)
+                .map(|offset| {
+                    read_counts
+                        .get(&(record.addr + offset))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .fold(0u32, u32::saturating_add);
+        }
+        let search_lower = options.search.as_ref().map(|value| value.to_lowercase());
+        let matched: Vec<_> = index
+            .strings
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.byte_len >= options.min_len)
+            .filter(|(_, record)| match &search_lower {
+                Some(query) => record.content.to_lowercase().contains(query),
+                None => true,
+            })
+            .collect();
+        let total = matched.len() as u64;
+        let page = matched
+            .into_iter()
+            .skip(options.offset as usize)
+            .take(options.limit as usize)
+            .map(|(index, record)| StringRecordDto {
+                idx: index as u64,
+                addr: format!("0x{:x}", record.addr),
+                content: record.content.clone(),
+                encoding: match record.encoding {
+                    StringEncoding::Ascii => "ASCII".to_string(),
+                    StringEncoding::Utf8 => "UTF-8".to_string(),
+                },
+                byte_len: record.byte_len,
+                seq: record.seq,
+                xref_count: record.xref_count,
+                rw: match record.rw {
+                    StringRw::Read => "R".to_string(),
+                    StringRw::Write => "W".to_string(),
+                },
+            })
+            .collect();
+        Ok(StringsResult {
+            strings: page,
+            total,
+            scope: "lazy_seq_window".to_string(),
+            lazy_window: true,
+            seq_start: Some(seq_start),
+            seq_end: Some(end),
         })
     }
 
@@ -1347,6 +1602,10 @@ impl super::TraceEngine {
                     .read()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
                 let mem_view = state.mem_accesses_view().ok_or(TraceError::IndexNotReady)?;
+                let estimated = (mem_view.total_records().saturating_mul(40)).max(16 * 1024 * 1024);
+                self.memory_watchdog
+                    .ensure_capacity(estimated as u64)
+                    .map_err(TraceError::ResourceBudgetExceeded)?;
 
                 accesses = Vec::new();
                 for (addr, rec) in mem_view.iter_all() {
@@ -1390,12 +1649,19 @@ impl super::TraceEngine {
 
             // 6. Write results and update cache
             {
+                let archive = crate::flat::strings::StringIndexArchive::from_index(&string_index);
+                let archive_bytes = archive.to_sections();
                 let mut state = handle
                     .state
                     .write()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
-                crate::cache::save_string_cache(&state.file_path, &state.mmap, &string_index);
-                state.string_index = Some(string_index);
+                crate::cache::save_sections_raw(
+                    &state.file_path,
+                    &state.mmap,
+                    ".strings.cache",
+                    &archive_bytes,
+                );
+                state.string_index = Some(crate::flat::archives::CachedStore::Owned(archive));
             }
 
             {
@@ -1404,8 +1670,12 @@ impl super::TraceEngine {
                     .read()
                     .map_err(|e| TraceError::Internal(e.to_string()))?;
                 if let Some(path) = crate::cache::index_manifest_path(&state.file_path) {
-                    let fingerprint =
-                        crate::index_manifest::TraceFingerprint::from_bytes(&state.mmap);
+                    let fingerprint = crate::index_manifest::TraceFingerprint::from_file(
+                        std::path::Path::new(&state.file_path),
+                    )
+                    .unwrap_or_else(|_| {
+                        crate::index_manifest::TraceFingerprint::from_bytes(&state.mmap)
+                    });
                     let mut manifest = crate::index_manifest::IndexManifest::load(&path)
                         .unwrap_or_else(|_| {
                             crate::index_manifest::IndexManifest::new(

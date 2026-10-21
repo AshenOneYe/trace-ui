@@ -1,4 +1,3 @@
-use crate::query::call_tree::CallTree;
 use crate::scanner::RegLastDef;
 use memmap2::Mmap;
 use std::sync::Arc;
@@ -6,6 +5,7 @@ use trace_parser::types::RegId;
 
 use super::bitvec::{BitView, FlatBitVec};
 use super::cache_format::{SectionReader, SectionWriter};
+use super::call_tree::{CallTreeArchive, CallTreeView};
 use super::deps::{DepsView, FlatDeps};
 use super::line_index::{LineIndexArchive, LineIndexView};
 use super::mem_access::{FlatMemAccess, MemAccessView};
@@ -13,6 +13,7 @@ use super::mem_last_def::{FlatMemLastDef, MemLastDefView};
 use super::pair_split::{FlatPairSplit, PairSplitView};
 use super::reg_checkpoints::{FlatRegCheckpoints, RegCheckpointsView};
 use super::scan_view::ScanView;
+use super::strings::{StringIndexArchive, StringIndexView};
 
 pub const HEADER_LEN: usize = 64;
 
@@ -21,7 +22,7 @@ pub const HEADER_LEN: usize = 64;
 pub struct Phase2Archive {
     pub mem_accesses: FlatMemAccess,
     pub reg_checkpoints: FlatRegCheckpoints,
-    pub call_tree: CallTree,
+    pub call_tree: CallTreeArchive,
 }
 
 impl Phase2Archive {
@@ -36,9 +37,8 @@ impl Phase2Archive {
         w.write_u64(self.reg_checkpoints.interval); // 3
         w.write_u64(self.reg_checkpoints.count); // 4
         w.write_slice(&self.reg_checkpoints.data); // 5
-                                                   // CallTree: section 6 (bincode, eagerly deserialized on load)
-        let ct_bytes = bincode::serialize(&self.call_tree).unwrap();
-        w.write_bytes(&ct_bytes); // 6
+                                                   // CallTree: fixed-width nodes + child IDs + name bytes (section 6)
+        w.write_bytes(&self.call_tree.to_sections());
         w.finish()
     }
 
@@ -52,7 +52,7 @@ impl Phase2Archive {
         Some(Phase2Views {
             mem_accesses: MemAccessView::from_raw(r.slice(0), r.slice(1), r.slice(2)),
             reg_checkpoints: RegCheckpointsView::from_raw(r.u64_val(3), r.u64_val(4), r.slice(5)),
-            call_tree_bytes: r.bytes(6),
+            call_tree: CallTreeArchive::views_from_sections(r.bytes(6))?,
         })
     }
 }
@@ -60,7 +60,7 @@ impl Phase2Archive {
 pub struct Phase2Views<'a> {
     pub mem_accesses: MemAccessView<'a>,
     pub reg_checkpoints: RegCheckpointsView<'a>,
-    pub call_tree_bytes: &'a [u8], // bincode bytes, deserialize on demand
+    pub call_tree: CallTreeView<'a>,
 }
 
 // ── ScanArchive ──────────────────────────────────────────────────────────────
@@ -195,13 +195,12 @@ impl CachedStore<Phase2Archive> {
         }
     }
 
-    pub fn deserialize_call_tree(&self) -> CallTree {
+    pub fn call_tree_view(&self) -> CallTreeView<'_> {
         match self {
-            Self::Owned(a) => a.call_tree.clone(),
+            Self::Owned(a) => a.call_tree.view(),
             Self::Mapped(mmap) => {
                 let views = Phase2Archive::views_from_sections(&mmap[HEADER_LEN..]).unwrap();
-                bincode::deserialize(views.call_tree_bytes)
-                    .expect("failed to deserialize CallTree from cache")
+                views.call_tree
             }
         }
     }
@@ -303,6 +302,16 @@ impl CachedStore<LineIndexArchive> {
             Self::Mapped(mmap) => {
                 LineIndexArchive::views_from_sections(&mmap[HEADER_LEN..]).unwrap()
             }
+        }
+    }
+}
+
+impl CachedStore<StringIndexArchive> {
+    pub fn string_index_view(&self) -> StringIndexView<'_> {
+        match self {
+            Self::Owned(archive) => archive.view(),
+            Self::Mapped(mmap) => StringIndexArchive::views_from_sections(&mmap[HEADER_LEN..])
+                .expect("invalid string index cache"),
         }
     }
 }

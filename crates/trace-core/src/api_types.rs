@@ -316,7 +316,7 @@ pub struct MemoryValueSearchResult {
 
 // ── Call Tree ──
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct CallTreeNodeDto {
     pub id: u32,
     pub func_addr: String,
@@ -358,6 +358,20 @@ pub struct StringRecordDto {
 pub struct StringsResult {
     pub strings: Vec<StringRecordDto>,
     pub total: u64,
+    pub scope: String,
+    pub lazy_window: bool,
+    pub seq_start: Option<u64>,
+    pub seq_end: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TraceSegmentDto {
+    pub index: u32,
+    pub start_seq: u64,
+    pub end_seq: u64,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub line_count: u64,
 }
 
 #[derive(Serialize)]

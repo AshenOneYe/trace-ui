@@ -1,4 +1,5 @@
 use crate::index_manifest::atomic_write_with;
+use crate::index_manifest::IndexManifest;
 use crate::query::strings::StringIndex;
 use memmap2::Mmap;
 use sha2::{Digest, Sha256};
@@ -227,15 +228,91 @@ fn load_cache_mmap(file_path: &str, data: &[u8], suffix: &str) -> Option<Arc<Mma
 // ── Section-based cache load ──
 
 pub fn load_phase2_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
-    load_cache_mmap(file_path, data, ".p2.cache")
+    let mmap = load_cache_mmap(file_path, data, ".p2v2.cache")?;
+    crate::flat::archives::Phase2Archive::views_from_sections(&mmap[HEADER_LEN_V4..])?;
+    Some(mmap)
 }
 
 pub fn load_scan_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
-    load_cache_mmap(file_path, data, ".scan.cache")
+    let mmap = load_cache_mmap(file_path, data, ".scan.cache")?;
+    crate::flat::archives::ScanArchive::views_from_sections(&mmap[HEADER_LEN_V4..])?;
+    Some(mmap)
 }
 
 pub fn load_lidx_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
-    load_cache_mmap(file_path, data, ".lidx.cache")
+    let mmap = load_cache_mmap(file_path, data, ".lidx.cache")?;
+    crate::flat::line_index::LineIndexArchive::views_from_sections(&mmap[HEADER_LEN_V4..])?;
+    Some(mmap)
+}
+
+pub fn load_string_index_cache(file_path: &str, data: &[u8]) -> Option<Arc<Mmap>> {
+    let mmap = load_cache_mmap(file_path, data, ".strings.cache")?;
+    crate::flat::strings::StringIndexArchive::views_from_sections(&mmap[HEADER_LEN_V4..])?;
+    Some(mmap)
+}
+
+/// Drop resident file-backed trace pages after bulk indexing.
+///
+/// The immutable mmap remains valid and pages fault back in on demand, while the
+/// process RSS returns close to the size of owned indexes instead of the full trace.
+pub fn release_mapped_file_pages(mmap: &Mmap) {
+    if mmap.is_empty() {
+        return;
+    }
+    // SAFETY: the mapping is read-only and we do not hold a borrow across the call.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let _ = libc::msync(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MS_INVALIDATE,
+        );
+        let _ = mmap.unchecked_advise(memmap2::UncheckedAdvice::FreeReusable);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+}
+
+pub fn release_mapped_file_range(mmap: &Mmap, start: usize, end: usize) {
+    let end = end.min(mmap.len());
+    if start >= end {
+        return;
+    }
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return;
+    }
+    let page_size = page_size as usize;
+    let aligned_start = start / page_size * page_size;
+    let aligned_end = ((end + page_size - 1) / page_size * page_size).min(mmap.len());
+    if aligned_start >= aligned_end {
+        return;
+    }
+    let length = aligned_end - aligned_start;
+    // SAFETY: the range is inside the mapping and both endpoints are page aligned.
+    unsafe {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = libc::msync(
+                mmap.as_ptr().add(aligned_start) as *mut libc::c_void,
+                length,
+                libc::MS_INVALIDATE,
+            );
+            let _ = mmap.unchecked_advise_range(
+                memmap2::UncheckedAdvice::FreeReusable,
+                aligned_start,
+                length,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = mmap.unchecked_advise_range(
+                memmap2::UncheckedAdvice::DontNeed,
+                aligned_start,
+                length,
+            );
+        }
+    }
 }
 
 // ── StringIndex bincode 缓存 ──
@@ -290,9 +367,11 @@ pub fn delete_cache(file_path: &str) {
     // New section-based cache suffixes
     for suffix in [
         ".p2.cache",
+        ".p2v2.cache",
         ".scan.cache",
         ".lidx.cache",
         ".strings.bin",
+        ".strings.cache",
         ".gum-extra.bin",
         ".crypto.bin",
     ] {
@@ -344,6 +423,167 @@ pub fn clear_all_cache() -> (u32, u64) {
     (count, total_size)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheCleanupReport {
+    pub dry_run: bool,
+    pub manifests_scanned: u64,
+    pub orphaned_traces: u64,
+    pub files_removed: u64,
+    pub bytes_reclaimable: u64,
+    pub bytes_removed: u64,
+    pub errors: Vec<String>,
+}
+
+fn known_cache_paths_in(dir: &std::path::Path, hash: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for suffix in [
+        ".p2.cache",
+        ".p2v2.cache",
+        ".scan.cache",
+        ".lidx.cache",
+        ".strings.bin",
+        ".strings.cache",
+        ".gum-extra.bin",
+        ".crypto.bin",
+        ".p2.rkyv",
+        ".scan.rkyv",
+        ".lidx.rkyv",
+        ".index.json",
+    ] {
+        paths.push(dir.join(format!("{hash}{suffix}")));
+    }
+    for suffix in ["", "-scan", "-lidx"] {
+        paths.push(dir.join(format!("{hash}{suffix}.bin")));
+    }
+    paths
+}
+
+fn checkpoint_dir_in(
+    dir: &std::path::Path,
+    hash: &str,
+    fingerprint: &crate::index_manifest::TraceFingerprint,
+) -> Option<PathBuf> {
+    let mut hasher = Sha256::new();
+    hasher.update(hash.as_bytes());
+    if let Ok(fp) = serde_json::to_vec(fingerprint) {
+        hasher.update(fp);
+    }
+    let hash = format!("{:x}", hasher.finalize());
+    Some(dir.join("checkpoints").join(hash))
+}
+
+fn path_size(path: &std::path::Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| path_size(&entry.path()))
+        .sum()
+}
+
+/// Remove caches/manifests/checkpoints whose source trace no longer exists.
+/// `dry_run=true` reports reclaimable bytes without deleting anything.
+pub fn cleanup_orphan_caches(dry_run: bool) -> CacheCleanupReport {
+    cleanup_orphan_caches_in(cache_dir(), dry_run)
+}
+
+fn cleanup_orphan_caches_in(dir: Option<PathBuf>, dry_run: bool) -> CacheCleanupReport {
+    let mut report = CacheCleanupReport {
+        dry_run,
+        manifests_scanned: 0,
+        orphaned_traces: 0,
+        files_removed: 0,
+        bytes_reclaimable: 0,
+        bytes_removed: 0,
+        errors: Vec::new(),
+    };
+    let Some(dir) = dir else {
+        report
+            .errors
+            .push("cache directory is unavailable".to_string());
+        return report;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        report
+            .errors
+            .push(format!("cannot read cache directory {}", dir.display()));
+        return report;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            || !path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".index.json"))
+        {
+            continue;
+        }
+        report.manifests_scanned += 1;
+        let Some(hash) = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .and_then(|name| name.strip_suffix(".index.json"))
+            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        else {
+            report.errors.push(format!(
+                "ignoring manifest with invalid cache key: {}",
+                path.display()
+            ));
+            continue;
+        };
+        let manifest = match IndexManifest::load(&path) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("cannot load {}: {error}", path.display()));
+                continue;
+            }
+        };
+        if std::path::Path::new(&manifest.file_path).exists() {
+            continue;
+        }
+        report.orphaned_traces += 1;
+        let mut paths = known_cache_paths_in(&dir, hash);
+        if let Some(checkpoint) = checkpoint_dir_in(&dir, hash, &manifest.fingerprint) {
+            paths.push(checkpoint);
+        }
+        for target in paths {
+            if !target.exists() {
+                continue;
+            }
+            let bytes = path_size(&target);
+            report.bytes_reclaimable = report.bytes_reclaimable.saturating_add(bytes);
+            if dry_run {
+                continue;
+            }
+            let result = if target.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else {
+                std::fs::remove_file(&target)
+            };
+            match result {
+                Ok(()) => {
+                    report.files_removed += 1;
+                    report.bytes_removed = report.bytes_removed.saturating_add(bytes);
+                }
+                Err(error) => report
+                    .errors
+                    .push(format!("cannot remove {}: {error}", target.display())),
+            }
+        }
+    }
+    report
+}
+
 fn dir_size(path: &PathBuf) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -353,4 +593,52 @@ fn dir_size(path: &PathBuf) -> u64 {
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
         .sum()
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use crate::index_manifest::IndexManifest;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn orphan_cache_cleanup_dry_run_then_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "trace-ui-orphan-cache-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace_path = dir.join("missing.trace");
+        let fingerprint = crate::index_manifest::TraceFingerprint::from_bytes(b"trace");
+        let manifest = IndexManifest::new(
+            fingerprint.clone(),
+            trace_path.to_string_lossy().to_string(),
+            "Gumtrace",
+        );
+        let hash = "a".repeat(64);
+        let manifest_path = dir.join(format!("{hash}.index.json"));
+        manifest.save_atomic(&manifest_path).unwrap();
+        let cache_path = dir.join(format!("{hash}.p2.cache"));
+        std::fs::write(&cache_path, vec![7u8; 32]).unwrap();
+        let checkpoint = checkpoint_dir_in(&dir, &hash, &manifest.fingerprint).unwrap();
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("chunk-000000.bin"), vec![1u8; 16]).unwrap();
+
+        let dry = cleanup_orphan_caches_in(Some(dir.clone()), true);
+        assert!(dry.dry_run);
+        assert_eq!(dry.orphaned_traces, 1);
+        assert!(dry.bytes_reclaimable >= 48);
+        assert!(manifest_path.exists() && cache_path.exists() && checkpoint.exists());
+
+        let deleted = cleanup_orphan_caches_in(Some(dir.clone()), false);
+        assert_eq!(deleted.orphaned_traces, 1);
+        assert!(!manifest_path.exists());
+        assert!(!cache_path.exists());
+        assert!(!checkpoint.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

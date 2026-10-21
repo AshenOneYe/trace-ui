@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::position::{GlobalLine, LineRange};
 
-pub const INDEX_SCHEMA_VERSION: u32 = 4;
+pub const INDEX_SCHEMA_VERSION: u32 = 5;
 pub const SAMPLE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,10 @@ pub struct TraceFingerprint {
     pub size: u64,
     pub head_sha256: String,
     pub tail_sha256: String,
+    #[serde(default)]
+    pub modified_unix_ns: Option<u64>,
+    #[serde(default)]
+    pub inode: Option<u64>,
 }
 
 impl TraceFingerprint {
@@ -28,7 +32,27 @@ impl TraceFingerprint {
             size: data.len() as u64,
             head_sha256: hash_bytes(&data[..head_end]),
             tail_sha256: hash_bytes(&data[tail_start..]),
+            modified_unix_ns: None,
+            inode: None,
         }
+    }
+
+    /// Fingerprint including filesystem identity used for automatic cache invalidation.
+    pub fn from_file(path: &Path) -> std::io::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let mut fingerprint = Self::from_reader(&mut file, metadata.len())?;
+        fingerprint.modified_unix_ns = metadata.modified().ok().and_then(|time| {
+            time.duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            fingerprint.inode = Some(metadata.ino());
+        }
+        Ok(fingerprint)
     }
 
     pub fn from_reader(reader: &mut (impl Read + Seek), size: u64) -> std::io::Result<Self> {
@@ -45,6 +69,8 @@ impl TraceFingerprint {
             size,
             head_sha256: hash_bytes(&head),
             tail_sha256: hash_bytes(&tail),
+            modified_unix_ns: None,
+            inode: None,
         })
     }
 }
@@ -396,6 +422,23 @@ mod tests {
             manifest.validate_for(&changed),
             Err(ManifestError::FingerprintMismatch)
         ));
+    }
+
+    #[test]
+    fn file_identity_changes_when_mtime_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "trace-ui-fingerprint-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::write(&path, b"same trace content\n").unwrap();
+        let first = TraceFingerprint::from_file(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"same trace content\n").unwrap();
+        let second = TraceFingerprint::from_file(&path).unwrap();
+        assert_eq!(first.head_sha256, second.head_sha256);
+        assert_ne!(first.modified_unix_ns, second.modified_unix_ns);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

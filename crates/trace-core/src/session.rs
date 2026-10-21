@@ -1,5 +1,6 @@
 use crate::flat::archives::{CachedStore, Phase2Archive, ScanArchive};
 use crate::flat::bitvec::BitView;
+use crate::flat::call_tree::CallTreeView;
 use crate::flat::deps::DepsView;
 use crate::flat::line_index::{LineIndexArchive, LineIndexView};
 use crate::flat::mem_access::MemAccessView;
@@ -7,9 +8,8 @@ use crate::flat::mem_last_def::MemLastDefView;
 use crate::flat::pair_split::PairSplitView;
 use crate::flat::reg_checkpoints::RegCheckpointsView;
 use crate::flat::scan_view::ScanView;
-use crate::query::call_tree::CallTree;
+use crate::flat::strings::{StringIndexArchive, StringIndexView};
 use crate::query::crypto::CryptoScanResult;
-use crate::query::strings::StringIndex;
 use crate::scanner::RegLastDef;
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -36,9 +36,8 @@ pub struct SessionState {
     pub trace_format: TraceFormat,
 
     // Phase2
-    pub call_tree: Option<CallTree>,
     pub phase2_store: Option<CachedStore<Phase2Archive>>,
-    pub string_index: Option<StringIndex>,
+    pub string_index: Option<CachedStore<StringIndexArchive>>,
 
     // Scan
     pub scan_store: Option<CachedStore<ScanArchive>>,
@@ -64,6 +63,14 @@ impl SessionState {
 
     pub fn mem_accesses_view(&self) -> Option<MemAccessView<'_>> {
         self.phase2_store.as_ref().map(|s| s.mem_accesses_view())
+    }
+
+    pub fn call_tree_view(&self) -> Option<CallTreeView<'_>> {
+        self.phase2_store.as_ref().map(|s| s.call_tree_view())
+    }
+
+    pub fn string_index_view(&self) -> Option<StringIndexView<'_>> {
+        self.string_index.as_ref().map(|s| s.string_index_view())
     }
 
     pub fn reg_checkpoints_view(&self) -> Option<RegCheckpointsView<'_>> {

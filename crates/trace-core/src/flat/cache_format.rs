@@ -105,6 +105,10 @@ impl<'a> SectionReader<'a> {
             let base = 4 + i * 16;
             let offset = u64::from_le_bytes(data[base..base + 8].try_into().ok()?);
             let length = u64::from_le_bytes(data[base + 8..base + 16].try_into().ok()?);
+            let end = offset.checked_add(length)?;
+            if offset % 8 != 0 || end > data.len() as u64 {
+                return None;
+            }
             sections.push((offset, length));
         }
         Some(Self { data, sections })
@@ -124,13 +128,13 @@ impl<'a> SectionReader<'a> {
 
     /// Get a single u32 from a section.
     pub fn u32_val(&self, idx: usize) -> u32 {
-        self.slice::<u32>(idx)[0]
+        self.slice::<u32>(idx).first().copied().unwrap_or(0)
     }
 
     /// Get a single u64 from a section.
     #[allow(dead_code)]
     pub fn u64_val(&self, idx: usize) -> u64 {
-        self.slice::<u64>(idx)[0]
+        self.slice::<u64>(idx).first().copied().unwrap_or(0)
     }
 
     /// Get section data as raw bytes (for bincode deserialization).
@@ -231,5 +235,11 @@ mod tests {
         assert!(SectionReader::new(&[0, 0, 0]).is_none());
         // num_sections = 1 but no table data
         assert!(SectionReader::new(&[1, 0, 0, 0]).is_none());
+
+        let mut out_of_bounds = Vec::new();
+        out_of_bounds.extend_from_slice(&1u32.to_le_bytes());
+        out_of_bounds.extend_from_slice(&u64::MAX.to_le_bytes());
+        out_of_bounds.extend_from_slice(&8u64.to_le_bytes());
+        assert!(SectionReader::new(&out_of_bounds).is_none());
     }
 }

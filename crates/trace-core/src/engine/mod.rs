@@ -23,6 +23,7 @@ pub struct TraceEngine {
     sessions: RwLock<HashMap<String, Arc<SessionHandle>>>,
     workspace: std::sync::Mutex<WorkspaceStore>,
     resources: RwLock<crate::resources::ResourceBudgets>,
+    memory_watchdog: Arc<crate::resources::MemoryWatchdog>,
     active_queries: AtomicUsize,
 }
 
@@ -51,10 +52,12 @@ impl TraceEngine {
                 WorkspaceStore::create(fallback, project())
                     .expect("temporary workspace should be writable")
             });
+        let resources = crate::resources::ResourceBudgets::default();
         Self {
             sessions: RwLock::new(HashMap::new()),
             workspace: std::sync::Mutex::new(workspace),
-            resources: RwLock::new(crate::resources::ResourceBudgets::default()),
+            memory_watchdog: crate::resources::MemoryWatchdog::start(resources.max_memory_bytes),
+            resources: RwLock::new(resources),
             active_queries: AtomicUsize::new(0),
         }
     }
@@ -78,9 +81,6 @@ impl TraceEngine {
         let file_size = metadata.len();
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TraceError::Io(e))?;
 
-        #[cfg(unix)]
-        let _ = mmap.advise(memmap2::Advice::WillNeed);
-
         let total_lines_estimate = (file_size / 110).max(1);
         let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -90,7 +90,6 @@ impl TraceEngine {
             total_lines: total_lines_estimate,
             file_size,
             trace_format: TraceFormat::Unidbg,
-            call_tree: None,
             phase2_store: None,
             string_index: None,
             scan_store: None,
@@ -171,24 +170,20 @@ impl TraceEngine {
 
     pub fn get_index_status(&self, session_id: &str) -> Result<IndexStatus> {
         let handle = self.get_handle(session_id)?;
-        let (file_path, data, session_total) = {
+        let (file_path, session_total) = {
             let state = handle
                 .state
                 .read()
                 .map_err(|e| TraceError::Internal(e.to_string()))?;
-            (
-                state.file_path.clone(),
-                state.mmap.clone(),
-                state.total_lines as u64,
-            )
+            (state.file_path.clone(), state.total_lines as u64)
         };
 
         let manifest = crate::cache::index_manifest_path(&file_path)
             .filter(|path| path.exists())
             .and_then(|path| crate::index_manifest::IndexManifest::load(&path).ok())
             .filter(|manifest| {
-                let fp = crate::index_manifest::TraceFingerprint::from_bytes(&data);
-                manifest.validate_for(&fp).is_ok()
+                crate::index_manifest::TraceFingerprint::from_file(std::path::Path::new(&file_path))
+                    .is_ok_and(|fp| manifest.validate_for(&fp).is_ok())
             });
 
         let stages = match &manifest {
@@ -315,6 +310,7 @@ impl TraceEngine {
 
     pub fn set_resource_budgets(&self, budgets: crate::resources::ResourceBudgets) -> Result<()> {
         budgets.validate().map_err(TraceError::InvalidArgument)?;
+        self.memory_watchdog.configure(budgets.max_memory_bytes);
         *self
             .resources
             .write()
@@ -323,8 +319,23 @@ impl TraceEngine {
     }
 
     pub(crate) fn acquire_query_lease(&self) -> Result<crate::resources::QueryLease<'_>> {
+        let memory = self.memory_watchdog.status();
+        if memory.pressure
+            || memory.available_memory_bytes.is_some_and(|available| {
+                available < crate::resources::DEFAULT_MEMORY_RESERVE_BYTES / 2
+            })
+        {
+            return Err(TraceError::ResourceBudgetExceeded(format!(
+                "query rejected while memory pressure is active: rss={:?}, available={:?}",
+                memory.process_rss_bytes, memory.available_memory_bytes
+            )));
+        }
         let limit = self.get_resource_budgets()?.max_concurrent_queries;
         crate::resources::QueryLease::try_acquire(&self.active_queries, limit)
+    }
+
+    pub fn get_memory_status(&self) -> crate::resources::MemoryStatus {
+        self.memory_watchdog.status()
     }
 
     pub fn get_analysis_workspace(&self) -> Result<AnalysisWorkspace> {
@@ -350,7 +361,12 @@ impl TraceEngine {
                 Some(crate::analysis::TraceRef {
                     trace_id: session_id.to_string(),
                     path: state.file_path.clone(),
-                    fingerprint: crate::index_manifest::TraceFingerprint::from_bytes(&state.mmap),
+                    fingerprint: crate::index_manifest::TraceFingerprint::from_file(
+                        std::path::Path::new(&state.file_path),
+                    )
+                    .unwrap_or_else(|_| {
+                        crate::index_manifest::TraceFingerprint::from_bytes(&state.mmap)
+                    }),
                     module_name: None,
                     total_lines: state.total_lines,
                 }),
@@ -386,7 +402,10 @@ impl TraceEngine {
 
         if let Some((file_path, mmap, total_lines, trace_format)) = manifest_context {
             if let Some(path) = crate::cache::index_manifest_path(&file_path) {
-                let fingerprint = crate::index_manifest::TraceFingerprint::from_bytes(&mmap);
+                let fingerprint = crate::index_manifest::TraceFingerprint::from_file(
+                    std::path::Path::new(&file_path),
+                )
+                .unwrap_or_else(|_| crate::index_manifest::TraceFingerprint::from_bytes(&mmap));
                 let mut manifest = crate::index_manifest::IndexManifest::load(&path)
                     .unwrap_or_else(|_| {
                         crate::index_manifest::IndexManifest::new(

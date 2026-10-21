@@ -223,12 +223,15 @@ AI 会依次调用：
 | file_path | string | 是 | trace 文件的绝对路径 |
 | force_rebuild | bool | 否（默认 false） | 即使缓存存在也强制重建索引 |
 | skip_strings | bool | 否（默认 false） | 跳过字符串索引以加速打开 |
+| allow_lite | bool | 否（默认 true） | 超出有效内存预算时自动进入 lite 模式；设为 false 则拒绝打开 |
 
-**返回**：session_id、module_name（模块名）、entry_address（入口地址）、trace_format（格式）、function_count（函数数量）、call_tree_nodes（调用树节点数）、function_count_semantics（`function_count` 的语义，当前为 `call_tree_nodes`）、total_lines（总行数）、file_size（文件大小）、has_string_index（是否有字符串索引）、from_cache（是否从缓存加载）。
+**返回**：session_id、module_name、entry_address、trace_format、function_count、call_tree_nodes、total_lines、file_size、has_string_index、from_cache、lite_mode、estimated_index_memory、memory_budget、process_rss_bytes、available_memory_bytes。
 
 > `function_count` 与 `call_tree_nodes` 当前是同一个值：调用树节点数，而不是旧版按地址粒度展开的原始函数数量。
 
-**注意**：首次打开大文件需要构建索引（千万行约 15 秒），构建完成后自动缓存，再次打开秒级加载。
+lite 模式只构建 metadata/lines。浏览、窗口搜索、窗口字符串和窗口调用树仍可使用；依赖污点、全量字符串列表和全量函数树会提示需要更大预算或后台完整索引。有效预算取配置上限与 `可用内存 - 512 MiB 安全余量` 的较小值。内存看门狗每 500 ms 采样当前 RSS 和峰值 RSS。
+
+缓存 manifest 使用文件大小、头尾内容哈希、mtime 和 inode 校验；任意一项变化都会使旧索引失效。
 
 ### 浏览数据
 
@@ -244,6 +247,17 @@ AI 会依次调用：
 | full | bool | 否（默认 false） | 返回完整字段（含 raw、reg_before、so_offset、mem_size） |
 
 **注意**：单次最多返回 100 行。需要查看更多行时多次调用，调整 start_seq 翻页。
+
+#### get_trace_segments
+
+为同一 mmap 会话列出稳定虚拟分段，便于对大 trace 并行或逐段查询。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 否 | 会话 ID |
+| segment_lines | u64 | 否 | 每段行数，默认 262144 |
+
+每段返回 `start_seq/end_seq/start_byte/end_byte`。把 `start_seq-end_seq` 传给 `search_instructions`、`get_strings`、`get_call_tree` 或 `analyze_function` 的 `seq_range` 即可逐段执行并按 seq 合并。
 
 #### get_memory
 
@@ -423,6 +437,20 @@ AI 会依次调用：
 
 **返回**：检测到的算法名称、匹配的魔数值、出现位置的指令地址和汇编内容、上下文指令。结果会自动缓存。
 
+### 资源与缓存维护
+
+#### memory_status
+
+返回当前 RSS、峰值 RSS、系统可回收内存、配置上限、有效上限、512 MiB 安全余量和内存压力状态。
+
+#### cleanup_cache
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| dry_run | bool | 否（默认 true） | 只报告可回收字节，不删除 |
+
+只处理原 trace 已不存在的 manifest 及其对应的 `.p2v2.cache`、`.scan.cache`、`.lidx.cache`、`.strings.cache`、旧格式缓存和 checkpoint 目录。默认先 dry-run，确认报告中 `bytes_reclaimable` 和 `errors` 后再以 `dry_run=false` 执行。
+
 ## 限制与约束
 
 ### 数据量限制
@@ -434,6 +462,7 @@ AI 会依次调用：
 | 内存读取长度 | 最多 256 字节 | `get_memory` 的 length 上限 |
 | 污点结果分页 | 最多 200 行 | `get_tainted_lines` 的 limit 上限 |
 | 字符串分页 | 最多 200 条 | `get_strings` 的 limit 上限 |
+| 懒字符串/调用树窗口 | 最多 262144 行 | 无完整索引时的单次窗口上限 |
 
 超出限制时使用分页参数（offset/limit）获取更多数据。
 
@@ -444,4 +473,5 @@ AI 会依次调用：
 - `taint_analysis` 执行分析并内联返回第一页结果，无需再单独调用 `get_tainted_lines` 查看初始结果
 - 新的 `taint_analysis` 调用会自动覆盖之前的污点结果，无需手动清除
 - `get_tainted_lines` 用于翻页获取更多污点结果，或使用 addr_range/context_lines 等高级过滤
-- `get_strings` 需要字符串索引（默认在 open_trace 时构建，可通过 skip_strings 跳过）
+- 完整索引会话的 `get_strings` 使用全量 mmap 字符串索引；lite 会话必须传 `seq_range`，在窗口内按需构建
+- `get_call_tree` / `analyze_function` 在 lite 会话中使用 `seq_range` 构建窗口级调用树；跨窗口边界的调用可能不完整

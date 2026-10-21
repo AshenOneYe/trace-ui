@@ -42,6 +42,11 @@ pub struct OpenTraceRequest {
     #[schemars(description = "Skip building string index to speed up opening (default: false)")]
     #[serde(default)]
     pub skip_strings: bool,
+    #[schemars(
+        description = "Automatically use base-index lite mode when estimated memory exceeds the budget (default: true)"
+    )]
+    #[serde(default = "default_true")]
+    pub allow_lite: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -185,6 +190,24 @@ pub struct GetCallTreeRequest {
     )]
     #[serde(default = "default_depth")]
     pub depth: u32,
+    #[schemars(
+        description = "Optional lazy seq window for sessions without a function index, e.g. '0-200000'. \
+        Builds a bounded window-local call tree instead of requiring a full index"
+    )]
+    pub seq_range: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetTraceSegmentsRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Virtual segment size in trace lines (default: 262144)")]
+    #[serde(default = "default_segment_lines")]
+    pub segment_lines: u64,
+}
+
+fn default_segment_lines() -> u64 {
+    262_144
 }
 
 fn default_depth() -> u32 {
@@ -290,6 +313,10 @@ pub struct AnalyzeFunctionRequest {
     )]
     #[serde(default = "default_func_list_limit")]
     pub limit: u32,
+    #[schemars(
+        description = "Optional lazy seq window for sessions without a function index, e.g. '0-200000'"
+    )]
+    pub seq_range: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -513,6 +540,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn open_trace_allows_lite_mode_by_default() {
+        let request: OpenTraceRequest =
+            serde_json::from_value(serde_json::json!({"file_path": "/tmp/trace.log"}))
+                .expect("open trace request");
+        assert!(request.allow_lite);
+    }
+
+    #[test]
     fn get_memory_length_accepts_number_decimal_and_hex_strings() {
         let number: GetMemoryRequest =
             serde_json::from_value(serde_json::json!({"address": "0x1000", "length": 64}))
@@ -648,6 +683,15 @@ pub struct GetResultPageRequest {
     #[schemars(description = "Results per page (default: 50, max: 2000)")]
     #[serde(default = "default_result_page")]
     pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CleanupCacheRequest {
+    #[schemars(
+        description = "Report reclaimable bytes without deleting when true (default: true)"
+    )]
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
