@@ -823,7 +823,9 @@ pub fn merge_all_chunks(
     // StringIndex — 从 scan_chunk 收集的内存访问记录精确构建（0.85-0.97）
     // 记录已按 chunk 顺序排列（每个 chunk 内部是 seq 顺序），直接逐 chunk 处理
     // = 全局 seq 顺序，无需排序
-    let string_index = if !skip_strings {
+    let (string_index, external_string_records) = if !skip_strings {
+        let local_cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = cancel_flag.unwrap_or(&local_cancel);
         let total_accesses: usize = chunk_string_accesses.iter().map(|w| w.len()).sum();
         let report_interval = (total_accesses / 100).max(1);
         let mut processed = 0usize;
@@ -845,6 +847,7 @@ pub fn merge_all_chunks(
             }
         };
         let mut sb = crate::query::strings::StringBuilder::with_capacity(estimated_pages);
+        let mut result_sorter = crate::query::string_external::StringRecordExternalSorter::new()?;
         for chunk_accesses in chunk_string_accesses.into_iter() {
             for &(addr, data, size, seq, rw) in &chunk_accesses {
                 sb.process_access(addr, data, size, seq, rw);
@@ -860,6 +863,9 @@ pub fn merge_all_chunks(
                         cb(0.85 + 0.12 * (processed as f64 / total_accesses as f64));
                     }
                 }
+                if sb.pending_result_count() >= 50_000 {
+                    result_sorter.add_records(sb.take_results())?;
+                }
             }
         }
 
@@ -868,20 +874,20 @@ pub fn merge_all_chunks(
         }
 
         let t2 = std::time::Instant::now();
-        let si = sb.finish();
+        result_sorter.add_records(sb.finish_unsorted())?;
+        let sorted_records = result_sorter.finish(cancel)?;
         eprintln!(
-            "[perf] StringBuilder.finish(): {:?} ({} strings)",
-            t2.elapsed(),
-            si.strings.len()
+            "[perf] external string result sort complete: {:?}",
+            t2.elapsed()
         );
 
         eprintln!(
             "[perf] StringIndex total (build+finish, xref deferred): {:?}",
             t.elapsed()
         );
-        si
+        (Default::default(), Some(sorted_records))
     } else {
-        Default::default()
+        (Default::default(), None)
     };
 
     // LineIndex
@@ -919,6 +925,7 @@ pub fn merge_all_chunks(
         mem_accesses,
         reg_checkpoints: merged_ckpts,
         string_index,
+        external_string_records,
     };
 
     if let Some(ref cb) = progress_fn {

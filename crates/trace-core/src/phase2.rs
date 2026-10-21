@@ -228,6 +228,7 @@ pub fn build_phase2(
         mem_accesses: mem_idx,
         reg_checkpoints: reg_ckpts,
         string_index: Default::default(),
+        external_string_records: None,
     }
 }
 

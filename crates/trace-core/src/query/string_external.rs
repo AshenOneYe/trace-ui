@@ -202,7 +202,7 @@ impl Drop for StringRecordExternalSorter {
     }
 }
 
-pub(crate) struct SortedStringRecords {
+pub struct SortedStringRecords {
     path: PathBuf,
     temp_dir: PathBuf,
     count: u64,
@@ -224,7 +224,7 @@ impl Drop for SortedStringRecords {
     }
 }
 
-pub(crate) struct StringRecordIter {
+pub struct StringRecordIter {
     reader: BufReader<File>,
     remaining: u64,
 }

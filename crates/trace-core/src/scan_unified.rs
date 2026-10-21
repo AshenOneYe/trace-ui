@@ -28,6 +28,7 @@ pub struct Phase2State {
     pub mem_accesses: crate::query::mem_access::MemAccessIndex,
     pub reg_checkpoints: crate::query::registers::RegCheckpoints,
     pub string_index: crate::query::strings::StringIndex,
+    pub external_string_records: Option<crate::query::string_external::SortedStringRecords>,
 }
 
 /// scan_unified 的返回结果
@@ -698,6 +699,7 @@ pub fn scan_unified(
         mem_accesses: mem_idx,
         reg_checkpoints: reg_ckpts,
         string_index,
+        external_string_records: None,
     };
     let line_index = li_builder.finish();
 

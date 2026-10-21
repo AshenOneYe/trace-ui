@@ -17,6 +17,44 @@ use crate::parallel::scan_unified_parallel_with_checkpoints;
 use crate::position::GlobalLine;
 use crate::scan_unified::{ProgressFn, ScanResult};
 
+fn string_xref_count(
+    mem_view: &crate::flat::mem_access::MemAccessView<'_>,
+    record: &crate::query::strings::StringRecord,
+) -> u32 {
+    (0..record.byte_len as u64)
+        .map(|offset| {
+            mem_view
+                .query(record.addr.saturating_add(offset))
+                .map(|records| records.iter().filter(|access| access.is_read()).count())
+                .unwrap_or(0)
+        })
+        .fold(0u32, |total, count| {
+            total.saturating_add(count.min(u32::MAX as usize) as u32)
+        })
+}
+
+fn build_streamed_string_store<I>(
+    file_path: &str,
+    data: &[u8],
+    mem_view: &crate::flat::mem_access::MemAccessView<'_>,
+    records: I,
+) -> Result<(Option<CachedStore<StringIndexArchive>>, bool)>
+where
+    I: Iterator<Item = Result<crate::query::strings::StringRecord>>,
+{
+    let mut writer =
+        crate::flat::strings::StringIndexArchiveWriter::new().map_err(TraceError::Io)?;
+    for record in records {
+        let record = record?;
+        let xref_count = string_xref_count(mem_view, &record);
+        writer.push(&record, xref_count).map_err(TraceError::Io)?;
+    }
+    let parts = writer.finish().map_err(TraceError::Io)?;
+    let has_records = parts.record_count > 0;
+    let mapped = cache::save_string_archive_from_parts(file_path, data, &parts)?;
+    Ok((Some(CachedStore::Mapped(mapped)), has_records))
+}
+
 /// 内部枚举：区分缓存命中 vs 新鲜扫描结果
 enum IndexResult {
     CacheHit {
@@ -867,27 +905,40 @@ impl super::TraceEngine {
             IndexResult::ScanResult(scan_result) => {
                 // 1. 在 write lock 外构建 archives
                 let phase2 = scan_result.phase2;
-                let string_index = phase2.string_index;
+                let crate::scan_unified::Phase2State {
+                    call_tree,
+                    mem_accesses,
+                    reg_checkpoints,
+                    string_index,
+                    external_string_records,
+                } = phase2;
 
                 let phase2_archive = Phase2Archive {
-                    mem_accesses: convert::mem_access_to_flat(&phase2.mem_accesses),
-                    reg_checkpoints: convert::reg_checkpoints_to_flat(&phase2.reg_checkpoints),
-                    call_tree: CallTreeArchive::from_tree(&phase2.call_tree),
+                    mem_accesses: convert::mem_access_to_flat(&mem_accesses),
+                    reg_checkpoints: convert::reg_checkpoints_to_flat(&reg_checkpoints),
+                    call_tree: CallTreeArchive::from_tree(&call_tree),
                 };
 
-                // fill_xref_counts：Phase2Archive 构建完成后，使用 flat view 计算 xref
-                // 此时使用 flat 数据而非原始 MemAccessIndex，内存更友好
-                let mut string_index = string_index;
-                if !string_index.strings.is_empty() {
-                    let mem_view = phase2_archive.mem_accesses.view();
-                    eprintln!("[index] computing xref counts from flat view...");
-                    let t_xref = std::time::Instant::now();
-                    crate::query::strings::StringBuilder::fill_xref_counts_view(
-                        &mut string_index,
-                        &mem_view,
-                    );
-                    eprintln!("[index] xref counts done: {:?}", t_xref.elapsed());
-                }
+                let (file_path, mmap_arc) = {
+                    let state = handle
+                        .state
+                        .read()
+                        .map_err(|e| TraceError::Internal(e.to_string()))?;
+                    (state.file_path.clone(), state.mmap.clone())
+                };
+                let mem_view = phase2_archive.mem_accesses.view();
+                let (string_store, has_string_index) =
+                    if let Some(sorted_records) = external_string_records {
+                        let records = sorted_records.iter()?.map(|record| record);
+                        build_streamed_string_store(&file_path, &mmap_arc, &mem_view, records)?
+                    } else {
+                        build_streamed_string_store(
+                            &file_path,
+                            &mmap_arc,
+                            &mem_view,
+                            string_index.strings.iter().cloned().map(Ok),
+                        )?
+                    };
 
                 let scan_state = &scan_result.scan_state;
                 let scan_archive = ScanArchive {
@@ -909,9 +960,6 @@ impl super::TraceEngine {
                 let p2_bytes = phase2_archive.to_sections();
                 let scan_bytes = scan_archive.to_sections();
                 let lidx_bytes = lidx_archive.to_sections();
-                let string_archive = StringIndexArchive::from_index(&string_index);
-                let si_bytes = string_archive.to_sections();
-                let has_string_index = !string_archive.view().is_empty();
                 eprintln!(
                     "[index] serialization done: p2={}B scan={}B lidx={}B",
                     p2_bytes.len(),
@@ -940,7 +988,7 @@ impl super::TraceEngine {
                     state.total_lines = total_lines;
                     state.trace_format = scan_result.format;
 
-                    state.string_index = Some(CachedStore::Owned(string_archive));
+                    state.string_index = string_store;
                     state.reg_last_def = Some(reg_last_def);
                     state.phase2_store = Some(CachedStore::Owned(phase2_archive));
                     state.scan_store = Some(CachedStore::Owned(scan_archive));
@@ -975,9 +1023,6 @@ impl super::TraceEngine {
                 cache::save_sections_raw(&fp, data_for_cache, ".p2v2.cache", &p2_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".scan.cache", &scan_bytes);
                 cache::save_sections_raw(&fp, data_for_cache, ".lidx.cache", &lidx_bytes);
-                if has_string_index {
-                    cache::save_sections_raw(&fp, data_for_cache, ".strings.cache", &si_bytes);
-                }
                 if let Some((ref anns, ref seqs)) = gum_extra {
                     cache::save_gumtrace_extra(&fp, data_for_cache, anns, seqs);
                 }
